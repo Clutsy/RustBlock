@@ -1,0 +1,6 @@
+/target
+**/*.gguf
+*.tmp
+.DS_Store
+.idea/
+.vscode/

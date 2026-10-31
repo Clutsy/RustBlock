@@ -1,0 +1,18 @@
+[package]
+name = "ternary-reblock-cli"
+description = "Command line interface for ternary-reblock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ternary-reblock"
+path = "src/main.rs"
+
+[dependencies]
+ternary-reblock-core = { path = "../core" }
+clap.workspace = true
+anyhow.workspace = true
+indicatif.workspace = true
+serde_json.workspace = true

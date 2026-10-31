@@ -1,0 +1,15 @@
+[package]
+name = "ternary-reblock-core"
+description = "Lossless GGUF reblocker: Prism PQ2_0 -> upstream Q2_0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+half.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+proptest = "1"

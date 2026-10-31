@@ -1,0 +1,13 @@
+ternary-reblock
+Copyright 2026 The ternary-reblock contributors
+
+This software is an independent community tool. It is not affiliated with,
+endorsed by, or sponsored by Prism ML or Alibaba Cloud.
+
+GGUF is a file format used by llama.cpp, which is distributed under the
+MIT License.
+
+"Bonsai" and "Ternary Bonsai" are products of Prism ML.
+Qwen3.8-27B is a model by Alibaba Cloud, licensed under Apache-2.0.
+
+No model weights are included in this repository.
