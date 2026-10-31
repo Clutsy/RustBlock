@@ -78,7 +78,7 @@ fn build_gguf(path: &Path, tensors: &[TestTensor], alignment: u32, file_type: Op
     }
 
     let pad = ((align - header.len() as u64 % align) % align) as usize;
-    header.extend(std::iter::repeat(0u8).take(pad));
+    header.extend(std::iter::repeat_n(0u8, pad));
 
     let mut file = fs::File::create(path).unwrap();
     file.write_all(&header).unwrap();

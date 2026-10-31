@@ -14,7 +14,8 @@ pub mod gguf;
 pub mod types;
 
 pub use convert::{
-    convert, ConvertError, ConvertOptions, Progress, Report, VerifyMode, LLAMA_FTYPE_MOSTLY_Q2_0,
+    convert, ConvertError, ConvertOptions, Phase, Progress, Report, VerifyMode,
+    LLAMA_FTYPE_MOSTLY_Q2_0,
 };
 pub use gguf::{align_up, Gguf, GgufError, TensorInfo};
 pub use types::{type_info, type_name, TypeInfo, TY_PQ2_0, TY_PTQ1_0, TY_Q2_0};

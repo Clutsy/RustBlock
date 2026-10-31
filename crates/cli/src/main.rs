@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
-use ternary_reblock_core::{convert, type_name, ConvertOptions, Gguf, Progress, VerifyMode};
+use ternary_reblock_core::{convert, type_name, ConvertOptions, Gguf, Phase, Progress, VerifyMode};
 
 #[derive(Parser)]
 #[command(
@@ -25,6 +25,20 @@ enum Command {
         /// GGUF file to inspect.
         file: PathBuf,
         /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify a GGUF without writing anything.
+    ///
+    /// For PQ2_0 files this performs the full lossless split check; for other
+    /// files it validates the structure only.
+    Verify {
+        /// GGUF file to verify.
+        file: PathBuf,
+        /// Skip the full PQ2_0 bit-exact check (structure only).
+        #[arg(long)]
+        quick: bool,
+        /// Print machine-readable JSON on stdout.
         #[arg(long)]
         json: bool,
     },
@@ -70,6 +84,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Inspect { file, json } => inspect(&file, json),
+        Command::Verify { file, quick, json } => verify_cmd(&file, quick, json),
         Command::Convert {
             input,
             output,
@@ -156,6 +171,100 @@ fn inspect(file: &Path, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+fn verify_cmd(file: &Path, quick: bool, as_json: bool) -> Result<()> {
+    let started = std::time::Instant::now();
+    let g = Gguf::open(file).with_context(|| format!("cannot read '{}'", file.display()))?;
+    let pq2 = g.pq2_count();
+    let ptq1 = g
+        .tensors
+        .iter()
+        .filter(|t| t.ty == ternary_reblock_core::TY_PTQ1_0)
+        .count();
+    let convertible = pq2 > 0 && ptq1 == 0;
+
+    let mut report = None;
+    if convertible && !quick {
+        let pb = ProgressBar::new(0);
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.green} {msg} {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        let mut progress = |p: &Progress| {
+            pb.set_length(p.bytes_total.max(1));
+            pb.set_position(p.bytes_done);
+            pb.set_message(format!(
+                "verifying [{}/{}] {}",
+                p.tensor_index + 1,
+                p.tensors_total,
+                p.tensor_name
+            ));
+        };
+        let dummy = file.with_extension("verify.gguf");
+        let r = convert(
+            file,
+            &dummy,
+            ConvertOptions {
+                dry_run: true,
+                verify: VerifyMode::Full,
+                ..Default::default()
+            },
+            Some(&mut progress),
+        )
+        .with_context(|| format!("verification of '{}' failed", file.display()))?;
+        pb.finish_and_clear();
+        report = Some(r);
+    }
+
+    let elapsed = started.elapsed();
+    if as_json {
+        let value = json!({
+            "file": file,
+            "status": "ok",
+            "version": g.version,
+            "size": g.file_len,
+            "alignment": g.alignment,
+            "tensors": g.tensors.len(),
+            "pq2_0": pq2,
+            "ptq1_0": ptq1,
+            "file_type": g.file_type,
+            "hadamard_metadata": g.has_hadamard_version,
+            "convertible": convertible,
+            "full_check": report.is_some(),
+            "new_file_size": report.as_ref().map(|r| r.new_file_size),
+            "elapsed_seconds": elapsed.as_secs_f64(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!("file:      {}", file.display());
+    println!(
+        "structure: OK ({} tensors, GGUF v{}, alignment {})",
+        g.tensors.len(),
+        g.version,
+        g.alignment
+    );
+    if convertible {
+        if let Some(report) = &report {
+            println!(
+                "lossless:  OK ({} PQ2_0 tensors, {} -> {} data)",
+                report.tensors_pq2,
+                human_bytes(report.old_data_size),
+                human_bytes(report.new_data_size)
+            );
+        } else {
+            println!("lossless:  skipped (--quick)");
+        }
+    } else if ptq1 > 0 {
+        println!("lossless:  not supported (PTQ1_0 has no lossless upstream type)");
+    } else {
+        println!("lossless:  not needed (no PQ2_0 tensors found)");
+    }
+    println!("elapsed:   {}", human_duration(elapsed));
+    Ok(())
+}
+
 fn convert_cmd(
     input: &Path,
     output: &Path,
@@ -181,7 +290,11 @@ fn convert_cmd(
         pb.set_length(p.bytes_total.max(1));
         pb.set_position(p.bytes_done);
         pb.set_message(format!(
-            "[{}/{}] {}",
+            "{} [{}/{}] {}",
+            match p.phase {
+                Phase::Converting => "converting",
+                Phase::Verifying => "verifying",
+            },
             p.tensor_index + 1,
             p.tensors_total,
             p.tensor_name

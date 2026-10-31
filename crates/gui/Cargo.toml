@@ -1,0 +1,16 @@
+[package]
+name = "ternary-reblock-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Desktop GUI for ternary-reblock: lossless PQ2_0 -> Q2_0 conversion"
+
+[[bin]]
+name = "ternary-reblock-gui"
+path = "src/main.rs"
+
+[dependencies]
+ternary-reblock-core = { path = "../core" }
+eframe.workspace = true
+rfd.workspace = true

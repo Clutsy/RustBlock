@@ -81,8 +81,17 @@ impl Default for ConvertOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Rewriting tensor data.
+    Converting,
+    /// Re-reading and checking the written data.
+    Verifying,
+}
+
 #[derive(Debug, Clone)]
 pub struct Progress {
+    pub phase: Phase,
     pub tensor_index: usize,
     pub tensor_name: String,
     pub tensors_total: usize,
@@ -90,7 +99,7 @@ pub struct Progress {
     pub bytes_total: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Report {
     pub input: PathBuf,
     pub output: PathBuf,
@@ -156,7 +165,14 @@ pub fn convert(
 
     if opts.dry_run {
         if opts.verify == VerifyMode::Full {
-            verify_source_full(&g, input)?;
+            emit_phase(
+                &mut on_progress,
+                &g,
+                Phase::Verifying,
+                0,
+                sum_sizes(&g, TY_PQ2_0),
+            );
+            verify_source_full(&g, input, &mut on_progress)?;
         }
         return Ok(Report {
             input: input.to_path_buf(),
@@ -238,7 +254,14 @@ pub fn convert(
                 tmp.write_all(&outbuf[..n * 36])?;
                 remaining -= n as u64;
                 done += (n * 36) as u64;
-                emit_progress(&mut on_progress, plan, &g, done, new_data_size);
+                emit_progress(
+                    &mut on_progress,
+                    plan,
+                    &g,
+                    Phase::Converting,
+                    done,
+                    new_data_size,
+                );
             }
         } else {
             let mut remaining = tensor_size;
@@ -250,7 +273,14 @@ pub fn convert(
                 tmp.write_all(&buf[..n])?;
                 remaining -= n as u64;
                 done += n as u64;
-                emit_progress(&mut on_progress, plan, &g, done, new_data_size);
+                emit_progress(
+                    &mut on_progress,
+                    plan,
+                    &g,
+                    Phase::Converting,
+                    done,
+                    new_data_size,
+                );
             }
         }
 
@@ -271,10 +301,11 @@ pub fn convert(
 
     let g_out = Gguf::open(tmp.path())?;
     if opts.verify != VerifyMode::None {
+        emit_phase(&mut on_progress, &g, Phase::Verifying, 0, new_data_size);
         verify_structure(&g, &g_out, &plans)?;
     }
     if opts.verify == VerifyMode::Full {
-        verify_full(&g, &g_out, input, tmp.path())?;
+        verify_full(&g, &g_out, input, tmp.path(), &mut on_progress)?;
     }
 
     if output.exists() {
@@ -304,18 +335,59 @@ fn emit_progress(
     cb: &mut Option<&mut dyn FnMut(&Progress)>,
     plan: &Plan,
     g: &Gguf,
+    phase: Phase,
+    bytes_done: u64,
+    bytes_total: u64,
+) {
+    emit(
+        cb,
+        phase,
+        plan.index,
+        &g.tensors[plan.index].name,
+        g.tensors.len(),
+        bytes_done,
+        bytes_total,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit(
+    cb: &mut Option<&mut dyn FnMut(&Progress)>,
+    phase: Phase,
+    tensor_index: usize,
+    tensor_name: &str,
+    tensors_total: usize,
     bytes_done: u64,
     bytes_total: u64,
 ) {
     if let Some(cb) = cb.as_mut() {
         cb(&Progress {
-            tensor_index: plan.index,
-            tensor_name: g.tensors[plan.index].name.clone(),
-            tensors_total: g.tensors.len(),
+            phase,
+            tensor_index,
+            tensor_name: tensor_name.to_string(),
+            tensors_total,
             bytes_done,
             bytes_total,
         });
     }
+}
+
+fn emit_phase(
+    cb: &mut Option<&mut dyn FnMut(&Progress)>,
+    g: &Gguf,
+    phase: Phase,
+    bytes_done: u64,
+    bytes_total: u64,
+) {
+    emit(cb, phase, 0, "", g.tensors.len(), bytes_done, bytes_total);
+}
+
+fn sum_sizes(g: &Gguf, ty: u32) -> u64 {
+    g.tensors
+        .iter()
+        .filter(|t| t.ty == ty)
+        .filter_map(|t| t.size)
+        .fold(0u64, |acc, size| acc.saturating_add(size))
 }
 
 fn plan_layout(g: &Gguf) -> Result<Vec<Plan>, ConvertError> {
@@ -503,11 +575,20 @@ fn verify_structure(input: &Gguf, output: &Gguf, plans: &[Plan]) -> Result<(), C
     Ok(())
 }
 
-fn verify_source_full(g: &Gguf, input: &Path) -> Result<(), ConvertError> {
+fn verify_source_full(
+    g: &Gguf,
+    input: &Path,
+    cb: &mut Option<&mut dyn FnMut(&Progress)>,
+) -> Result<(), ConvertError> {
     let mut src = File::open(input)?;
     let mut inbuf = vec![0u8; REBLOCK_CHUNK_BLOCKS * 34];
+    let total = sum_sizes(g, TY_PQ2_0);
+    let mut done = 0u64;
 
-    for t in g.tensors.iter().filter(|t| t.ty == TY_PQ2_0) {
+    for (index, t) in g.tensors.iter().enumerate() {
+        if t.ty != TY_PQ2_0 {
+            continue;
+        }
         let blocks = t.size.expect("checked earlier") / 34;
         src.seek(SeekFrom::Start(g.data_start + t.offset))?;
         let mut remaining = blocks;
@@ -518,6 +599,16 @@ fn verify_source_full(g: &Gguf, input: &Path) -> Result<(), ConvertError> {
                 compare_reblocked_block(&inbuf[i * 34..i * 34 + 34], &t.name)?;
             }
             remaining -= n as u64;
+            done += (n * 34) as u64;
+            emit(
+                cb,
+                Phase::Verifying,
+                index,
+                &t.name,
+                g.tensors.len(),
+                done,
+                total,
+            );
         }
     }
     Ok(())
@@ -557,6 +648,7 @@ fn verify_full(
     g_out: &Gguf,
     in_path: &Path,
     out_path: &Path,
+    cb: &mut Option<&mut dyn FnMut(&Progress)>,
 ) -> Result<(), ConvertError> {
     let mut src = File::open(in_path)?;
     let mut dst = File::open(out_path)?;
@@ -565,6 +657,12 @@ fn verify_full(
     let mut new_buf = vec![0u8; REBLOCK_CHUNK_BLOCKS * 36];
     let mut raw_a = vec![0u8; IO_BUF_SIZE];
     let mut raw_b = vec![0u8; IO_BUF_SIZE];
+    let total = g_out
+        .tensors
+        .iter()
+        .filter_map(|t| t.size)
+        .fold(0u64, |acc, size| acc.saturating_add(size));
+    let mut done = 0u64;
 
     for (i, t_in) in g_in.tensors.iter().enumerate() {
         let t_out = &g_out.tensors[i];
@@ -596,6 +694,16 @@ fn verify_full(
                     element_base += 128;
                 }
                 remaining -= n as u64;
+                done += (n * 36) as u64;
+                emit(
+                    cb,
+                    Phase::Verifying,
+                    i,
+                    &t_in.name,
+                    g_in.tensors.len(),
+                    done,
+                    total,
+                );
             }
         } else {
             let size_out = t_out.size.expect("checked earlier");
@@ -617,6 +725,16 @@ fn verify_full(
                     )));
                 }
                 remaining -= n as u64;
+                done += n as u64;
+                emit(
+                    cb,
+                    Phase::Verifying,
+                    i,
+                    &t_in.name,
+                    g_in.tensors.len(),
+                    done,
+                    total,
+                );
             }
         }
     }

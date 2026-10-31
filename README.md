@@ -24,19 +24,45 @@ The same `d` is copied to both output blocks and the codes are split in order, s
 
 ## Status
 
-Phase 1: conversion engine + CLI + automated tests.
-Phase 2 (planned): desktop GUI (Rust + egui), drag & drop, batch conversion.
+- **Phase 1 — engine + CLI + automated tests:** complete.
+- **Phase 2 — desktop GUI:** complete (Rust + egui/eframe, Windows/macOS/Linux).
+
+The GUI is a native standalone executable: no Python, Node.js, terminal or quantization knowledge required.
 
 ## Install / build
 
-Requires Rust 1.80+.
+Requires Rust **1.92+**.
 
 ```bash
 cargo build --release
-# binary: target/release/ternary-reblock (ternary-reblock.exe on Windows)
 ```
 
-## Usage
+Binaries:
+
+- CLI: `target/release/ternary-reblock` (`ternary-reblock.exe` on Windows)
+- GUI: `target/release/ternary-reblock-gui` (`ternary-reblock-gui.exe` on Windows)
+
+The GUI can also be launched directly with one or more models:
+
+```bash
+cargo run -p ternary-reblock-gui --release -- model-PQ2_0.gguf
+```
+
+## GUI
+
+![Reblock GUI](docs/gui.png)
+
+- Drag & drop one or many `.gguf` files, or browse with the file picker.
+- Automatic detection of `PQ2_0`, `Q2_0`, `PTQ1_0` and unsupported files; only convertible models are queued for conversion.
+- Output next to each input file or in a custom folder, with duplicate-path and existing-file protection.
+- Verification levels `None`, `Structure` and `Full`, plus a **verify-only** mode that writes nothing.
+- Batch queue, **stop after the current file**, live speed/ETA and a per-file progress bar.
+- Exportable log, English/Italian UI, dark theme, About window.
+- Fully offline: no network access, no telemetry, no model data leaves the machine.
+
+Basic flow: drop a model, choose the verification level, press **Convert** (or `Ctrl+Enter`). The original file is opened read-only and is never modified.
+
+## CLI usage
 
 Inspect a file (metadata, tensor type histogram, eligibility):
 
@@ -109,7 +135,7 @@ The generated file is ~5.8% larger than PQ2_0 (2.125 → 2.25 bits per weight).
 - GGUF **v3** only.
 - Only `PQ2_0 → Q2_0`. `PTQ1_0` is rejected: converting it would require lossy requantization.
 - Files containing unknown tensor types are handled only if those tensors can be sized; conversion refuses unknown types rather than guessing.
-- No GUI yet (phase 2).
+- The GUI supports one batch at a time; the current file finishes before a stop request takes effect.
 
 ## License
 
