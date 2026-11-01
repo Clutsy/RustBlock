@@ -1,13 +1,18 @@
-ternary-reblock
-Copyright 2026 The ternary-reblock contributors
+RustBlock
+Copyright 2026 The RustBlock contributors
 
 This software is an independent community tool. It is not affiliated with,
-endorsed by, or sponsored by Prism ML or Alibaba Cloud.
+endorsed by, or sponsored by Prism ML, Alibaba Cloud, Hugging Face, LM Studio
+or Ollama.
 
-GGUF is a file format used by llama.cpp, which is distributed under the
-MIT License.
+GGUF is a file format used by llama.cpp, which is distributed under the MIT
+License.
+
+RustBlock uses pmetal-gguf for K-quant and legacy GGUF tensor codecs.
+pmetal-gguf is a separate project and is used under its upstream license; see
+its package metadata and repository for the full text and attribution.
 
 "Bonsai" and "Ternary Bonsai" are products of Prism ML.
-Qwen3.8-27B is a model by Alibaba Cloud, licensed under Apache-2.0.
+Qwen is a model family by Alibaba Cloud.
 
 No model weights are included in this repository.

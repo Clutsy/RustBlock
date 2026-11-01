@@ -1,0 +1,1108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RustBlock — interface concept</title>
+<style>
+  :root {
+    --paper: #0e1012;
+    --surface: #16191c;
+    --surface-2: #1d2125;
+    --ink: #e8e5de;
+    --ink-2: #bdc3c7;
+    --steel: #8f979d;
+    --rule: #333a40;
+    --rule-2: #4a545b;
+    --rust: #c96642;
+    --rust-dark: #a94e30;
+    --rust-wash: #2b1a14;
+    --on-rust: #140f0c;
+    --ok: #6f9f7d;
+    --warn: #cfa056;
+    --mono: "Cascadia Mono", "Consolas", "Liberation Mono", monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body { height: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 13px/1.45 "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+
+  button, input, select { font: inherit; color: inherit; }
+  button { border: 0; background: none; cursor: pointer; }
+  ::selection { background: var(--rust); color: var(--on-rust); }
+
+  .topbar {
+    height: 54px;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 0 30px;
+    padding: 0 18px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 190px; }
+  .brand img { width: 30px; height: 30px; display: block; background: #080808; }
+  .brand strong { display: block; font-size: 14px; font-weight: 650; letter-spacing: -.012em; }
+  .brand span { display: block; margin-top: 1px; font-size: 10.5px; color: var(--steel); }
+
+  nav { display: flex; align-self: stretch; gap: 24px; }
+  .navbtn {
+    position: relative;
+    padding: 0 1px;
+    color: var(--steel);
+    font-size: 12.5px;
+  }
+  .navbtn:hover { color: var(--ink-2); }
+  .navbtn.active { color: var(--ink); font-weight: 600; }
+  .navbtn.active::after {
+    content: "";
+    position: absolute;
+    left: 0; right: 0; bottom: -1px;
+    height: 2px;
+    background: var(--rust);
+  }
+
+  .top-actions { display: flex; align-items: center; gap: 16px; }
+  .engine { display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--steel); }
+  .engine i { width: 6px; height: 6px; display: block; background: var(--ok); }
+  .linkbtn {
+    color: var(--ink-2);
+    font-size: 11.5px;
+    text-decoration: underline;
+    text-decoration-color: var(--rule-2);
+    text-underline-offset: 3px;
+  }
+  .linkbtn:hover { color: var(--rust); text-decoration-color: var(--rust); }
+
+  main { height: calc(100vh - 54px - 27px); overflow: hidden; }
+
+  .view {
+    height: 100%;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 340px;
+  }
+  .view[hidden] { display: none; }
+
+  .work { min-width: 0; padding: 24px 26px 0; overflow: auto; scrollbar-width: thin; }
+  .rail {
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+    border-left: 1px solid var(--rule);
+  }
+
+  .pagehead {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 24px;
+    margin-bottom: 20px;
+  }
+  .pagehead h1 {
+    margin: 0 0 4px;
+    font-size: 27px;
+    font-weight: 600;
+    line-height: 1.1;
+    letter-spacing: -.025em;
+  }
+  .pagehead p { margin: 0; max-width: 440px; color: var(--steel); font-size: 12px; }
+  .pipeline {
+    padding-top: 6px;
+    color: var(--steel);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    text-align: right;
+    white-space: nowrap;
+  }
+  .pipeline b { color: var(--ink-2); font-weight: 500; }
+
+  .intake {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 22px;
+    padding: 15px 16px;
+    border: 1px dashed var(--rule-2);
+    background: transparent;
+    transition: background .12s, border-color .12s;
+  }
+  .intake:hover, .intake.drag { background: rgba(255,255,255,.04); border-color: var(--ink-2); }
+
+  .how {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 18px;
+    margin-bottom: 18px;
+    padding: 10px 0 11px;
+    border-top: 1px solid var(--rule);
+    border-bottom: 1px solid var(--rule);
+  }
+  .how strong { display: block; margin-bottom: 2px; font-size: 11.5px; font-weight: 600; }
+  .how span { display: block; color: var(--steel); font-size: 10.5px; line-height: 1.4; }
+  .intake .mark {
+    width: 32px; height: 32px;
+    display: grid; place-items: center;
+    border: 1px solid var(--rule-2);
+    color: var(--ink-2);
+    font-size: 15px;
+    line-height: 1;
+  }
+  .intake .copy { flex: 1; min-width: 0; }
+  .intake h3 { margin: 0 0 2px; font-size: 13.5px; font-weight: 600; }
+  .intake p { margin: 0; color: var(--steel); font-size: 11.5px; }
+
+  .btn {
+    height: 30px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 0 12px;
+    border: 1px solid var(--rule-2);
+    background: var(--surface);
+    color: var(--ink);
+    font-size: 11.5px;
+    font-weight: 550;
+    white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--ink-2); background: var(--surface-2); }
+  .btn.primary { border-color: var(--rust); background: var(--rust); color: var(--on-rust); }
+  .btn.primary:hover { border-color: var(--rust-dark); background: var(--rust-dark); }
+  .btn.ghost { padding: 0 6px; border-color: transparent; background: none; color: var(--steel); }
+  .btn.ghost:hover { background: none; color: var(--ink); }
+  .btn.small { height: 24px; padding: 0 8px; font-size: 10.5px; }
+  .btn:disabled {
+    border-color: var(--rule);
+    background: var(--surface-2);
+    color: var(--steel);
+    cursor: not-allowed;
+  }
+
+  .rowhead {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    padding-bottom: 7px;
+    border-bottom: 1px solid var(--rule-2);
+  }
+  .rowhead h2 { margin: 0; font-size: 11.5px; font-weight: 650; letter-spacing: .005em; }
+  .rowhead .meta { color: var(--steel); font-family: var(--mono); font-size: 10.5px; }
+  .rowhead .actions { display: flex; align-items: center; gap: 10px; }
+
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    padding: 8px 10px 7px;
+    border-bottom: 1px solid var(--rule);
+    color: var(--steel);
+    font-size: 10.5px;
+    font-weight: 500;
+    text-align: left;
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 10px;
+    border-bottom: 1px solid var(--rule);
+    font-size: 12px;
+    vertical-align: middle;
+  }
+  tbody tr { transition: background .1s; }
+  tbody tr:hover { background: rgba(255,255,255,.04); }
+  td.num, th.num { font-family: var(--mono); font-size: 10.5px; color: var(--steel); font-variant-numeric: tabular-nums; }
+  th.num, td.num { text-align: right; }
+  .file { display: flex; flex-direction: column; gap: 1px; }
+  .file strong { font-size: 12px; font-weight: 550; letter-spacing: -.005em; }
+  .file span { color: var(--steel); font-size: 10.5px; }
+  .status { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 11px; white-space: nowrap; }
+  .status i { width: 6px; height: 6px; display: block; background: var(--steel); }
+  .status.ready i { background: var(--rust); }
+  .status.done i { background: var(--ok); }
+
+  .empty {
+    padding: 26px 0;
+    border-bottom: 1px solid var(--rule);
+    color: var(--steel);
+    font-size: 12px;
+  }
+
+  .railhead { padding: 19px 20px 14px; border-bottom: 1px solid var(--rule); }
+  .eyebrow { margin-bottom: 3px; color: var(--steel); font-size: 10.5px; }
+  .railhead h2 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.012em; }
+  .railhead .hint { margin-top: 3px; color: var(--steel); font-size: 11px; }
+
+  .railbody { flex: 1; min-height: 0; overflow: auto; padding: 16px 20px; scrollbar-width: thin; }
+
+  .field { margin-bottom: 16px; }
+  .field:last-child { margin-bottom: 0; }
+  .fieldhead { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 7px; }
+  .fieldhead span:first-child { font-size: 11.5px; font-weight: 600; }
+  .fieldhead span:last-child { color: var(--steel); font-size: 10.5px; }
+
+  .targets {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1px;
+    border: 1px solid var(--rule-2);
+    background: var(--rule-2);
+  }
+  .target {
+    position: relative;
+    height: 39px;
+    background: var(--surface);
+    color: var(--ink-2);
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .target:hover { background: var(--surface-2); color: var(--ink); }
+  .target.sel { background: var(--rust); color: var(--on-rust); }
+  .target.sel::after {
+    content: "";
+    position: absolute; top: 5px; right: 5px;
+    width: 4px; height: 4px;
+    background: var(--on-rust);
+  }
+
+  .seg { display: flex; border: 1px solid var(--rule-2); }
+  .seg button {
+    flex: 1;
+    height: 28px;
+    border-right: 1px solid var(--rule-2);
+    background: var(--surface);
+    font-size: 10.5px;
+  }
+  .seg button:last-child { border-right: 0; }
+  .seg button:hover { background: var(--surface-2); }
+  .seg button.on { background: var(--ink); color: var(--paper); }
+
+  .checkrow { display: flex; align-items: center; gap: 8px; padding: 7px 0; font-size: 11.5px; }
+  .check {
+    width: 13px; height: 13px;
+    display: grid; place-items: center;
+    border: 1px solid var(--rule-2);
+    background: var(--surface);
+    color: var(--on-rust);
+    font-size: 9px;
+  }
+  .check.on { border-color: var(--ink); background: var(--ink); }
+
+  .startwrap { padding: 13px 20px 17px; border-top: 1px solid var(--rule-2); background: var(--surface); }
+  .start {
+    width: 100%;
+    height: 38px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 12px;
+    background: var(--rust);
+    border: 1px solid var(--rust);
+    color: var(--on-rust);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .start:hover { background: var(--rust-dark); border-color: var(--rust-dark); }
+  .start span:last-child { font-family: var(--mono); font-size: 10px; font-weight: 400; }
+  .start:disabled {
+    background: var(--surface-2);
+    border-color: var(--rule);
+    color: var(--steel);
+    cursor: not-allowed;
+  }
+  .startnote { margin-top: 7px; color: var(--steel); font-size: 10.5px; }
+
+  .searchbar {
+    display: flex;
+    height: 38px;
+    margin-bottom: 8px;
+    border: 1px solid var(--rule-2);
+    background: var(--surface);
+  }
+  .searchbar:focus-within { border-color: var(--ink-2); }
+  .searchbar input {
+    flex: 1;
+    min-width: 0;
+    padding: 0 12px;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    font-size: 13px;
+  }
+  .searchbar input::placeholder { color: var(--steel); }
+  .searchbar .search {
+    width: 92px;
+    border-left: 1px solid var(--rule-2);
+    background: var(--rust);
+    color: var(--on-rust);
+    font-size: 11.5px;
+    font-weight: 600;
+  }
+  .searchbar .search:hover { background: var(--rust-dark); }
+
+  .underbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 15px;
+    color: var(--steel);
+    font-size: 11px;
+  }
+  .underbar .examples { display: flex; align-items: center; gap: 10px; }
+  .underbar .examples button {
+    color: var(--ink-2);
+    font-size: 11px;
+    text-decoration: underline;
+    text-decoration-color: var(--rule-2);
+    text-underline-offset: 3px;
+  }
+  .underbar .examples button:hover { color: var(--rust); text-decoration-color: var(--rust); }
+  .sortbtn { color: var(--ink-2); font-size: 11px; }
+  .sortbtn:hover { color: var(--rust); }
+
+  .results th:first-child, .results td:first-child { padding-left: 10px; }
+  .results { table-layout: fixed; }
+  .results th:nth-child(1) { width: auto; }
+  .results th:nth-child(2) { width: 100px; }
+  .results th:nth-child(3) { width: 62px; }
+  .results th:nth-child(4) { width: 44px; }
+  .results th:nth-child(5) { width: 40px; }
+  .results th:nth-child(6) { width: 68px; }
+  .results tbody tr { cursor: pointer; position: relative; }
+  .results tbody tr.selected { background: var(--rust-wash); }
+  .results tbody tr.selected::before {
+    content: "";
+    position: absolute; left: 0; top: 0; bottom: 0;
+    width: 3px;
+    background: var(--rust);
+  }
+  .repo { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .repo span { color: var(--steel); font-size: 10.5px; }
+  .repo strong {
+    overflow: hidden;
+    color: var(--ink);
+    font-size: 12px;
+    font-weight: 550;
+    letter-spacing: -.005em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tagline {
+    overflow: hidden;
+    color: var(--steel);
+    font-size: 10.5px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .results .muted { color: var(--steel); }
+
+  .inspector .modelname {
+    margin: 1px 0 3px;
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 1.25;
+    letter-spacing: -.015em;
+    overflow-wrap: anywhere;
+  }
+  .inspector .author { color: var(--steel); font-size: 11px; }
+  .openlink {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: 5px;
+    color: var(--rust);
+    font-size: 11px;
+    text-decoration: underline;
+    text-decoration-color: var(--rust-wash);
+    text-underline-offset: 3px;
+  }
+  .openlink:hover { text-decoration-color: var(--rust); }
+
+  .metricrow {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0;
+    margin: 14px 0 16px;
+    border-top: 1px solid var(--rule);
+    border-bottom: 1px solid var(--rule);
+  }
+  .metric { padding: 8px 0 7px; border-right: 1px solid var(--rule); }
+  .metric:not(:first-child) { padding-left: 10px; }
+  .metric:last-child { border-right: 0; }
+  .metric b { display: block; font: 12px var(--mono); font-weight: 500; color: var(--ink); }
+  .metric span { display: block; margin-top: 1px; color: var(--steel); font-size: 9.5px; }
+
+  .readme {
+    margin: 0;
+    color: var(--ink-2);
+    font-size: 11.5px;
+    line-height: 1.55;
+    display: -webkit-box;
+    -webkit-line-clamp: 5;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .facts { border-top: 1px solid var(--rule); }
+  .fact {
+    display: grid;
+    grid-template-columns: 84px 1fr;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--rule);
+    font-size: 11px;
+  }
+  .fact span { color: var(--steel); }
+  .fact b { font-weight: 500; color: var(--ink-2); overflow-wrap: anywhere; }
+  .fact b.mono { font-family: var(--mono); font-size: 10.5px; }
+
+  .filter {
+    width: 100%;
+    height: 27px;
+    margin: 6px 0 0;
+    padding: 0 8px;
+    border: 1px solid var(--rule);
+    background: var(--paper);
+    outline: 0;
+    font-size: 10.5px;
+  }
+  .filter:focus { border-color: var(--ink-2); }
+  .filter::placeholder { color: var(--steel); }
+
+  .filelist { margin-top: 4px; }
+  .filerow {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto 20px;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  .filerow .fname {
+    overflow: hidden;
+    color: var(--ink-2);
+    font: 10px var(--mono);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .filerow .fsize { color: var(--steel); font: 9.5px var(--mono); white-space: nowrap; }
+  .filerow .dl { color: var(--rust); font-size: 13px; line-height: 1; }
+  .filerow .dl:hover { color: var(--rust-dark); }
+
+  .statusbar {
+    height: 27px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 0 14px;
+    border-top: 1px solid var(--rule);
+    background: var(--surface);
+    color: var(--steel);
+    font-size: 10.5px;
+  }
+  .statusbar .left, .statusbar .right { display: flex; align-items: center; gap: 14px; }
+  .statusbar .dot { width: 5px; height: 5px; background: var(--rust); }
+  kbd {
+    padding: 0 4px;
+    border: 1px solid var(--rule);
+    background: var(--paper);
+    color: var(--ink-2);
+    font: 9.5px var(--mono);
+  }
+  .statusbar .sep { color: var(--rule-2); }
+
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 42px;
+    transform: translateX(-50%) translateY(8px);
+    padding: 8px 12px;
+    background: var(--ink);
+    color: var(--paper);
+    font-size: 11.5px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .15s, transform .15s;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  @media (max-width: 940px) {
+    .view { grid-template-columns: minmax(0, 1fr) 310px; }
+    .top-actions .engine { display: none; }
+    .brand { min-width: 0; }
+    .pagehead .pipeline { display: none; }
+    .underbar .examples { display: none; }
+    .queue th:nth-child(2), .queue td:nth-child(2),
+    .queue th:nth-child(3), .queue td:nth-child(3) { display: none; }
+    .results th:nth-child(2), .results td:nth-child(2),
+    .results th:nth-child(4), .results td:nth-child(4),
+    .results th:nth-child(5), .results td:nth-child(5),
+    .results th:nth-child(6), .results td:nth-child(6) { display: none; }
+    .results, .results tbody { display: block; }
+    .results thead { display: none; }
+    .results tbody tr {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 64px;
+      align-items: center;
+      border-bottom: 1px solid var(--rule);
+    }
+    .results tbody td { display: block; padding: 7px 10px; border-bottom: 0; }
+    .results tbody td:nth-child(2), .results tbody td:nth-child(4),
+    .results tbody td:nth-child(5), .results tbody td:nth-child(6) { display: none; }
+    .results tbody td:nth-child(3) { grid-column: 2; grid-row: 1; text-align: right; padding-right: 4px; }
+  }
+
+  @media (max-width: 720px) {
+    .view { grid-template-columns: 1fr; }
+    .rail { display: none; }
+    .top-actions .linkbtn { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <img src="assets/rustblock-logo.png" alt="RustBlock">
+    <div>
+      <strong>RustBlock</strong>
+      <span>GGUF workshop</span>
+    </div>
+  </div>
+
+  <nav aria-label="Workspace">
+    <button class="navbtn active" data-tab="convert">Convert</button>
+    <button class="navbtn" data-tab="discover">Discover</button>
+  </nav>
+
+  <div class="top-actions">
+    <span class="engine"><i></i>LM Studio ready</span>
+    <button class="linkbtn" data-toast="Settings are part of the next build.">Settings</button>
+    <button class="linkbtn" data-toast="Activity log opened.">Log</button>
+  </div>
+</header>
+
+<main>
+  <section class="view" id="convert">
+    <div class="work">
+      <div class="pagehead">
+        <div>
+          <h1>Convert</h1>
+          <p>Turn a GGUF into another layout. The source file is never modified.</p>
+        </div>
+        <div class="pipeline">source <b>GGUF</b> → target <b id="targetEcho">F16</b></div>
+      </div>
+
+      <div class="how">
+        <div><strong>Add a model</strong><span>Drop a .gguf here, or download one from Discover. The original is never changed.</span></div>
+        <div><strong>Choose a layout</strong><span>Pick an output on the right. If you are unsure, Q4_K is the usual balance.</span></div>
+        <div><strong>Start</strong><span>RustBlock writes a new file, checks it, then leaves it in the destination.</span></div>
+      </div>
+
+      <div class="intake" id="intake">
+        <div class="mark">↓</div>
+        <div class="copy">
+          <h3>Drop GGUF files here</h3>
+          <p>Several files are fine. Each one becomes a separate job.</p>
+        </div>
+        <button class="btn" id="browseBtn">Browse files</button>
+      </div>
+
+      <div class="rowhead">
+        <h2>Queue</h2>
+        <div class="actions">
+          <span class="meta" id="queueMeta">2 files · 9.1 GB</span>
+          <button class="btn ghost" id="clearQueue">Clear</button>
+        </div>
+      </div>
+
+      <table class="queue">
+        <thead>
+          <tr>
+            <th>File</th>
+            <th>Layout</th>
+            <th class="num">Size</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="queueBody">
+          <tr>
+            <td><div class="file"><strong>Qwen3-8B-Q5_K_M.gguf</strong><span>Q5_K_M · 8.2B parameters</span></div></td>
+            <td class="num">Q5_K</td>
+            <td class="num">5.7 GB</td>
+            <td><span class="status ready"><i></i>Ready</span></td>
+            <td style="text-align:right"><button class="btn ghost small remove">Remove</button></td>
+          </tr>
+          <tr>
+            <td><div class="file"><strong>Llama-3.2-3B-Q8_0.gguf</strong><span>Q8_0 · 3.2B parameters</span></div></td>
+            <td class="num">Q8_0</td>
+            <td class="num">3.4 GB</td>
+            <td><span class="status"><i></i>Queued</span></td>
+            <td style="text-align:right"><button class="btn ghost small remove">Remove</button></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="empty" id="queueEmpty" hidden>Nothing queued yet. Drop a GGUF above, or pull one from Discover.</div>
+    </div>
+
+    <aside class="rail">
+      <div class="railhead">
+        <div class="eyebrow">Output</div>
+        <h2 id="targetTitle">F16</h2>
+        <div class="hint" id="targetHint">16-bit float. The usual source for quantization.</div>
+      </div>
+
+      <div class="railbody">
+        <div class="field">
+          <div class="fieldhead"><span>Layout</span><span id="targetGroup">float</span></div>
+          <div class="targets" id="targets">
+            <button class="target" data-target="Q2_0" data-hint="Lossless Prism PQ2_0 → upstream Q2_0 reblocking." data-group="reblock">Q2_0</button>
+            <button class="target" data-target="F32" data-hint="32-bit float. Largest file, maximum compatibility." data-group="float">F32</button>
+            <button class="target sel" data-target="F16" data-hint="16-bit float. The usual source for quantization." data-group="float">F16</button>
+            <button class="target" data-target="BF16" data-hint="bfloat16. Same range as F32, less mantissa." data-group="float">BF16</button>
+            <button class="target" data-target="Q8_0" data-hint="8-bit block quantization. Near-lossless." data-group="block">Q8_0</button>
+            <button class="target" data-target="Q5_0" data-hint="5-bit block quantization." data-group="block">Q5_0</button>
+            <button class="target" data-target="Q5_1" data-hint="5-bit blocks with a stored minimum. Older but compatible." data-group="block">Q5_1</button>
+            <button class="target" data-target="Q4_0" data-hint="4-bit block quantization." data-group="block">Q4_0</button>
+            <button class="target" data-target="Q4_1" data-hint="4-bit blocks with a stored minimum." data-group="block">Q4_1</button>
+            <button class="target" data-target="Q2_K" data-hint="2-bit K-quant. Smallest common K format." data-group="k-quant">Q2_K</button>
+            <button class="target" data-target="Q3_K" data-hint="3-bit K-quant." data-group="k-quant">Q3_K</button>
+            <button class="target" data-target="Q4_K" data-hint="4-bit K-quant. Uniform, not mixed Q4_K_M." data-group="k-quant">Q4_K</button>
+            <button class="target" data-target="Q5_K" data-hint="5-bit K-quant." data-group="k-quant">Q5_K</button>
+            <button class="target" data-target="Q6_K" data-hint="6-bit K-quant." data-group="k-quant">Q6_K</button>
+            <button class="target" data-target="TQ1_0" data-hint="Ternary 1.69-bit. Experimental; needs a compatible runtime." data-group="ternary">TQ1_0</button>
+            <button class="target" data-target="TQ2_0" data-hint="Ternary 2.06-bit. Experimental; needs a compatible runtime." data-group="ternary">TQ2_0</button>
+            <button class="target" data-target="MXFP4" data-hint="4-bit block float for newer small/MoE models." data-group="fp4">MXFP4</button>
+            <button class="target" data-target="NVFP4" data-hint="NVIDIA 4-bit float. Recent runtime required." data-group="fp4">NVFP4</button>
+            <button class="target" data-target="Q1_0" data-hint="1-bit. Smallest and most destructive; experimental." data-group="1-bit">Q1_0</button>
+          </div>
+          <div class="startnote">New to this? Q4_K is the usual choice. F16 keeps the most quality; Q2_K and Q1_0 save the most space.</div>
+        </div>
+
+        <div class="field">
+          <div class="fieldhead"><span>Verification</span><span>after write</span></div>
+          <div class="seg" id="verify">
+            <button data-verify="none">None</button>
+            <button class="on" data-verify="structure">Structure</button>
+            <button data-verify="full">Full</button>
+          </div>
+          <div class="checkrow"><span class="check on" id="overwriteCheck">×</span> Overwrite existing outputs</div>
+        </div>
+
+        <div class="field">
+          <div class="fieldhead"><span>Destination</span><span>same folder</span></div>
+          <div class="fact" style="border-top:1px solid var(--rule)">
+            <span>Output name</span><b class="mono" id="outputName">Qwen3-8B-Q5_K_M-F16.gguf</b>
+          </div>
+        </div>
+      </div>
+
+      <div class="startwrap">
+        <button class="start" id="startBtn"><span>Start conversion</span><span>Ctrl + Enter</span></button>
+        <div class="startnote">2 files queued. Nothing is written until you start.</div>
+      </div>
+    </aside>
+  </section>
+
+  <section class="view" id="discover" hidden>
+    <div class="work">
+      <div class="pagehead">
+        <div>
+          <h1>Discover</h1>
+          <p>Search by name, or paste a full Hugging Face link. Inspect the card, then download a file.</p>
+        </div>
+        <div class="pipeline">index <b>huggingface.co</b> · gguf</div>
+      </div>
+
+      <form class="searchbar" id="searchForm">
+        <input id="searchInput" type="search" value="Qwen" placeholder="Model name, or paste huggingface.co/author/model" autocomplete="off">
+        <button class="search" type="submit">Search</button>
+      </form>
+
+      <div class="startnote" style="margin:-2px 0 10px">Paste a model URL and press Enter to open its files directly. Dataset and Space links are not models.</div>
+
+      <div class="underbar">
+        <div class="examples">
+          <span>Try</span>
+          <button data-query="Qwen">Qwen</button>
+          <button data-query="Llama">Llama</button>
+          <button data-query="Mistral">Mistral</button>
+          <button data-query="DeepSeek">DeepSeek</button>
+          <button data-query="vision">vision</button>
+        </div>
+        <button class="sortbtn" id="sortBtn">Sort: downloads ↓</button>
+      </div>
+
+      <div class="rowhead" style="margin-bottom:0">
+        <h2>Repositories</h2>
+        <span class="meta" id="resultCount">6 results · sorted by downloads</span>
+      </div>
+
+      <table class="results">
+        <thead>
+          <tr>
+            <th>Repository</th>
+            <th>Pipeline</th>
+            <th class="num">Downloads</th>
+            <th class="num">Likes</th>
+            <th class="num">GGUF</th>
+            <th class="num">Updated</th>
+          </tr>
+        </thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
+      <div class="empty" id="noResults" hidden>No repositories match that search. Try a broader term.</div>
+    </div>
+
+    <aside class="rail inspector">
+      <div class="railhead">
+        <div class="eyebrow">Inspector</div>
+        <h2 style="font-size:11px;font-weight:500;color:var(--steel)">Selected model</h2>
+      </div>
+
+      <div class="railbody">
+        <div class="modelname" id="modelName">Qwen3.8-Flash-Next-GSQ-RCO-GGUF</div>
+        <div class="author"><span id="modelAuthor">ISTA-DASLab</span> · <span id="modelPipeline">image-text-to-text</span>
+          <a href="https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF" target="_blank" rel="noreferrer" class="openlink" id="modelOpen">Open ↗</a>
+        </div>
+
+        <div class="metricrow">
+          <div class="metric"><b id="mDownloads">7.7M</b><span>downloads</span></div>
+          <div class="metric"><b id="mLikes">1.1k</b><span>likes</span></div>
+          <div class="metric"><b id="mFiles">9</b><span>GGUF files</span></div>
+        </div>
+
+        <div class="field">
+          <div class="fieldhead"><span>About</span><span id="updatedLabel">updated 2026-09-29</span></div>
+          <p class="readme" id="modelAbout">Q-RCO GGUF release card for Qwen3.8-Flash-Next. Mirrors the Qwen3.8-27B card. The YAML block must remain the very first bytes of the file (HF requirement).</p>
+        </div>
+
+        <div class="field">
+          <div class="fieldhead"><span>Facts</span><span>from the model card</span></div>
+          <div class="facts" id="modelFacts">
+            <div class="fact"><span>Architecture</span><b class="mono">qwen3exp</b></div>
+            <div class="fact"><span>Library</span><b>gguf</b></div>
+            <div class="fact"><span>Context</span><b class="mono">262.1k tokens</b></div>
+            <div class="fact"><span>Payload</span><b class="mono">164.8 GiB</b></div>
+            <div class="fact"><span>Repository</span><b class="mono">194.1 GiB</b></div>
+            <div class="fact"><span>License</span><b>apache-2.0</b></div>
+            <div class="fact"><span>Base model</span><b class="mono">Qwen/Qwen3.8-Flash-Next</b></div>
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="fieldhead"><span>GGUF files</span><span id="fileCount">9 files</span></div>
+          <input class="filter" id="fileFilter" placeholder="Filter by quant or folder">
+          <div class="filelist" id="fileList">
+            <div class="filerow"><span class="fname">IQ2_XS/Qwen3.8-Flash-…-00002-of-00002.gguf</span><span class="fsize">26.8 GiB</span><button class="dl" title="Download">↓</button></div>
+            <div class="filerow"><span class="fname">IQ3_Q5/Qwen3.8-Flash-…-00002-of-00002.gguf</span><span class="fsize">26.8 GiB</span><button class="dl" title="Download">↓</button></div>
+            <div class="filerow"><span class="fname">IQ3_XXS/Qwen3.8-Flash-…-00002-of-00002.gguf</span><span class="fsize">26.8 GiB</span><button class="dl" title="Download">↓</button></div>
+            <div class="filerow"><span class="fname">Q2_0/Qwen3.8-Flash-…-00001-of-00002.gguf</span><span class="fsize">26.8 GiB</span><button class="dl" title="Download">↓</button></div>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </section>
+</main>
+
+<footer class="statusbar">
+  <div class="left">
+    <span class="dot"></span><span id="statusText">Ready</span>
+    <span class="sep">|</span><span id="statusQueue">2 files · 0 converted</span>
+    <span class="sep">|</span><span>APACHE-2.0 source</span>
+  </div>
+  <div class="right">
+    <span><kbd>Ctrl</kbd> <kbd>1</kbd> Convert</span>
+    <span><kbd>Ctrl</kbd> <kbd>2</kbd> Discover</span>
+    <span><kbd>Ctrl</kbd> <kbd>Enter</kbd> Start</span>
+  </div>
+</footer>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const models = [
+  {
+    author: "ISTA-DASLab",
+    name: "Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+    pipeline: "image-text-to-text",
+    downloads: "7.7M",
+    likes: "1.1k",
+    files: 9,
+    updated: "2026-09-29",
+    about: "Q-RCO GGUF release card for Qwen3.8-Flash-Next. Mirrors the Qwen3.8-27B card. The YAML block must remain the very first bytes of the file (HF requirement).",
+    facts: [
+      ["Architecture", "qwen3exp", true], ["Library", "gguf", false],
+      ["Context", "262.1k tokens", true], ["Payload", "164.8 GiB", true],
+      ["Repository", "194.1 GiB", true], ["License", "apache-2.0", false],
+      ["Base model", "Qwen/Qwen3.8-Flash-Next", true]
+    ]
+  },
+  {
+    author: "unsloth",
+    name: "Qwen3-8B-GGUF",
+    pipeline: "text-generation",
+    downloads: "3.2M",
+    likes: "684",
+    files: 12,
+    updated: "2026-10-18",
+    about: "Unsloth dynamic GGUF quantizations for Qwen3-8B. Includes Q4_K_XL, Q5_K_XL and Q8_0 builds with the original chat template.",
+    facts: [
+      ["Architecture", "qwen3", true], ["Library", "gguf", false],
+      ["Context", "40.9k tokens", true], ["Payload", "16.4 GiB", true],
+      ["Repository", "24.8 GiB", true], ["License", "apache-2.0", false],
+      ["Base model", "Qwen/Qwen3-8B", true]
+    ]
+  },
+  {
+    author: "bartowski",
+    name: "Llama-3.1-8B-Instruct-GGUF",
+    pipeline: "text-generation",
+    downloads: "2.8M",
+    likes: "1.4k",
+    files: 15,
+    updated: "2026-08-04",
+    about: "Llama 3.1 8B Instruct quantized with llama.cpp. File naming follows the standard Q_K_M ladder; an imatrix build is included.",
+    facts: [
+      ["Architecture", "llama", true], ["Library", "gguf", false],
+      ["Context", "131.1k tokens", true], ["Payload", "8.6 GiB", true],
+      ["Repository", "14.2 GiB", true], ["License", "llama3.1", false],
+      ["Base model", "meta-llama/Llama-3.1-8B-Instruct", true]
+    ]
+  },
+  {
+    author: "bartowski",
+    name: "Mistral-Nemo-Instruct-2407-GGUF",
+    pipeline: "text-generation",
+    downloads: "1.6M",
+    likes: "812",
+    files: 18,
+    updated: "2026-07-22",
+    about: "Quantized Mistral Nemo 12B instruct. K-quant and i-quant variants, with the official tokenizer and chat template preserved.",
+    facts: [
+      ["Architecture", "llama", true], ["Library", "gguf", false],
+      ["Context", "131.1k tokens", true], ["Payload", "12.2 GiB", true],
+      ["Repository", "21.4 GiB", true], ["License", "apache-2.0", false],
+      ["Base model", "mistralai/Mistral-Nemo-Instruct-2407", true]
+    ]
+  },
+  {
+    author: "unsloth",
+    name: "DeepSeek-R1-Distill-Qwen-7B-GGUF",
+    pipeline: "text-generation",
+    downloads: "980k",
+    likes: "522",
+    files: 10,
+    updated: "2026-06-11",
+    about: "Distilled DeepSeek R1 reasoning model based on Qwen2.5 7B. Includes dynamic 4-bit and 6-bit quantizations for local inference.",
+    facts: [
+      ["Architecture", "qwen2", true], ["Library", "gguf", false],
+      ["Context", "32.8k tokens", true], ["Payload", "7.4 GiB", true],
+      ["Repository", "11.9 GiB", true], ["License", "apache-2.0", false],
+      ["Base model", "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", true]
+    ]
+  },
+  {
+    author: "ggml-org",
+    name: "Qwen2.5-VL-7B-Instruct-GGUF",
+    pipeline: "image-text-to-text",
+    downloads: "740k",
+    likes: "398",
+    files: 6,
+    updated: "2026-05-30",
+    about: "Vision-language Qwen2.5 build for llama.cpp. Requires a projector file; text and image tensors are split across two GGUFs.",
+    facts: [
+      ["Architecture", "qwen2vl", true], ["Library", "gguf", false],
+      ["Context", "32.8k tokens", true], ["Payload", "9.1 GiB", true],
+      ["Repository", "13.7 GiB", true], ["License", "apache-2.0", false],
+      ["Base model", "Qwen/Qwen2.5-VL-7B-Instruct", true]
+    ]
+  }
+];
+
+const state = { selected: 0, sort: 0, query: "Qwen" };
+const sorts = [
+  { label: "downloads", key: "down" },
+  { label: "likes", key: "like" },
+  { label: "recent", key: "recent" }
+];
+
+function numberFrom(value) {
+  const n = parseFloat(value);
+  if (value.includes("M")) return n * 1e6;
+  if (value.includes("k")) return n * 1e3;
+  return n;
+}
+
+function visibleModels() {
+  const q = state.query.trim().toLowerCase();
+  let list = models.filter(m => !q || (m.author + " " + m.name + " " + m.pipeline).toLowerCase().includes(q));
+  if (state.sort === 1) list = [...list].sort((a, b) => numberFrom(b.likes) - numberFrom(a.likes));
+  else if (state.sort === 2) list = [...list].sort((a, b) => b.updated.localeCompare(a.updated));
+  else list = [...list].sort((a, b) => numberFrom(b.downloads) - numberFrom(a.downloads));
+  return list;
+}
+
+function renderResults() {
+  const list = visibleModels();
+  const body = document.getElementById("resultsBody");
+  body.innerHTML = list.map((m, i) => {
+    const original = models.indexOf(m);
+    return `<tr data-index="${original}" class="${original === state.selected ? "selected" : ""}">
+      <td><div class="repo"><span>${m.author}</span><strong>${m.name}</strong></div></td>
+      <td><div class="tagline">${m.pipeline}</div></td>
+      <td class="num">${m.downloads}</td>
+      <td class="num">${m.likes}</td>
+      <td class="num">${m.files}</td>
+      <td class="num">${m.updated}</td>
+    </tr>`;
+  }).join("");
+  document.getElementById("resultCount").textContent = `${list.length} result${list.length === 1 ? "" : "s"} · sorted by ${sorts[state.sort].label}`;
+  document.getElementById("noResults").hidden = list.length !== 0;
+  body.querySelectorAll("tr").forEach(row => row.addEventListener("click", () => {
+    state.selected = Number(row.dataset.index);
+    renderResults();
+    renderInspector();
+  }));
+}
+
+function renderInspector() {
+  const m = models[state.selected];
+  document.getElementById("modelName").textContent = m.name;
+  document.getElementById("modelAuthor").textContent = m.author;
+  document.getElementById("modelPipeline").textContent = m.pipeline;
+  document.getElementById("modelOpen").href = `https://huggingface.co/${m.author}/${m.name}`;
+  document.getElementById("mDownloads").textContent = m.downloads;
+  document.getElementById("mLikes").textContent = m.likes;
+  document.getElementById("mFiles").textContent = m.files;
+  document.getElementById("updatedLabel").textContent = `updated ${m.updated}`;
+  document.getElementById("modelAbout").textContent = m.about;
+  document.getElementById("fileCount").textContent = `${m.files} files`;
+  document.getElementById("modelFacts").innerHTML = m.facts.map(([k, v, mono]) =>
+    `<div class="fact"><span>${k}</span><b class="${mono ? "mono" : ""}">${v}</b></div>`).join("");
+}
+
+const toast = document.getElementById("toast");
+let toastTimer;
+function showToast(text) {
+  toast.textContent = text;
+  toast.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove("show"), 1800);
+}
+
+document.querySelectorAll("[data-toast]").forEach(el => el.addEventListener("click", () => showToast(el.dataset.toast)));
+
+function setTab(tab) {
+  document.querySelectorAll(".navbtn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+  document.getElementById("convert").hidden = tab !== "convert";
+  document.getElementById("discover").hidden = tab !== "discover";
+}
+document.querySelectorAll(".navbtn").forEach(b => b.addEventListener("click", () => setTab(b.dataset.tab)));
+
+document.querySelectorAll(".target").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll(".target").forEach(x => x.classList.remove("sel"));
+  b.classList.add("sel");
+  document.getElementById("targetTitle").textContent = b.dataset.target;
+  document.getElementById("targetHint").textContent = b.dataset.hint;
+  document.getElementById("targetGroup").textContent = b.dataset.group;
+  document.getElementById("targetEcho").textContent = b.dataset.target;
+  document.getElementById("outputName").textContent = `Qwen3-8B-Q5_K_M-${b.dataset.target}.gguf`;
+}));
+
+document.querySelectorAll("#verify button").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll("#verify button").forEach(x => x.classList.remove("on"));
+  b.classList.add("on");
+}));
+
+document.getElementById("overwriteCheck").addEventListener("click", e => e.currentTarget.classList.toggle("on"));
+
+document.getElementById("browseBtn").addEventListener("click", () => showToast("Native file picker opens here in the desktop build."));
+document.getElementById("intake").addEventListener("click", e => {
+  if (e.target.id !== "browseBtn") showToast("Drop .gguf files anywhere on this strip.");
+});
+
+function updateQueue() {
+  const rows = document.querySelectorAll("#queueBody tr");
+  const empty = rows.length === 0;
+  document.getElementById("queueEmpty").hidden = !empty;
+  document.getElementById("queueMeta").textContent = empty ? "0 files" : `${rows.length} file${rows.length === 1 ? "" : "s"} · 9.1 GB`;
+  document.getElementById("statusQueue").textContent = empty ? "0 files · 0 converted" : `${rows.length} files · 0 converted`;
+  document.getElementById("startBtn").disabled = empty;
+  document.querySelector(".startwrap .startnote").textContent = empty ? "Add a file to enable conversion." : `${rows.length} file${rows.length === 1 ? "" : "s"} queued. Nothing is written until you start.`;
+}
+document.querySelectorAll(".remove").forEach(b => b.addEventListener("click", () => { b.closest("tr").remove(); updateQueue(); }));
+document.getElementById("clearQueue").addEventListener("click", () => { document.getElementById("queueBody").innerHTML = ""; updateQueue(); });
+document.getElementById("startBtn").addEventListener("click", () => {
+  if (document.getElementById("startBtn").disabled) return;
+  showToast("Conversion starts here. This is a design prototype.");
+});
+
+document.getElementById("searchForm").addEventListener("submit", e => {
+  e.preventDefault();
+  const value = document.getElementById("searchInput").value.trim();
+  const link = value.match(/huggingface\.co\/([^/]+)\/([^/?#]+)/i);
+  if (link) {
+    document.getElementById("searchInput").value = `${link[1]}/${link[2]}`;
+    showToast(`Desktop build opens ${link[1]}/${link[2]} and lists its GGUF files.`);
+    return;
+  }
+  state.query = value;
+  renderResults();
+  if (visibleModels().length) {
+    state.selected = models.indexOf(visibleModels()[0]);
+    renderInspector();
+  }
+});
+document.querySelectorAll("[data-query]").forEach(b => b.addEventListener("click", () => {
+  document.getElementById("searchInput").value = b.dataset.query;
+  state.query = b.dataset.query;
+  renderResults();
+  if (visibleModels().length) {
+    state.selected = models.indexOf(visibleModels()[0]);
+    renderInspector();
+  }
+}));
+document.getElementById("sortBtn").addEventListener("click", e => {
+  state.sort = (state.sort + 1) % sorts.length;
+  e.currentTarget.textContent = `Sort: ${sorts[state.sort].label} ↓`;
+  renderResults();
+});
+document.getElementById("fileFilter").addEventListener("input", e => {
+  const q = e.target.value.toLowerCase();
+  document.querySelectorAll("#fileList .filerow").forEach(row => {
+    row.hidden = q && !row.textContent.toLowerCase().includes(q);
+  });
+});
+document.querySelectorAll(".dl").forEach(b => b.addEventListener("click", () => showToast("Download joins the queue in the desktop build.")));
+
+document.addEventListener("keydown", e => {
+  if (e.ctrlKey && e.key === "1") { e.preventDefault(); setTab("convert"); }
+  if (e.ctrlKey && e.key === "2") { e.preventDefault(); setTab("discover"); }
+  if (e.ctrlKey && e.key === "Enter") { e.preventDefault(); document.getElementById("startBtn").click(); }
+  if (e.key === "/" && document.activeElement.tagName !== "INPUT") {
+    e.preventDefault();
+    setTab("discover");
+    document.getElementById("searchInput").focus();
+  }
+});
+
+renderResults();
+renderInspector();
+updateQueue();
+</script>
+</body>
+</html>

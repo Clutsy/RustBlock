@@ -1,16 +1,20 @@
 [package]
-name = "ternary-reblock-gui"
+name = "rustblock-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Desktop GUI for ternary-reblock: lossless PQ2_0 -> Q2_0 conversion"
+description = "RustBlock - native desktop toolkit for GGUF model conversion"
 
 [[bin]]
-name = "ternary-reblock-gui"
+name = "rustblock-gui"
 path = "src/main.rs"
 
 [dependencies]
-ternary-reblock-core = { path = "../core" }
+rustblock-core = { path = "../core" }
 eframe.workspace = true
 rfd.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+urlencoding.workspace = true
+image.workspace = true

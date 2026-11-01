@@ -2,8 +2,8 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use ternary_reblock_core::gguf::{align_up, Gguf};
-use ternary_reblock_core::{
+use rustblock_core::gguf::{align_up, Gguf};
+use rustblock_core::{
     convert, ConvertError, ConvertOptions, VerifyMode, TY_PQ2_0, TY_PTQ1_0, TY_Q2_0,
 };
 

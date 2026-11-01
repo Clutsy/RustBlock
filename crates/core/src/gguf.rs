@@ -80,6 +80,10 @@ pub struct Gguf {
     pub file_len: u64,
     pub data_start: u64,
     pub alignment: u64,
+    /// Absolute offset where tensor-info records begin (after the KV section).
+    pub tensor_info_start: u64,
+    /// Absolute offset just past the last tensor-info record.
+    pub tensor_info_end: u64,
     /// Raw bytes of the header, including padding up to `data_start`.
     pub header: Vec<u8>,
     pub kv: Vec<KvEntry>,
@@ -176,6 +180,8 @@ impl Gguf {
             });
         }
 
+        let tensor_info_start = r.pos;
+
         if alignment == 0 || !alignment.is_power_of_two() || alignment > (1 << 24) {
             return Err(GgufError::InvalidAlignment(alignment));
         }
@@ -250,6 +256,7 @@ impl Gguf {
         }
 
         let header_end = r.pos;
+        let tensor_info_end = header_end;
 
         let data_start = align_up(header_end, alignment)
             .ok_or_else(|| GgufError::Malformed("tensor data start offset overflow".into()))?;
@@ -314,6 +321,8 @@ impl Gguf {
             file_len,
             data_start,
             alignment,
+            tensor_info_start,
+            tensor_info_end,
             header,
             kv,
             tensors,

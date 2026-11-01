@@ -1,5 +1,4 @@
-//! Background worker. One thread processes the selected jobs sequentially and
-//! reports progress over a channel, so the UI never blocks on disk I/O.
+//! Background conversion/verification worker.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,11 +7,12 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use ternary_reblock_core::{
-    convert, ConvertOptions, Gguf, Phase, Progress, Report, VerifyMode, TY_Q2_0,
+use rustblock_core::{
+    convert, transcode, ConvertOptions, Gguf, Phase, Progress, Report, Target, VerifyMode,
 };
 
-use crate::model::VerifyOutcome;
+use crate::model::{InstallResult, InstallTarget, VerifyKind, VerifyOutcome};
+use crate::targets;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkKind {
@@ -26,15 +26,16 @@ pub struct WorkItem {
     pub kind: WorkKind,
     pub input: PathBuf,
     pub output: PathBuf,
+    pub target: Target,
     pub verify: VerifyMode,
     pub force: bool,
+    pub install: InstallTarget,
 }
 
 #[derive(Debug)]
 pub enum Event {
     Started {
         id: u64,
-        kind: WorkKind,
     },
     Progress {
         id: u64,
@@ -48,6 +49,8 @@ pub enum Event {
     Done {
         id: u64,
         report: Report,
+        target: Target,
+        install: Option<InstallResult>,
     },
     Verified {
         id: u64,
@@ -82,69 +85,92 @@ fn run_batch(items: Vec<WorkItem>, tx: Sender<Event>, cancel: Arc<AtomicBool>) {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        if tx
-            .send(Event::Started {
-                id: item.id,
-                kind: item.kind,
-            })
-            .is_err()
-        {
+        if tx.send(Event::Started { id: item.id }).is_err() {
             return;
         }
         let item_started = Instant::now();
 
-        let result = match item.kind {
+        match item.kind {
             WorkKind::Convert => {
                 let mut progress = |p: &Progress| send_progress(&tx, item.id, p);
-                convert(
+                match transcode(
                     &item.input,
                     &item.output,
+                    item.target,
                     ConvertOptions {
                         force: item.force,
                         dry_run: false,
                         verify: item.verify,
                     },
                     Some(&mut progress),
-                )
-                .map(Outcome::Converted)
-                .map_err(|e| e.to_string())
-            }
-            WorkKind::Verify => verify_item(&item, &tx).map(Outcome::Verified),
-        };
-
-        match result {
-            Ok(Outcome::Converted(report)) => {
-                converted += 1;
-                if tx
-                    .send(Event::Done {
-                        id: item.id,
-                        report,
-                    })
-                    .is_err()
-                {
-                    return;
+                ) {
+                    Ok(report) => {
+                        let install = if matches!(item.install, InstallTarget::None) {
+                            None
+                        } else {
+                            Some(
+                                match targets::install_model(
+                                    &item.install,
+                                    &item.output,
+                                    &item
+                                        .output
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "model.gguf".to_string()),
+                                ) {
+                                    Ok(message) => InstallResult::Installed(message),
+                                    Err(error) => InstallResult::Failed(error),
+                                },
+                            )
+                        };
+                        converted += 1;
+                        if tx
+                            .send(Event::Done {
+                                id: item.id,
+                                report,
+                                target: item.target,
+                                install,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        if tx
+                            .send(Event::Failed {
+                                id: item.id,
+                                error: error.to_string(),
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                 }
             }
-            Ok(Outcome::Verified(outcome)) => {
-                verified += 1;
-                let elapsed = item_started.elapsed();
-                if tx
-                    .send(Event::Verified {
-                        id: item.id,
-                        outcome,
-                        elapsed,
-                    })
-                    .is_err()
-                {
-                    return;
+            WorkKind::Verify => match verify_item(&item, &tx) {
+                Ok(outcome) => {
+                    verified += 1;
+                    if tx
+                        .send(Event::Verified {
+                            id: item.id,
+                            outcome,
+                            elapsed: item_started.elapsed(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
-            }
-            Err(error) => {
-                failed += 1;
-                if tx.send(Event::Failed { id: item.id, error }).is_err() {
-                    return;
+                Err(error) => {
+                    failed += 1;
+                    if tx.send(Event::Failed { id: item.id, error }).is_err() {
+                        return;
+                    }
                 }
-            }
+            },
         }
     }
 
@@ -156,17 +182,14 @@ fn run_batch(items: Vec<WorkItem>, tx: Sender<Event>, cancel: Arc<AtomicBool>) {
     });
 }
 
-enum Outcome {
-    Converted(Report),
-    Verified(VerifyOutcome),
-}
-
 fn verify_item(item: &WorkItem, tx: &Sender<Event>) -> Result<VerifyOutcome, String> {
     let g = Gguf::open(&item.input).map_err(|e| e.to_string())?;
 
     if g.has_ptq1() {
-        return Ok(VerifyOutcome::Ptq1 {
+        return Ok(VerifyOutcome {
             tensors: g.tensors.len(),
+            kind: VerifyKind::Structure,
+            label: "PTQ1_0 is structurally readable but cannot be converted losslessly".to_string(),
         });
     }
 
@@ -184,21 +207,24 @@ fn verify_item(item: &WorkItem, tx: &Sender<Event>) -> Result<VerifyOutcome, Str
             Some(&mut progress),
         )
         .map_err(|e| e.to_string())?;
-        return Ok(VerifyOutcome::Pq2 {
+        return Ok(VerifyOutcome {
             tensors: report.tensors_pq2,
+            kind: VerifyKind::Exact,
+            label: format!(
+                "Lossless reblock verified for {} PQ2_0 tensors",
+                report.tensors_pq2
+            ),
         });
     }
 
-    let q2 = g.tensors.iter().filter(|t| t.ty == TY_Q2_0).count();
-    if q2 > 0 || g.file_type == Some(41) {
-        Ok(VerifyOutcome::Native {
-            tensors: g.tensors.len(),
-        })
-    } else {
-        Ok(VerifyOutcome::Other {
-            tensors: g.tensors.len(),
-        })
-    }
+    Ok(VerifyOutcome {
+        tensors: g.tensors.len(),
+        kind: VerifyKind::Structure,
+        label: format!(
+            "Header, tensor table, offsets and alignment are valid ({} tensors)",
+            g.tensors.len()
+        ),
+    })
 }
 
 fn send_progress(tx: &Sender<Event>, id: u64, p: &Progress) {

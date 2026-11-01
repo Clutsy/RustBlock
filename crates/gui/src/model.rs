@@ -1,22 +1,20 @@
-//! UI data model and filesystem helpers.
+//! UI data model, analysis helpers and filesystem utilities.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use ternary_reblock_core::{
-    convert, ConvertOptions, Gguf, Phase, Report, VerifyMode, TY_PTQ1_0, TY_Q2_0,
+use rustblock_core::{
+    source_supported, type_name, Gguf, Phase, Report, Target, VerifyMode, TY_PTQ1_0, TY_Q2_0,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lang {
-    En,
-    It,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Pq2,
     Q2,
+    Float,
+    Quantized,
+    Mixed,
     Ptq1,
     Other,
     Invalid,
@@ -30,10 +28,8 @@ pub struct Analysis {
     pub tensors: usize,
     pub pq2: usize,
     pub ptq1: usize,
-    pub q2: usize,
-    pub file_type: Option<u32>,
-    pub hadamard: bool,
-    pub estimated_new_size: Option<u64>,
+    pub types: Vec<(u32, usize)>,
+    pub supported: bool,
     pub kind: FileKind,
     pub error: Option<String>,
 }
@@ -47,26 +43,65 @@ impl Analysis {
             tensors: 0,
             pq2: 0,
             ptq1: 0,
-            q2: 0,
-            file_type: None,
-            hadamard: false,
-            estimated_new_size: None,
+            types: Vec::new(),
+            supported: false,
             kind: FileKind::Invalid,
             error: Some(error),
         }
     }
 
-    pub fn can_convert(&self) -> bool {
-        self.kind == FileKind::Pq2 && self.error.is_none()
+    pub fn can_target(&self, target: Target) -> bool {
+        if self.error.is_some() || self.ptq1 > 0 || !self.supported {
+            return false;
+        }
+        if target == Target::Reblock {
+            self.pq2 > 0
+        } else {
+            true
+        }
     }
 
-    pub fn can_verify(&self) -> bool {
-        self.error.is_none()
+    pub fn default_target(&self) -> Target {
+        if self.pq2 > 0 {
+            Target::Reblock
+        } else if matches!(self.kind, FileKind::Float) {
+            Target::Q4K
+        } else if matches!(self.kind, FileKind::Quantized | FileKind::Mixed) {
+            Target::F16
+        } else {
+            Target::Q4K
+        }
+    }
+
+    pub fn type_summary(&self) -> String {
+        let mut parts = Vec::new();
+        for (ty, count) in self.types.iter().take(4) {
+            parts.push(format!("{} x{}", type_name(*ty), count));
+        }
+        if self.types.len() > 4 {
+            parts.push(format!("+{} types", self.types.len() - 4));
+        }
+        if parts.is_empty() {
+            "no tensors".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
+
+    pub fn kind_label(&self) -> &'static str {
+        match self.kind {
+            FileKind::Pq2 => "PQ2_0 ternary",
+            FileKind::Q2 => "Q2_0 ternary",
+            FileKind::Float => "float GGUF",
+            FileKind::Quantized => "quantized GGUF",
+            FileKind::Mixed => "mixed GGUF",
+            FileKind::Ptq1 => "PTQ1_0 (unsupported)",
+            FileKind::Other => "other GGUF",
+            FileKind::Invalid => "invalid file",
+        }
     }
 }
 
-/// Reads only the GGUF header, then asks the conversion engine for a dry-run
-/// estimate (no data is written).
 pub fn analyze(path: &Path) -> Analysis {
     let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let g = match Gguf::open(path) {
@@ -74,51 +109,91 @@ pub fn analyze(path: &Path) -> Analysis {
         Err(e) => return Analysis::invalid(file_len, e.to_string()),
     };
 
-    let mut analysis = Analysis {
+    let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for t in &g.tensors {
+        *counts.entry(t.ty).or_insert(0) += 1;
+    }
+    let types: Vec<(u32, usize)> = counts.iter().map(|(k, v)| (*k, *v)).collect();
+    let supported = g.tensors.iter().all(|t| source_supported(t.ty));
+    let pq2 = g.pq2_count();
+    let ptq1 = g.tensors.iter().filter(|t| t.ty == TY_PTQ1_0).count();
+    let q2 = g.tensors.iter().filter(|t| t.ty == TY_Q2_0).count();
+    let all_float = g.tensors.iter().all(|t| matches!(t.ty, 0 | 1 | 30));
+    let any_quant = g.tensors.iter().any(|t| {
+        matches!(
+            t.ty,
+            2 | 3
+                | 6
+                | 7
+                | 8
+                | 9
+                | 10
+                | 11
+                | 12
+                | 13
+                | 14
+                | 15
+                | 16
+                | 17
+                | 18
+                | 19
+                | 20
+                | 21
+                | 22
+                | 23
+                | 29
+                | 34
+                | 35
+                | 39
+                | 40
+                | 41
+                | 42
+        )
+    });
+
+    let kind = if ptq1 > 0 {
+        FileKind::Ptq1
+    } else if pq2 > 0 {
+        FileKind::Pq2
+    } else if !supported {
+        FileKind::Other
+    } else if q2 > 0 && types.len() == 1 {
+        FileKind::Q2
+    } else if q2 > 0 {
+        FileKind::Mixed
+    } else if all_float {
+        FileKind::Float
+    } else if any_quant {
+        FileKind::Quantized
+    } else {
+        FileKind::Other
+    };
+
+    Analysis {
         version: g.version,
         file_len: g.file_len,
         alignment: g.alignment,
         tensors: g.tensors.len(),
-        pq2: g.pq2_count(),
-        ptq1: g.tensors.iter().filter(|t| t.ty == TY_PTQ1_0).count(),
-        q2: g.tensors.iter().filter(|t| t.ty == TY_Q2_0).count(),
-        file_type: g.file_type,
-        hadamard: g.has_hadamard_version,
-        estimated_new_size: None,
-        kind: FileKind::Other,
+        pq2,
+        ptq1,
+        types,
+        supported,
+        kind,
         error: None,
-    };
-
-    if analysis.ptq1 > 0 {
-        analysis.kind = FileKind::Ptq1;
-    } else if analysis.pq2 > 0 {
-        analysis.kind = FileKind::Pq2;
-        let dummy = path.with_extension("estimate.gguf");
-        analysis.estimated_new_size = convert(
-            path,
-            &dummy,
-            ConvertOptions {
-                dry_run: true,
-                verify: VerifyMode::None,
-                ..Default::default()
-            },
-            None,
-        )
-        .ok()
-        .map(|r| r.new_file_size);
-    } else if analysis.q2 > 0 || analysis.file_type == Some(41) {
-        analysis.kind = FileKind::Q2;
     }
+}
 
-    analysis
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyKind {
+    Exact,
+    Structure,
 }
 
 #[derive(Debug, Clone)]
-pub enum VerifyOutcome {
-    Pq2 { tensors: usize },
-    Native { tensors: usize },
-    Other { tensors: usize },
-    Ptq1 { tensors: usize },
+pub struct VerifyOutcome {
+    pub tensors: usize,
+    pub kind: VerifyKind,
+    pub label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -178,7 +253,6 @@ impl RunState {
                 self.last_time = now;
             }
         }
-
         self.phase = phase;
         self.done = done;
         self.total = total.max(1);
@@ -205,10 +279,20 @@ impl RunState {
 }
 
 #[derive(Debug, Clone)]
+pub enum InstallResult {
+    Installed(String),
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
 pub enum JobStatus {
     Ready,
     Running(RunState),
-    Done(Report),
+    Done {
+        report: Report,
+        target: Target,
+        install: Option<InstallResult>,
+    },
     Verified {
         outcome: VerifyOutcome,
         elapsed: Duration,
@@ -222,6 +306,7 @@ pub struct Job {
     pub input: PathBuf,
     pub analysis: Analysis,
     pub status: JobStatus,
+    pub target: Target,
 }
 
 impl Job {
@@ -235,7 +320,7 @@ impl Job {
     pub fn is_finished(&self) -> bool {
         matches!(
             self.status,
-            JobStatus::Done(_) | JobStatus::Verified { .. } | JobStatus::Failed(_)
+            JobStatus::Done { .. } | JobStatus::Verified { .. } | JobStatus::Failed(_)
         )
     }
 }
@@ -246,25 +331,68 @@ pub enum OutputMode {
     Custom(PathBuf),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallTarget {
+    None,
+    LmStudio(PathBuf),
+    Ollama { exe: PathBuf, models: PathBuf },
+    Folder(PathBuf),
+}
+
+impl InstallTarget {
+    pub fn label(&self) -> String {
+        match self {
+            InstallTarget::None => "Do not install".to_string(),
+            InstallTarget::LmStudio(path) => {
+                format!("LM Studio · {}", shorten(&path.display().to_string(), 52))
+            }
+            InstallTarget::Ollama { .. } => "Ollama (ollama create)".to_string(),
+            InstallTarget::Folder(path) => {
+                format!("Folder · {}", shorten(&path.display().to_string(), 52))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
-    pub lang: Lang,
+    pub target: Target,
     pub verify: VerifyMode,
     pub overwrite: bool,
     pub verify_only: bool,
     pub output_mode: OutputMode,
+    pub install: InstallTarget,
+    pub download_dir: PathBuf,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            lang: Lang::En,
+            target: Target::Reblock,
             verify: VerifyMode::Structure,
             overwrite: false,
             verify_only: false,
             output_mode: OutputMode::NextToInput,
+            install: InstallTarget::None,
+            download_dir: default_download_dir(),
         }
     }
+}
+
+pub fn default_download_dir() -> PathBuf {
+    home_dir()
+        .map(|h| h.join("Downloads").join("RustBlock"))
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join("RustBlock-models")
+        })
+}
+
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
 }
 
 pub fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
@@ -276,19 +404,43 @@ pub fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize
     (0..=h.len() - n.len()).find(|&i| h[i..i + n.len()].eq_ignore_ascii_case(n))
 }
 
-pub fn output_path(input: &Path, mode: &OutputMode) -> PathBuf {
+fn strip_quant_suffix(base: &str) -> &str {
+    if let Some(pos) = base.rfind(['-', '.', '_']) {
+        let tail = &base[pos + 1..];
+        let upper = tail.to_ascii_uppercase();
+        if upper.starts_with('Q')
+            || upper.starts_with("IQ")
+            || upper.starts_with("TQ")
+            || upper.starts_with("BF16")
+            || upper.starts_with("F16")
+            || upper.starts_with("F32")
+        {
+            return &base[..pos];
+        }
+    }
+    base
+}
+
+pub fn output_path(input: &Path, target: Target, mode: &OutputMode) -> PathBuf {
     let file_name = input
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "model.gguf".to_string());
-
-    let new_name = if let Some(pos) = find_ascii_case_insensitive(&file_name, "PQ2_0") {
-        format!("{}Q2_0{}", &file_name[..pos], &file_name[pos + 5..])
-    } else if file_name.len() >= 5 && file_name[file_name.len() - 5..].eq_ignore_ascii_case(".gguf")
-    {
-        format!("{}-Q2_0.gguf", &file_name[..file_name.len() - 5])
+    let lower = file_name.to_ascii_lowercase();
+    let stem = if lower.ends_with(".gguf") {
+        &file_name[..file_name.len() - 5]
     } else {
-        format!("{file_name}-Q2_0.gguf")
+        &file_name[..]
+    };
+
+    let new_name = if target == Target::Reblock {
+        if let Some(pos) = find_ascii_case_insensitive(&file_name, "PQ2_0") {
+            format!("{}Q2_0{}", &file_name[..pos], &file_name[pos + 5..])
+        } else {
+            format!("{}-Q2_0.gguf", strip_quant_suffix(stem))
+        }
+    } else {
+        format!("{}-{}.gguf", strip_quant_suffix(stem), target.short())
     };
 
     match mode {

@@ -52,6 +52,8 @@ pub enum ConvertError {
     Overflow,
     #[error("verification failed: {0}")]
     Verify(String),
+    #[error("tensor codec failed: {0}")]
+    Codec(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
