@@ -21,5 +21,5 @@ pub use convert::{
     LLAMA_FTYPE_MOSTLY_Q2_0,
 };
 pub use gguf::{align_up, Gguf, GgufError, TensorInfo};
-pub use transcode::{source_supported, transcode, Target};
+pub use transcode::{conversion_workers, source_supported, transcode, Target};
 pub use types::{type_info, type_name, TypeInfo, TY_PQ2_0, TY_PTQ1_0, TY_Q2_0};

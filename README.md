@@ -2,9 +2,11 @@
 
 <p align="center"><img src="crates/gui/assets/rustblock-logo.png" width="190" alt="RustBlock logo"></p>
 
-**The native Swiss Army knife for GGUF models.** Reblock Prism ternary files, convert floats, quantize, verify, download from Hugging Face, and install into LM Studio or Ollama — from one steel-and-blocks desktop app. No Python, Node.js or terminal knowledge required.
+**The native Swiss Army knife for GGUF models.** Reblock Prism ternary files, convert floats, quantize, verify and download from Hugging Face — from one steel-and-blocks desktop app. No Python, Node.js or terminal knowledge required.
 
 RustBlock opens the source **read-only**, writes to a temporary file in the destination folder, verifies the result, and only then renames it into place. There is no telemetry and no upload of model data.
+
+Conversion is **multicore and memory-bounded**: independent tensors run in parallel, and a single large tensor is split into codec-aligned spans that are decoded, quantized and re-encoded across all available cores without loading the whole model into RAM.
 
 ## What it can do
 
@@ -30,7 +32,9 @@ RustBlock opens the source **read-only**, writes to a temporary file in the dest
 | **NVFP4** | NVIDIA 4-bit block float | No, lossy | Recent NVIDIA runtimes; experimental |
 | **Q1_0** | 1-bit | No, lossy | Extreme compression; experimental |
 
-The K-quant targets are **uniform** layouts. They are not the mixed `Q4_K_M` / `Q5_K_M` presets, and RustBlock does not use an importance matrix. IQ formats can be read as sources, but writing them requires an importance matrix and is intentionally not offered.
+The K-quant targets use a **model-agnostic adaptive policy**. For `Q2_K` through `Q5_K`, tensors that are usually most sensitive — output projection, token embeddings and value projections — are kept one step higher (for example `Q6_K` inside a `Q4_K` conversion), while norms and unaligned rows stay `F32`. This is applied to every model; it is not the mixed `Q4_K_M` / `Q5_K_M` preset and it is not an importance-matrix calibration. IQ formats can be read as sources, but writing them requires an importance matrix and is intentionally not offered.
+
+Ternary, MXFP4, NVFP4 and Q1_0 are **real native targets**, not placeholders: the output is a valid GGUF that the matching runtime can load. They are extremely lossy on a dense model. TQ1_0/TQ2_0 are meant for models trained or distilled for ternary weights; MXFP4/NVFP4 need a recent runtime; Q1_0 is a last-resort size experiment. Use `Full` verification when you want RustBlock to decode the output again and compare it.
 
 ### Lossless reblocking
 
@@ -49,23 +53,28 @@ Both use the same 2-bit ternary codec. RustBlock splits each 128-value block int
 
 ![RustBlock Discover view](docs/gui-discover.png)
 
-A dependency-free HTML interface concept is in `docs/ui-concept.html`.
-
 - **Convert** view: drag & drop one or many `.gguf` files, or browse with the native file picker.
-- Choose any of the 19 targets with a plain-English description and hover tooltips written for beginners. The layout picker includes float, legacy block, K-quant, ternary, FP4 and 1-bit families; legacy and experimental choices sit under **More formats** so the common options stay visible.
-- Batch queue, live speed/ETA, per-file progress, **stop after the current file**, remove finished jobs and exportable log.
+- Choose any of the 19 targets with hover descriptions. Every format is visible at once — no collapsed “More formats” drawer. Float, legacy block, K-quant, FP4 and 1-bit are grouped in the normal grid; **TQ1_0/TQ2_0 have their own ternary section** with a separate warning because ternary is a different use case, not a normal requant.
+- Compact queue with live speed/ETA, per-file progress, **stop after the current file** and per-file removal.
 - Output next to each input or in a custom folder, with overwrite protection and duplicate-path checks.
-- Verification: `None`, `Structure` or `Full` (full decode comparison), plus **Verify only** mode that writes nothing.
-- Optional automatic install after conversion:
-  - **LM Studio** is detected at the usual `~/.lmstudio/models` and cache paths; the converted GGUF is copied into `RustBlock/<model>/`.
-  - **Ollama** is detected from `PATH`; RustBlock runs the official `ollama create` with a generated Modelfile. It never copies a loose GGUF into Ollama's `blobs/` directory.
-  - Any custom folder can be selected instead.
-- **Discover** view: search Hugging Face directly from the app, paste a full `huggingface.co/author/model` link, sort by downloads, likes or update time, and inspect real card data before downloading.
-- The inspector shows the README summary, architecture, context window, GGUF payload, repository size, license, base model, tags, languages and every GGUF file with its real size. Selecting a result loads its details automatically.
-- Downloads show progress, speed, cancellation and resumable `.part` files; finished downloads are added to Convert automatically.
-- The dark graphite and oxide-red interface uses the included RustBlock logo; square controls and hairline rules replace rounded cards and decorative colour. Inline beginner guidance explains the three conversion steps and recommends Q4_K when in doubt.
+- Choose `Off`, `Structure` or `Full` verification per batch; `Structure` is the default. The CLI exposes the same `--verify none|structure|full` levels for scripted checks.
+- **Discover** view: opens on the most downloaded GGUF repositories, then search Hugging Face, paste a full `huggingface.co/author/model` link, sort by downloads, likes or update time, and open a repository to see its downloadable GGUF files and sizes.
+- Downloads use a transfer panel with byte counts, percentage, smoothed speed, ETA, cancellation and resumable `.part` files. The panel stays visible on both Convert and Discover, and finished downloads are added to Convert automatically.
+- Files whose names indicate an existing quantization (`Q4_K_M`, `Q8_0`, `IQ…`, `TQ…`, `MXFP4`, …) are marked **already quantized** before download. After conversion starts, the tensor types are checked as well. RustBlock warns that requantizing an already compressed model compounds the loss and that a virgin F16/BF16 release is the better source.
+- **Only supported standalone GGUF models can be downloaded.** Non-GGUF files are hidden; importance matrices, projectors, adapters, split shards and PTQ1_0 containers are rejected. The download function repeats the check before the network request, then re-opens the finished file, verifies its tensor types and deletes it if the native engine cannot decode it.
+- The interface is deliberately minimal: dark graphite, neutral steel and square controls, with one action per view. There is no log drawer, Activity panel, About window, card-metadata inspector or install-target UI.
 
-Network access is used **only** when you search or download from Hugging Face. Local conversion and installation work offline.
+Network access is used **only** when you search or download from Hugging Face. Local conversion works offline.
+
+### Multicore conversion
+
+RustBlock uses every available logical core by default. Set `RUSTBLOCK_THREADS` to leave headroom for inference or to benchmark:
+
+```bash
+RUSTBLOCK_THREADS=8 rustblock convert model-f32.gguf model-q5_k.gguf --to q5_k
+```
+
+The worker batch has a bounded memory budget (about 768 MiB of estimated peak buffers), so concurrency does not scale RAM with model size. Encoding and positional writes run in the same parallel batch, and a single tensor is split into enough block-aligned spans to keep every worker busy. On the development machine, a 128 MiB single-tensor F32 → Q5_K conversion took about **0.36–0.40 s with 1 thread** and **0.09–0.10 s with 16 threads** (≈4×; measurements vary with disk cache and CPU).
 
 ### Hugging Face token
 
@@ -127,7 +136,8 @@ rustblock convert model-F16.gguf model-Q4_K.gguf --to q4_k --verify structure
 `--to` accepts:
 
 ```text
-reblock | f32 | f16 | bf16 | q8_0 | q5_0 | q4_0 | q2_k | q3_k | q4_k | q5_k | q6_k
+reblock | f32 | f16 | bf16 | q8_0 | q5_0 | q5_1 | q4_0 | q4_1 |
+q2_k | q3_k | q4_k | q5_k | q6_k | tq1_0 | tq2_0 | mxfp4 | nvfp4 | q1_0
 ```
 
 Other options:
@@ -158,7 +168,7 @@ Other options:
 cargo test --workspace
 ```
 
-Coverage includes lossless PQ2_0 reblocking, exact F16 conversion, Q4_K/Q8_0 layout and metadata, all target conversions, alignment preservation, source immutability on error, dry-run, overwrite protection and end-to-end metadata preservation.
+Coverage includes lossless PQ2_0 reblocking, exact F16 conversion, Q4_K/Q8_0 layout and metadata, all target conversions, the adaptive protected-tensor policy, pure ternary output, parallel large-tensor conversion, alignment preservation, source immutability on error, dry-run, overwrite protection, download gating/validation and end-to-end metadata preservation.
 
 ## License
 

@@ -5,7 +5,6 @@
 mod app;
 mod hf;
 mod model;
-mod targets;
 mod theme;
 mod worker;
 

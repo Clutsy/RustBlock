@@ -100,6 +100,36 @@ impl Analysis {
             FileKind::Invalid => "invalid file",
         }
     }
+
+    /// True when the file already contains compressed weights. Requantizing
+    /// such a file cannot recover information that was lost earlier.
+    pub fn is_quantized(&self) -> bool {
+        matches!(
+            self.kind,
+            FileKind::Pq2 | FileKind::Q2 | FileKind::Quantized | FileKind::Mixed | FileKind::Ptq1
+        )
+    }
+}
+
+/// Best-effort detection from a file name. Hugging Face exposes sibling names
+/// without downloading the tensors, so this is used for the pre-download
+/// warning; the actual tensor types are checked again after the file arrives.
+pub fn looks_quantized_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| {
+            let bytes = token.as_bytes();
+            let starts_q_digit = bytes.len() > 1 && bytes[0] == b'q' && bytes[1].is_ascii_digit();
+            let starts_iq_digit =
+                bytes.len() > 2 && &bytes[..2] == b"iq" && bytes[2].is_ascii_digit();
+            let starts_tq_digit =
+                bytes.len() > 2 && &bytes[..2] == b"tq" && bytes[2].is_ascii_digit();
+            starts_q_digit
+                || starts_iq_digit
+                || starts_tq_digit
+                || matches!(token, "mxfp4" | "nvfp4" | "pq2" | "ptq1")
+        })
 }
 
 pub fn analyze(path: &Path) -> Analysis {
@@ -279,19 +309,12 @@ impl RunState {
 }
 
 #[derive(Debug, Clone)]
-pub enum InstallResult {
-    Installed(String),
-    Failed(String),
-}
-
-#[derive(Debug, Clone)]
 pub enum JobStatus {
     Ready,
     Running(RunState),
     Done {
         report: Report,
         target: Target,
-        install: Option<InstallResult>,
     },
     Verified {
         outcome: VerifyOutcome,
@@ -316,13 +339,6 @@ impl Job {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.input.display().to_string())
     }
-
-    pub fn is_finished(&self) -> bool {
-        matches!(
-            self.status,
-            JobStatus::Done { .. } | JobStatus::Verified { .. } | JobStatus::Failed(_)
-        )
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,37 +347,12 @@ pub enum OutputMode {
     Custom(PathBuf),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InstallTarget {
-    None,
-    LmStudio(PathBuf),
-    Ollama { exe: PathBuf, models: PathBuf },
-    Folder(PathBuf),
-}
-
-impl InstallTarget {
-    pub fn label(&self) -> String {
-        match self {
-            InstallTarget::None => "Do not install".to_string(),
-            InstallTarget::LmStudio(path) => {
-                format!("LM Studio · {}", shorten(&path.display().to_string(), 52))
-            }
-            InstallTarget::Ollama { .. } => "Ollama (ollama create)".to_string(),
-            InstallTarget::Folder(path) => {
-                format!("Folder · {}", shorten(&path.display().to_string(), 52))
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub target: Target,
     pub verify: VerifyMode,
     pub overwrite: bool,
-    pub verify_only: bool,
     pub output_mode: OutputMode,
-    pub install: InstallTarget,
     pub download_dir: PathBuf,
 }
 
@@ -371,9 +362,7 @@ impl Default for Settings {
             target: Target::Reblock,
             verify: VerifyMode::Structure,
             overwrite: false,
-            verify_only: false,
             output_mode: OutputMode::NextToInput,
-            install: InstallTarget::None,
             download_dir: default_download_dir(),
         }
     }
@@ -500,11 +489,6 @@ pub fn human_duration(d: Duration) -> String {
     }
 }
 
-pub fn log_clock(d: Duration) -> String {
-    let secs = d.as_secs();
-    format!("{:02}:{:02}", secs / 60, secs % 60)
-}
-
 pub fn shorten(text: &str, max_chars: usize) -> String {
     if max_chars < 8 {
         return text.to_string();
@@ -519,4 +503,19 @@ pub fn shorten(text: &str, max_chars: usize) -> String {
         .skip(count - (max_chars - max_chars / 2 - 1))
         .collect();
     format!("{head}…{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_quantized_name;
+
+    #[test]
+    fn recognizes_quantized_file_names_without_flagging_qwen() {
+        assert!(looks_quantized_name("model-Q4_K_M.gguf"));
+        assert!(looks_quantized_name("Qwen3-8B-Q8_0.gguf"));
+        assert!(looks_quantized_name("model-IQ3_XS.gguf"));
+        assert!(looks_quantized_name("model-TQ2_0.gguf"));
+        assert!(!looks_quantized_name("Qwen3-8B-F16.gguf"));
+        assert!(!looks_quantized_name("virgin-model.gguf"));
+    }
 }

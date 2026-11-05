@@ -170,6 +170,111 @@ fn q4k_quantization_adds_quantization_version() {
 }
 
 #[test]
+fn sensitive_tensors_get_extra_precision_on_every_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let values = float_values(512);
+    for name in [
+        "output.weight",
+        "token_embd.weight",
+        "blk.0.attn_v.weight",
+        "transformer.word_embeddings.weight",
+    ] {
+        let input = dir.path().join(format!("{}.gguf", name.replace('.', "_")));
+        let output = dir
+            .path()
+            .join(format!("{}-q4k.gguf", name.replace('.', "_")));
+        build_gguf(&input, name, &[256, 2], 1, &f16_bytes(&values), 32, 1);
+
+        transcode(
+            &input,
+            &output,
+            Target::Q4K,
+            ConvertOptions {
+                verify: VerifyMode::Full,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{name} failed: {e}"));
+
+        let g = Gguf::open(&output).unwrap();
+        assert_eq!(g.tensors[0].ty, 14, "{name} should be protected as Q6_K");
+        assert_eq!(g.file_type, Some(14));
+    }
+}
+
+#[test]
+fn ternary_targets_are_not_mixed_with_protected_precision() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("output.gguf");
+    let output = dir.path().join("output-tq2.gguf");
+    let values = float_values(512);
+    build_gguf(
+        &input,
+        "output.weight",
+        &[256, 2],
+        1,
+        &f16_bytes(&values),
+        32,
+        1,
+    );
+
+    transcode(
+        &input,
+        &output,
+        Target::Tq2_0,
+        ConvertOptions {
+            verify: VerifyMode::Full,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+
+    let g = Gguf::open(&output).unwrap();
+    assert_eq!(g.tensors[0].ty, 35);
+}
+
+#[test]
+fn k_quant_targets_keep_their_protected_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("output.gguf");
+    let values = float_values(512);
+    build_gguf(
+        &input,
+        "output.weight",
+        &[256, 2],
+        1,
+        &f16_bytes(&values),
+        32,
+        1,
+    );
+    for (target, expected) in [
+        (Target::Q2K, 12),
+        (Target::Q3K, 13),
+        (Target::Q4K, 14),
+        (Target::Q5K, 14),
+    ] {
+        let output = dir
+            .path()
+            .join(format!("protected-{}.gguf", target.short()));
+        transcode(
+            &input,
+            &output,
+            target,
+            ConvertOptions {
+                verify: VerifyMode::Full,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{target:?} protected conversion failed: {e}"));
+        let g = Gguf::open(&output).unwrap();
+        assert_eq!(g.tensors[0].ty, expected, "{target:?}");
+    }
+}
+
+#[test]
 fn q8_0_conversion_writes_blocks() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("in-f32.gguf");
@@ -329,4 +434,97 @@ fn every_native_target_produces_a_valid_gguf() {
         assert!(g.tensors[0].size.unwrap() > 0, "{target:?}");
     }
     assert_eq!(fs::read(&input).unwrap(), source_before);
+}
+
+#[test]
+fn every_native_target_survives_full_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in-f32.gguf");
+    let values = float_values(512);
+    build_gguf(&input, "w", &[256, 2], 0, &f32_bytes(&values), 32, 0);
+
+    for target in [
+        Target::F32,
+        Target::F16,
+        Target::Bf16,
+        Target::Q8_0,
+        Target::Q5_0,
+        Target::Q5_1,
+        Target::Q4_0,
+        Target::Q4_1,
+        Target::Q2K,
+        Target::Q3K,
+        Target::Q4K,
+        Target::Q5K,
+        Target::Q6K,
+        Target::Tq1_0,
+        Target::Tq2_0,
+        Target::Mxfp4,
+        Target::Nvfp4,
+        Target::Q1_0,
+    ] {
+        let output = dir.path().join(format!("full-{}.gguf", target.short()));
+        transcode(
+            &input,
+            &output,
+            target,
+            ConvertOptions {
+                verify: VerifyMode::Full,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{target:?} failed full verification: {e}"));
+    }
+}
+
+#[test]
+fn unaligned_rows_fall_back_to_float_instead_of_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in-f32.gguf");
+    let output = dir.path().join("out-ternary.gguf");
+    let values = float_values(51);
+    build_gguf(&input, "w", &[17, 3], 0, &f32_bytes(&values), 32, 0);
+
+    transcode(
+        &input,
+        &output,
+        Target::Tq1_0,
+        ConvertOptions {
+            verify: VerifyMode::Full,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+
+    let g = Gguf::open(&output).unwrap();
+    assert_eq!(g.tensors[0].ty, 0);
+    assert_eq!(g.tensors[0].size, Some(204));
+    assert_eq!(g.file_type, Some(36));
+}
+
+#[test]
+fn large_tensor_parallel_chunks_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("large-f32.gguf");
+    let output = dir.path().join("large-q5k.gguf");
+    let values = float_values(4096 * 512);
+    build_gguf(&input, "w", &[4096, 512], 0, &f32_bytes(&values), 32, 0);
+
+    transcode(
+        &input,
+        &output,
+        Target::Q5K,
+        ConvertOptions {
+            verify: VerifyMode::Full,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+
+    let g = Gguf::open(&output).unwrap();
+    assert_eq!(g.tensors[0].ty, 13);
+    assert_eq!(g.tensors[0].element_count(), 4096 * 512);
 }

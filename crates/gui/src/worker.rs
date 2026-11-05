@@ -11,8 +11,7 @@ use rustblock_core::{
     convert, transcode, ConvertOptions, Gguf, Phase, Progress, Report, Target, VerifyMode,
 };
 
-use crate::model::{InstallResult, InstallTarget, VerifyKind, VerifyOutcome};
-use crate::targets;
+use crate::model::{VerifyKind, VerifyOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkKind {
@@ -29,7 +28,6 @@ pub struct WorkItem {
     pub target: Target,
     pub verify: VerifyMode,
     pub force: bool,
-    pub install: InstallTarget,
 }
 
 #[derive(Debug)]
@@ -50,7 +48,6 @@ pub enum Event {
         id: u64,
         report: Report,
         target: Target,
-        install: Option<InstallResult>,
     },
     Verified {
         id: u64,
@@ -105,31 +102,12 @@ fn run_batch(items: Vec<WorkItem>, tx: Sender<Event>, cancel: Arc<AtomicBool>) {
                     Some(&mut progress),
                 ) {
                     Ok(report) => {
-                        let install = if matches!(item.install, InstallTarget::None) {
-                            None
-                        } else {
-                            Some(
-                                match targets::install_model(
-                                    &item.install,
-                                    &item.output,
-                                    &item
-                                        .output
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| "model.gguf".to_string()),
-                                ) {
-                                    Ok(message) => InstallResult::Installed(message),
-                                    Err(error) => InstallResult::Failed(error),
-                                },
-                            )
-                        };
                         converted += 1;
                         if tx
                             .send(Event::Done {
                                 id: item.id,
                                 report,
                                 target: item.target,
-                                install,
                             })
                             .is_err()
                         {

@@ -173,6 +173,45 @@ mod tests {
         assert!(parse_link("https://example.com/owner/model").is_none());
         assert!(parse_link("not a link").is_none());
     }
+
+    #[test]
+    fn accepts_only_supported_gguf_models() {
+        assert!(file_support("Qwen/Qwen3-8B-Q4_K_M.gguf").is_ok());
+        assert!(file_support("nested/model-BF16.gguf").is_ok());
+        assert!(file_support("model.safetensors").is_err());
+        assert!(file_support("imatrix_unsloth.gguf").is_err());
+        assert!(file_support("mmproj-model-f16.gguf").is_err());
+        assert!(file_support("model-lora.gguf").is_err());
+        assert!(file_support("model-PTQ1_0.gguf").is_err());
+        assert!(file_support("model-00001-of-00003.gguf").is_err());
+        assert!(file_support("proof-of-concept.gguf").is_ok());
+    }
+
+    #[test]
+    fn download_rejects_unsupported_files_before_touching_network() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let error = download(
+            "owner/repo",
+            "main",
+            "imatrix_unsloth.gguf",
+            Path::new("target"),
+            false,
+            &cancel,
+            &tx,
+        )
+        .unwrap_err();
+        assert!(error.contains("importance matrix"));
+        assert!(!Path::new("target/imatrix_unsloth.gguf").exists());
+    }
+
+    #[test]
+    fn validation_rejects_a_non_gguf_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fake.gguf");
+        std::fs::write(&file, b"not a gguf").unwrap();
+        assert!(validate_download(&file).is_err());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,15 +220,8 @@ pub struct HfModel {
     pub author: String,
     pub name: String,
     pub downloads: u64,
-    pub likes: u64,
-    pub created_at: String,
     pub last_modified: String,
     pub gated: bool,
-    pub pipeline: String,
-    pub library: String,
-    pub tags: Vec<String>,
-    pub license: Option<String>,
-    pub base_model: Option<String>,
     pub sha: String,
     pub gguf_files: usize,
 }
@@ -204,18 +236,47 @@ impl HfModel {
 pub struct HfFile {
     pub path: String,
     pub size: u64,
+    /// False for GGUF containers that are not standalone models (importance
+    /// matrices, projectors, adapters, split shards, rejected Prism builds).
+    pub supported: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct HfDetails {
-    pub architecture: Option<String>,
-    pub context_length: Option<u64>,
-    pub total_gguf: Option<u64>,
-    pub used_storage: Option<u64>,
-    pub license: Option<String>,
-    pub base_model: Option<String>,
-    pub languages: Vec<String>,
-    pub description: Option<String>,
+/// Reject files that have a .gguf suffix but are not a supported standalone
+/// model. Downloads are gated by this check as well as the file list UI.
+pub fn file_support(path: &str) -> Result<(), &'static str> {
+    let lower = path.to_ascii_lowercase();
+    if !lower.ends_with(".gguf") {
+        return Err("not a GGUF file");
+    }
+    let name = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    if name.contains("imatrix") || name.contains("importance") {
+        return Err("importance matrix, not a model");
+    }
+    if name.contains("mmproj") || name.contains("projector") {
+        return Err("vision projector, not a standalone model");
+    }
+    if name.contains("lora") || name.contains("adapter") {
+        return Err("adapter, not a standalone model");
+    }
+    if name.contains("ptq1") {
+        return Err("PTQ1_0 is not convertible by RustBlock");
+    }
+    if is_split_shard(name) {
+        return Err("split shard, not a standalone model");
+    }
+    Ok(())
+}
+
+fn is_split_shard(name: &str) -> bool {
+    let stem = name.strip_suffix(".gguf").unwrap_or(name);
+    let Some((left, right)) = stem.rsplit_once("-of-") else {
+        return false;
+    };
+    let right_ok = right.len() == 5 && right.bytes().all(|b| b.is_ascii_digit());
+    let left_ok = left
+        .rsplit_once('-')
+        .is_some_and(|(_, index)| index.len() == 5 && index.bytes().all(|b| b.is_ascii_digit()));
+    right_ok && left_ok
 }
 
 #[derive(Debug, Clone)]
@@ -225,7 +286,6 @@ pub enum HfEvent {
     DetailsStarted(String),
     DetailsLoaded {
         repo: String,
-        details: HfDetails,
         files: Vec<HfFile>,
     },
     DetailsError {
@@ -285,26 +345,6 @@ fn parse_model(item: &Value) -> Option<HfModel> {
         .split_once('/')
         .map(|(_, name)| name.to_string())
         .unwrap_or_else(|| id.clone());
-    let tags = item
-        .get("tags")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let license = card_license(item).or_else(|| {
-        tags.iter()
-            .find_map(|tag| tag.strip_prefix("license:").map(str::to_string))
-    });
-    let base_model = card_base_model(item).or_else(|| {
-        tags.iter()
-            .find(|tag| tag.starts_with("base_model:") && !tag.starts_with("base_model:quantized:"))
-            .and_then(|tag| tag.strip_prefix("base_model:"))
-            .map(str::to_string)
-    });
     let gguf_files = item
         .get("siblings")
         .and_then(Value::as_array)
@@ -324,90 +364,16 @@ fn parse_model(item: &Value) -> Option<HfModel> {
         author,
         name,
         downloads: u64_field(item, "downloads").unwrap_or(0),
-        likes: u64_field(item, "likes").unwrap_or(0),
-        created_at: str_field(item, "createdAt").unwrap_or_default().to_string(),
         last_modified: str_field(item, "lastModified")
             .unwrap_or_default()
             .to_string(),
         gated: gated_field(item),
-        pipeline: str_field(item, "pipeline_tag")
-            .unwrap_or_default()
-            .to_string(),
-        library: str_field(item, "library_name")
-            .unwrap_or_default()
-            .to_string(),
-        tags,
-        license,
-        base_model,
         sha: str_field(item, "sha")
             .filter(|sha| !sha.is_empty())
             .unwrap_or("main")
             .to_string(),
         gguf_files,
     })
-}
-
-/// Fetch the full model card, README summary and the GGUF file list.
-pub fn load_details(repo: &str, revision: &str) -> Result<(HfDetails, Vec<HfFile>), String> {
-    let url = format!("{BASE}/api/models/{}", encode_path(repo));
-    let value = get_json(&url)?;
-    let mut details = HfDetails {
-        architecture: value
-            .get("gguf")
-            .and_then(|g| g.get("architecture"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        context_length: value
-            .get("gguf")
-            .and_then(|g| g.get("context_length"))
-            .and_then(Value::as_u64),
-        total_gguf: value
-            .get("gguf")
-            .and_then(|g| g.get("total"))
-            .and_then(Value::as_u64),
-        used_storage: u64_field(&value, "usedStorage"),
-        license: card_license(&value).or_else(|| {
-            value
-                .get("tags")
-                .and_then(Value::as_array)
-                .and_then(|tags| {
-                    tags.iter().find_map(|tag| {
-                        tag.as_str()
-                            .and_then(|tag| tag.strip_prefix("license:"))
-                            .map(str::to_string)
-                    })
-                })
-        }),
-        base_model: card_base_model(&value),
-        languages: card_languages(&value),
-        description: None,
-    };
-    if details.base_model.is_none() {
-        details.base_model = value
-            .get("tags")
-            .and_then(Value::as_array)
-            .and_then(|tags| {
-                tags.iter().find_map(|tag| {
-                    tag.as_str()
-                        .filter(|tag| {
-                            tag.starts_with("base_model:")
-                                && !tag.starts_with("base_model:quantized:")
-                        })
-                        .and_then(|tag| tag.strip_prefix("base_model:"))
-                        .map(str::to_string)
-                })
-            });
-    }
-
-    if let Ok(Some(readme)) = fetch_readme(repo, revision) {
-        details.description = summarize_readme(&readme);
-        if details.license.is_none() {
-            details.license = readme_license(&readme);
-        }
-    }
-
-    let files = list_files(repo, revision)?;
-    Ok((details, files))
 }
 
 pub fn list_files(repo: &str, revision: &str) -> Result<Vec<HfFile>, String> {
@@ -445,12 +411,16 @@ pub fn list_files(repo: &str, revision: &str) -> Result<Vec<HfFile>, String> {
                     .and_then(Value::as_u64)
             })
             .unwrap_or(0);
+        let support = file_support(path);
         out.push(HfFile {
             path: path.to_string(),
             size,
+            supported: support.is_ok(),
         });
     }
-    out.sort_by_key(|f| f.size);
+    // Keep usable models first; unsupported artifacts remain visible with a
+    // warning so the user understands why a file is not downloadable.
+    out.sort_by_key(|f| (!f.supported, f.size));
     Ok(out)
 }
 
@@ -464,6 +434,7 @@ pub fn download(
     cancel: &AtomicBool,
     tx: &Sender<HfEvent>,
 ) -> Result<PathBuf, String> {
+    file_support(file).map_err(|reason| format!("Cannot download {file}: {reason}."))?;
     fs::create_dir_all(dest_dir).map_err(|e| format!("cannot create download folder: {e}"))?;
     let name = file
         .rsplit('/')
@@ -472,6 +443,7 @@ pub fn download(
         .unwrap_or("model.gguf");
     let final_path = dest_dir.join(name);
     if final_path.exists() && !overwrite {
+        validate_download(&final_path)?;
         let _ = tx.send(HfEvent::Downloaded {
             repo: repo.to_string(),
             file: file.to_string(),
@@ -610,6 +582,10 @@ pub fn download(
             fs::remove_file(&final_path).map_err(|e| e.to_string())?;
         }
         fs::rename(&partial, &final_path).map_err(|e| e.to_string())?;
+        if let Err(error) = validate_download(&final_path) {
+            let _ = fs::remove_file(&final_path);
+            return Err(error);
+        }
         let _ = tx.send(HfEvent::Downloaded {
             repo: repo.to_string(),
             file: file.to_string(),
@@ -619,164 +595,26 @@ pub fn download(
     }
 }
 
-fn fetch_readme(repo: &str, revision: &str) -> Result<Option<String>, String> {
-    let rev = if revision.is_empty() {
-        "main"
-    } else {
-        revision
-    };
-    let url = format!(
-        "{BASE}/{}/raw/{}/README.md",
-        encode_path(repo),
-        encode_path(rev)
-    );
-    let mut request = ureq::get(&url).set("User-Agent", UA);
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        if !token.trim().is_empty() {
-            request = request.set("Authorization", &format!("Bearer {}", token.trim()));
-        }
+/// Re-open the completed file before announcing it. A `.gguf` name is not a
+/// promise that the container is usable: reject malformed files, PTQ1_0 and
+/// tensor types the native engine cannot decode, and remove them from disk.
+fn validate_download(path: &Path) -> Result<(), String> {
+    let g = rustblock_core::Gguf::open(path)
+        .map_err(|e| format!("downloaded file is not a readable GGUF: {e}"))?;
+    if g.has_ptq1() {
+        return Err("downloaded file contains PTQ1_0, which RustBlock cannot convert".to_string());
     }
-    match request.call() {
-        Ok(response) => Ok(Some(
-            response
-                .into_string()
-                .map_err(|e| format!("invalid README response: {e}"))?,
-        )),
-        Err(ureq::Error::Status(404, _)) => Ok(None),
-        Err(ureq::Error::Status(401 | 403, _)) => Ok(None),
-        Err(ureq::Error::Status(code, _)) => Err(format!("README request returned HTTP {code}")),
-        Err(e) => Err(format!("README network error: {e}")),
+    if let Some(tensor) = g
+        .tensors
+        .iter()
+        .find(|tensor| !rustblock_core::source_supported(tensor.ty))
+    {
+        return Err(format!(
+            "downloaded file contains tensor type {} ('{}'), which this build cannot decode",
+            tensor.ty, tensor.name
+        ));
     }
-}
-
-fn summarize_readme(text: &str) -> Option<String> {
-    let body = strip_frontmatter(text);
-    let mut paragraph = String::new();
-    for line in body.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            if !paragraph.is_empty() {
-                break;
-            }
-            continue;
-        }
-        if line.starts_with('#')
-            || line.starts_with('!')
-            || line.starts_with('<')
-            || line.starts_with('|')
-            || line.starts_with("```")
-            || line.starts_with("---")
-        {
-            continue;
-        }
-        let clean = clean_markdown_line(line);
-        if clean.is_empty() {
-            continue;
-        }
-        if !paragraph.is_empty() {
-            paragraph.push(' ');
-        }
-        paragraph.push_str(&clean);
-        if paragraph.len() > 520 {
-            break;
-        }
-    }
-    let paragraph = paragraph.trim();
-    if paragraph.is_empty() {
-        None
-    } else {
-        Some(paragraph.chars().take(760).collect())
-    }
-}
-
-fn strip_frontmatter(text: &str) -> &str {
-    if let Some(rest) = text.strip_prefix("---") {
-        if let Some(end) = rest.find("\n---") {
-            return &rest[end + 4..];
-        }
-    }
-    text
-}
-
-fn clean_markdown_line(line: &str) -> String {
-    let mut out = String::new();
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '[' => {
-                let mut label = String::new();
-                for c2 in chars.by_ref() {
-                    if c2 == ']' {
-                        break;
-                    }
-                    label.push(c2);
-                }
-                if chars.peek() == Some(&'(') {
-                    for c2 in chars.by_ref() {
-                        if c2 == ')' {
-                            break;
-                        }
-                    }
-                }
-                out.push_str(&label);
-            }
-            '<' => {
-                for c2 in chars.by_ref() {
-                    if c2 == '>' {
-                        break;
-                    }
-                }
-            }
-            '*' | '_' | '`' | '\\' => {}
-            _ => out.push(c),
-        }
-    }
-    out.trim().to_string()
-}
-
-fn readme_license(text: &str) -> Option<String> {
-    let front = text.strip_prefix("---")?;
-    let end = front.find("\n---")?;
-    for line in front[..end].lines() {
-        if let Some(value) = line.strip_prefix("license:") {
-            let value = value.trim().trim_matches('"').trim_matches('\'');
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn card_license(value: &Value) -> Option<String> {
-    value
-        .get("cardData")
-        .and_then(|c| c.get("license"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-fn card_base_model(value: &Value) -> Option<String> {
-    let base = value.get("cardData").and_then(|c| c.get("base_model"))?;
-    if let Some(s) = base.as_str() {
-        return Some(s.to_string());
-    }
-    base.as_array()
-        .and_then(|a| a.iter().filter_map(Value::as_str).next())
-        .map(str::to_string)
-}
-
-fn card_languages(value: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    let Some(lang) = value.get("cardData").and_then(|c| c.get("language")) else {
-        return out;
-    };
-    if let Some(s) = lang.as_str() {
-        out.push(s.to_string());
-    } else if let Some(a) = lang.as_array() {
-        out.extend(a.iter().filter_map(Value::as_str).map(str::to_string));
-    }
-    out
+    Ok(())
 }
 
 fn gated_field(item: &Value) -> bool {

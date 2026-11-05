@@ -249,7 +249,9 @@ fn inspect(file: &Path, as_json: bool) -> Result<()> {
     println!(
         "native:    {}",
         match (native_convert, ptq1 > 0) {
-            (true, _) => "yes (F32 / F16 / BF16 / Q4_0 / Q5_0 / Q8_0 / Q2_K..Q6_K)",
+            (true, _) => {
+                "yes (19 targets: float, Q4_0..Q6_K, TQ1_0/TQ2_0, MXFP4/NVFP4, Q1_0)"
+            }
             (false, true) => "no (PTQ1_0 is not supported)",
             (false, false) => "no (file contains an unsupported tensor type)",
         }

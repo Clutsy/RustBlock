@@ -1,5 +1,5 @@
 //! Steel-and-blocks visual language: dark graphite, brushed steel, a single
-//! oxide-red accent and a gear/cube/arrows mark drawn entirely with egui shapes.
+//! neutral steel accent and a gear/cube/arrows mark drawn entirely with egui shapes.
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, IconData, Pos2, Shape, Stroke, StrokeKind, TextStyle, Vec2,
@@ -13,24 +13,24 @@ pub const PANEL_3: Color32 = Color32::from_rgb(39, 44, 49);
 pub const BORDER: Color32 = Color32::from_rgb(51, 58, 64);
 pub const TEXT: Color32 = Color32::from_rgb(232, 229, 222);
 pub const MUTED: Color32 = Color32::from_rgb(143, 151, 157);
-pub const ACCENT: Color32 = Color32::from_rgb(201, 102, 66);
-pub const ACCENT_DARK: Color32 = Color32::from_rgb(169, 78, 48);
+pub const ACCENT: Color32 = Color32::from_rgb(166, 173, 178);
+pub const ACCENT_DARK: Color32 = Color32::from_rgb(118, 126, 132);
 pub const STEEL: Color32 = Color32::from_rgb(125, 134, 141);
 pub const STEEL_LIGHT: Color32 = Color32::from_rgb(189, 195, 199);
 pub const STEEL_DARK: Color32 = Color32::from_rgb(104, 112, 118);
-pub const WARN: Color32 = Color32::from_rgb(207, 160, 86);
+pub const WARN: Color32 = Color32::from_rgb(190, 184, 168);
 pub const ERROR: Color32 = Color32::from_rgb(222, 105, 92);
 pub const INFO: Color32 = Color32::from_rgb(132, 153, 158);
-pub const INK: Color32 = Color32::from_rgb(18, 14, 12);
+pub const INK: Color32 = Color32::from_rgb(14, 16, 18);
 
 pub fn install(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::Dark);
 
     ctx.all_styles_mut(|style| {
         style.visuals = visuals();
-        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        style.spacing.button_padding = Vec2::new(10.0, 5.0);
-        style.spacing.interact_size = Vec2::new(34.0, 26.0);
+        style.spacing.item_spacing = Vec2::new(10.0, 8.0);
+        style.spacing.button_padding = Vec2::new(12.0, 7.0);
+        style.spacing.interact_size = Vec2::new(38.0, 30.0);
         style.spacing.menu_margin = egui::Margin::same(6);
         style.animation_time = 0.10;
         style
@@ -38,13 +38,13 @@ pub fn install(ctx: &egui::Context) {
             .insert(TextStyle::Heading, FontId::proportional(24.0));
         style
             .text_styles
-            .insert(TextStyle::Body, FontId::proportional(13.0));
+            .insert(TextStyle::Body, FontId::proportional(13.5));
         style
             .text_styles
             .insert(TextStyle::Button, FontId::proportional(12.0));
         style
             .text_styles
-            .insert(TextStyle::Small, FontId::proportional(10.5));
+            .insert(TextStyle::Small, FontId::proportional(11.0));
         style
             .text_styles
             .insert(TextStyle::Monospace, FontId::monospace(11.0));
@@ -59,7 +59,7 @@ fn visuals() -> egui::Visuals {
     v.faint_bg_color = PANEL_2;
     v.code_bg_color = Color32::from_rgb(26, 31, 35);
     v.window_stroke = Stroke::new(1.0, BORDER);
-    v.window_corner_radius = CornerRadius::same(0);
+    v.window_corner_radius = CornerRadius::same(6);
     v.menu_corner_radius = CornerRadius::same(0);
     v.window_shadow = egui::epaint::Shadow::NONE;
     v.popup_shadow = egui::epaint::Shadow::NONE;
@@ -70,7 +70,7 @@ fn visuals() -> egui::Visuals {
     v.error_fg_color = ERROR;
     v.override_text_color = Some(TEXT);
 
-    let corner = CornerRadius::same(0);
+    let corner = CornerRadius::same(4);
     v.widgets.noninteractive.bg_fill = PANEL;
     v.widgets.noninteractive.weak_bg_fill = PANEL;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);

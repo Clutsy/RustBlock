@@ -22,7 +22,13 @@ use std::time::Instant;
 
 use half::{bf16, f16};
 use pmetal_gguf::{dequant, quantize, GgmlType};
+use rayon::prelude::*;
 use tempfile::NamedTempFile;
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
 use crate::convert::{convert, ConvertError, ConvertOptions, Phase, Progress, Report, VerifyMode};
 use crate::gguf::{align_up, patch_u32, patch_u64, Gguf, TensorInfo};
@@ -172,16 +178,16 @@ impl Target {
                 "4-bit blocks with a stored minimum as well as a scale. Slightly better than Q4_0 at a slightly larger size; Q4_K is usually the better modern choice."
             }
             Target::Q2K => {
-                "2-bit K-quant. Very small, with noticeable quality loss. Best for large models that otherwise would not fit in memory."
+                "2-bit K-quant base. Very small, with noticeable quality loss. Output, embeddings and value tensors are kept at Q4_K; best for large models that otherwise would not fit in memory."
             }
             Target::Q3K => {
-                "3-bit K-quant. A compromise for very tight memory; prefer Q4_K when it fits."
+                "3-bit K-quant base. A compromise for very tight memory; output, embeddings and value tensors are kept at Q5_K. Prefer Q4_K when it fits."
             }
             Target::Q4K => {
-                "4-bit K-quant with 256-value super-blocks. The usual quality/size sweet spot. This is a uniform Q4_K layout, not the mixed Q4_K_M preset."
+                "4-bit K-quant with 256-value super-blocks. The usual quality/size sweet spot. The base is Q4_K; output, embeddings and value tensors stay at Q6_K. Not the full Q4_K_M preset."
             }
             Target::Q5K => {
-                "5-bit K-quant. Better quality than Q4_K at a larger size. A good choice for small models or high-quality local inference."
+                "5-bit K-quant. Better quality than Q4_K at a larger size; output, embeddings and value tensors stay at Q6_K. Good for small models or high-quality local inference."
             }
             Target::Q6K => {
                 "6-bit K-quant. Near-F16 quality at a smaller size; usually the highest-quality practical quant."
@@ -249,6 +255,26 @@ impl Target {
         )
     }
 
+    /// Ternary layouts are handled separately in the UI and are never mixed
+    /// with the adaptive precision policy below.
+    pub fn is_ternary(self) -> bool {
+        matches!(self, Target::Tq1_0 | Target::Tq2_0)
+    }
+
+    /// The type used for tensors that are more sensitive to quantization.
+    /// This is a small, model-agnostic policy: architectures that name their
+    /// output projection, embeddings or value projection in the usual GGUF way
+    /// get extra precision there. It is not calibration and does not guess an
+    /// architecture from metadata.
+    pub fn protected_target(self) -> Option<Target> {
+        match self {
+            Target::Q2K => Some(Target::Q4K),
+            Target::Q3K => Some(Target::Q5K),
+            Target::Q4K | Target::Q5K => Some(Target::Q6K),
+            _ => None,
+        }
+    }
+
     pub fn file_type(self) -> Option<u32> {
         match self {
             Target::Reblock => Some(41),
@@ -271,10 +297,6 @@ impl Target {
             Target::Nvfp4 => Some(39),
             Target::Q1_0 => Some(40),
         }
-    }
-
-    fn ggml(self) -> Option<GgmlType> {
-        GgmlType::try_from(self.type_id()?).ok()
     }
 
     fn block(self) -> u64 {
@@ -376,50 +398,67 @@ pub fn transcode(
 
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(&header)?;
+    tmp.as_file().set_len(new_file_size)?;
 
-    let mut src = File::open(input)?;
+    let src = File::open(input)?;
+    let threads = conversion_workers();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("rustblock-convert-{i}"))
+        .build()
+        .map_err(|e| ConvertError::Codec(format!("cannot start conversion workers: {e}")))?;
     let mut written = 0u64;
 
-    for plan in &plans {
-        if plan.new_offset < written {
-            return Err(ConvertError::Verify(
-                "internal error: tensor layout is not monotonic".into(),
-            ));
-        }
-        write_zeros(&mut tmp, plan.new_offset - written)?;
+    // Tensors are independent, so encode and write a bounded batch in parallel.
+    // The output is preallocated and each tensor is written at its final offset
+    // with positional writes, so encoding no longer waits for a serial append.
+    // The batch budget prevents a large model from materializing all of its
+    // output at once. When a batch has fewer tensors than workers, encode_plan
+    // also splits a large tensor into source/target block-aligned spans.
+    let mut batch_start = 0usize;
+    while batch_start < plans.len() {
+        let batch_end = next_batch_end(&g, &plans, batch_start, threads);
+        let batch = &plans[batch_start..batch_end];
+        let parallel_inner = batch.len() < threads && threads > 1;
+        let completed: Vec<Result<u64, ConvertError>> = pool.install(|| {
+            batch
+                .par_iter()
+                .map(|plan| {
+                    let bytes = encode_plan(&src, &g, plan, target, parallel_inner, threads)?;
+                    if bytes.len() as u64 != plan.new_size {
+                        let t = &g.tensors[plan.index];
+                        return Err(ConvertError::Codec(format!(
+                            "tensor '{}' encoded to {} bytes, expected {}",
+                            t.name,
+                            bytes.len(),
+                            plan.new_size
+                        )));
+                    }
+                    write_all_at(tmp.as_file(), new_data_start + plan.new_offset, &bytes)?;
+                    Ok(plan.new_offset + plan.new_size)
+                })
+                .collect()
+        });
 
-        let t = &g.tensors[plan.index];
-        src.seek(SeekFrom::Start(g.data_start + t.offset))?;
-        let src_size = t.size.expect("validated by Gguf::open");
-        let mut raw = vec![0u8; src_size as usize];
-        src.read_exact(&mut raw)?;
-
-        if plan.copy_raw {
-            tmp.write_all(&raw)?;
-        } else {
-            let values = decode_tensor(&raw, t)?;
-            let encoded = encode_values(&values, target, plan.out_ty, t)?;
-            if encoded.len() as u64 != plan.new_size {
-                return Err(ConvertError::Codec(format!(
-                    "tensor '{}' encoded to {} bytes, expected {}",
-                    t.name,
-                    encoded.len(),
-                    plan.new_size
-                )));
+        for (plan, result) in batch.iter().zip(completed) {
+            let end = result?;
+            if end < written {
+                return Err(ConvertError::Verify(
+                    "internal error: tensor layout is not monotonic".into(),
+                ));
             }
-            tmp.write_all(&encoded)?;
+            written = end;
+            emit(
+                &mut on_progress,
+                Phase::Converting,
+                plan.index,
+                &g.tensors[plan.index].name,
+                g.tensors.len(),
+                written,
+                new_data_size,
+            );
         }
-
-        written = plan.new_offset + plan.new_size;
-        emit(
-            &mut on_progress,
-            Phase::Converting,
-            plan.index,
-            &t.name,
-            g.tensors.len(),
-            written,
-            new_data_size,
-        );
+        batch_start = batch_end;
     }
 
     tmp.flush()?;
@@ -472,6 +511,257 @@ pub fn transcode(
     })
 }
 
+/// Number of workers for one conversion. The explicit environment override is
+/// useful for benchmarking and for leaving headroom on a busy machine.
+pub fn conversion_workers() -> usize {
+    std::env::var("RUSTBLOCK_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1)
+        })
+        .min(256)
+}
+
+/// Keep a parallel batch under a memory budget. A tensor is never split just
+/// to fit the budget: one oversized tensor still gets the whole pool and is
+/// encoded in block-aligned chunks.
+fn next_batch_end(g: &Gguf, plans: &[Plan], start: usize, threads: usize) -> usize {
+    const BATCH_PEAK_BYTES: u64 = 768 * 1024 * 1024;
+    let max_tensors = threads.saturating_mul(8).max(1);
+    let mut end = start;
+    let mut peak = 0u64;
+    while end < plans.len() && end - start < max_tensors {
+        let plan = &plans[end];
+        let tensor = &g.tensors[plan.index];
+        let source = tensor.size.unwrap_or(0);
+        let cost = if plan.copy_raw {
+            source
+        } else {
+            source
+                .saturating_add(plan.new_size)
+                .saturating_add(tensor.element_count().saturating_mul(4))
+        };
+        if end > start && peak.saturating_add(cost) > BATCH_PEAK_BYTES {
+            break;
+        }
+        peak = peak.saturating_add(cost);
+        end += 1;
+        if peak >= BATCH_PEAK_BYTES {
+            break;
+        }
+    }
+    end.max(start + 1)
+}
+
+fn encode_plan(
+    src: &File,
+    g: &Gguf,
+    plan: &Plan,
+    target: Target,
+    parallel_inner: bool,
+    threads: usize,
+) -> Result<Vec<u8>, ConvertError> {
+    let tensor = &g.tensors[plan.index];
+    if plan.copy_raw {
+        let source_size = tensor.size.ok_or_else(|| ConvertError::UnsupportedTensor {
+            name: tensor.name.clone(),
+            ty: tensor.ty,
+        })?;
+        let mut raw = vec![0u8; source_size as usize];
+        read_exact_at(src, g.data_start + tensor.offset, &mut raw)?;
+        return Ok(raw);
+    }
+
+    let total = tensor.element_count();
+    let (source_block, _) = source_layout(tensor)?;
+    let target_block = type_info(plan.out_ty).map(|info| info.block).unwrap_or(1);
+    let unit = lcm(source_block, target_block).max(1);
+    // Give the pool enough independent spans even for one medium-sized
+    // tensor. A fixed 1M-element chunk left most cores idle on 2M-value
+    // tensors; this targets at least two spans per worker while keeping reads
+    // reasonably large.
+    let cap = (1_048_576u64 / unit).max(1) * unit;
+    let desired = total
+        .div_ceil((threads.max(1) as u64).saturating_mul(2))
+        .max(unit);
+    let chunk = (desired.min(cap) / unit).max(1) * unit;
+    if parallel_inner && total > chunk {
+        let chunks = total.div_ceil(chunk);
+        let parts: Vec<Result<Vec<u8>, ConvertError>> = (0..chunks)
+            .into_par_iter()
+            .map(|index| {
+                let start = index.saturating_mul(chunk);
+                let count = chunk.min(total - start);
+                encode_span(src, g, tensor, plan, target, start, count)
+            })
+            .collect();
+        let mut out = Vec::with_capacity(plan.new_size as usize);
+        for part in parts {
+            out.extend_from_slice(&part?);
+        }
+        return Ok(out);
+    }
+
+    let source_size = tensor.size.ok_or_else(|| ConvertError::UnsupportedTensor {
+        name: tensor.name.clone(),
+        ty: tensor.ty,
+    })?;
+    let mut raw = vec![0u8; source_size as usize];
+    read_exact_at(src, g.data_start + tensor.offset, &mut raw)?;
+    let values = decode_tensor(&raw, tensor)?;
+    encode_values(&values, target, plan.out_ty, tensor)
+}
+
+fn encode_span(
+    src: &File,
+    g: &Gguf,
+    tensor: &TensorInfo,
+    plan: &Plan,
+    target: Target,
+    element_start: u64,
+    element_count: u64,
+) -> Result<Vec<u8>, ConvertError> {
+    let (source_block, source_bytes) = source_layout(tensor)?;
+    let byte_start = (element_start / source_block)
+        .checked_mul(source_bytes)
+        .ok_or(ConvertError::Overflow)?;
+    let byte_len = (element_count / source_block)
+        .checked_mul(source_bytes)
+        .ok_or(ConvertError::Overflow)?;
+    let mut raw = vec![0u8; byte_len as usize];
+    read_exact_at(src, g.data_start + tensor.offset + byte_start, &mut raw)?;
+    let values = decode_chunk(&raw, tensor, element_count)?;
+    encode_values(&values, target, plan.out_ty, tensor)
+}
+
+fn source_layout(tensor: &TensorInfo) -> Result<(u64, u64), ConvertError> {
+    if tensor.ty == TY_PQ2_0 {
+        return Ok((128, 34));
+    }
+    if tensor.ty == TY_Q2_0 {
+        return Ok((64, 18));
+    }
+    type_info(tensor.ty)
+        .map(|info| (info.block, info.bytes))
+        .ok_or_else(|| ConvertError::UnsupportedTensor {
+            name: tensor.name.clone(),
+            ty: tensor.ty,
+        })
+}
+
+fn decode_chunk(raw: &[u8], tensor: &TensorInfo, elements: u64) -> Result<Vec<f32>, ConvertError> {
+    if tensor.ty == TY_PQ2_0 {
+        return Ok(decode_ternary(raw, 128, 34));
+    }
+    if tensor.ty == TY_Q2_0 {
+        return Ok(decode_ternary(raw, 64, 18));
+    }
+    let dtype = GgmlType::try_from(tensor.ty).map_err(|_| ConvertError::UnsupportedTensor {
+        name: tensor.name.clone(),
+        ty: tensor.ty,
+    })?;
+    if elements > i32::MAX as u64 {
+        return Err(ConvertError::Codec(format!(
+            "chunk for tensor '{}' is too large for the codec",
+            tensor.name
+        )));
+    }
+    dequant::dequantize(raw, dtype, &[elements as i32])
+        .map_err(|e| ConvertError::Codec(format!("cannot decode tensor '{}': {e}", tensor.name)))
+}
+
+fn lcm(a: u64, b: u64) -> u64 {
+    fn gcd(mut x: u64, mut y: u64) -> u64 {
+        while y != 0 {
+            let rest = x % y;
+            x = y;
+            y = rest;
+        }
+        x
+    }
+    if a == 0 || b == 0 {
+        0
+    } else {
+        (a / gcd(a, b)).saturating_mul(b)
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    FileExt::read_exact_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "tensor data ended early",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, offset: u64, mut buf: &[u8]) -> io::Result<()> {
+    let mut done = 0u64;
+    while !buf.is_empty() {
+        let n = FileExt::write_at(file, buf, offset + done)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "could not write tensor data",
+            ));
+        }
+        done += n as u64;
+        buf = &buf[n..];
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, offset: u64, mut buf: &[u8]) -> io::Result<()> {
+    let mut done = 0u64;
+    while !buf.is_empty() {
+        let n = file.seek_write(buf, offset + done)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "could not write tensor data",
+            ));
+        }
+        done += n as u64;
+        buf = &buf[n..];
+    }
+    Ok(())
+}
+
+fn is_sensitive_tensor(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if !name.ends_with(".weight") {
+        return false;
+    }
+    name.contains("output")
+        || name.contains("lm_head")
+        || name.contains("token_embd")
+        || name.contains("tok_embeddings")
+        || name.contains("embed_tokens")
+        || name.contains("embedding")
+        || name.contains("word_embeddings")
+        || name.contains("wte.weight")
+        || name.contains("attn_v")
+        || name.contains("v_proj")
+}
+
 fn plan_layout(g: &Gguf, target: Target) -> Result<Vec<Plan>, ConvertError> {
     let mut order: Vec<usize> = (0..g.tensors.len()).collect();
     order.sort_by_key(|&i| g.tensors[i].offset);
@@ -484,7 +774,15 @@ fn plan_layout(g: &Gguf, target: Target) -> Result<Vec<Plan>, ConvertError> {
         let out_ty = if target.is_quantized() {
             let block = target.block();
             if t.dims.len() >= 2 && t.dims[0].is_multiple_of(block) && elems.is_multiple_of(block) {
-                target.type_id().expect("quantized target has a type id")
+                let base = target.type_id().expect("quantized target has a type id");
+                if is_sensitive_tensor(&t.name) {
+                    target
+                        .protected_target()
+                        .and_then(Target::type_id)
+                        .unwrap_or(base)
+                } else {
+                    base
+                }
             } else {
                 0 // 1-D tensors and unaligned rows stay F32
             }
@@ -646,10 +944,10 @@ fn encode_values(
         2 => Ok(encode_q4_0(values)),
         6 => Ok(encode_q5_0(values)),
         8 => Ok(encode_q8_0(values)),
+        13 => Ok(encode_q5k(values)),
         3 | 7 | 34 | 35 | 39 | 40 | 41 => {
-            let dtype = target.ggml().ok_or_else(|| {
-                ConvertError::Codec(format!("no codec for target {}", target.short()))
-            })?;
+            let dtype = GgmlType::try_from(out_ty)
+                .map_err(|_| ConvertError::Codec(format!("no codec for tensor type {out_ty}")))?;
             quantize::quantize(values, dtype).map_err(|e| {
                 ConvertError::Codec(format!(
                     "cannot quantize tensor '{}' to {}: {e}",
@@ -659,9 +957,8 @@ fn encode_values(
             })
         }
         10..=14 => {
-            let dtype = target.ggml().ok_or_else(|| {
-                ConvertError::Codec(format!("no codec for target {}", target.short()))
-            })?;
+            let dtype = GgmlType::try_from(out_ty)
+                .map_err(|_| ConvertError::Codec(format!("no codec for tensor type {out_ty}")))?;
             quantize::quantize(values, dtype).map_err(|e| {
                 ConvertError::Codec(format!(
                     "cannot quantize tensor '{}' to {}: {e}",
@@ -730,6 +1027,98 @@ fn encode_q5_0(values: &[f32]) -> Vec<u8> {
         for i in 0..16 {
             out.push((q[i] & 0x0f) | ((q[i + 16] & 0x0f) << 4));
         }
+    }
+    out
+}
+
+/// Q5_K packed directly instead of relying on pmetal's Q5K quantizer, whose
+/// high-bit layout is incompatible with its own decoder in 0.5.0. The layout
+/// here follows the GGUF Q5_K block: d, dmin, 12 packed 6-bit scale/min pairs,
+/// 32 high-bit bytes, then 128 low-nibble bytes.
+fn encode_q5k(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() / 256 * 176);
+    for block in values.chunks_exact(256) {
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+        let mut q = [0u8; 256];
+        let mut block_scale = 0f32;
+        let mut block_min = 0f32;
+
+        for chunk in block.chunks_exact(32) {
+            let min = chunk.iter().fold(0f32, |m, v| m.min(*v));
+            let max = chunk.iter().fold(f32::NEG_INFINITY, |m, v| m.max(*v));
+            let scale = (max - min) / 31.0;
+            block_scale = block_scale.max(scale);
+            block_min = block_min.max(-min);
+        }
+
+        let d = f16::from_f32(block_scale / 63.0);
+        let dmin = f16::from_f32(block_min / 63.0);
+        for (j, chunk) in block.chunks_exact(32).enumerate() {
+            let min = chunk.iter().fold(0f32, |m, v| m.min(*v));
+            let max = chunk.iter().fold(f32::NEG_INFINITY, |m, v| m.max(*v));
+            let scale = (max - min) / 31.0;
+            let sc = if d.to_f32() > 0.0 {
+                (scale / d.to_f32()).round().clamp(0.0, 63.0) as u8
+            } else {
+                0
+            };
+            let m = if dmin.to_f32() > 0.0 {
+                (-min / dmin.to_f32()).round().clamp(0.0, 63.0) as u8
+            } else {
+                0
+            };
+            scales[j] = sc;
+            mins[j] = m;
+            let actual_d = d.to_f32() * sc as f32;
+            let actual_min = dmin.to_f32() * m as f32;
+            for (i, value) in chunk.iter().enumerate() {
+                let code = if actual_d > 0.0 {
+                    ((*value + actual_min) / actual_d).round().clamp(0.0, 31.0) as u8
+                } else {
+                    0
+                };
+                q[j * 32 + i] = code;
+            }
+        }
+
+        let mut packed_scales = [0u8; 12];
+        for j in 0..4 {
+            packed_scales[j] = scales[j] & 0x3f;
+            packed_scales[j + 4] = mins[j] & 0x3f;
+        }
+        for j in 4..8 {
+            packed_scales[j + 4] = (scales[j] & 0x0f) | ((mins[j] & 0x0f) << 4);
+            packed_scales[j - 4] |= (scales[j] >> 4) << 6;
+            packed_scales[j] |= (mins[j] >> 4) << 6;
+        }
+
+        let mut qh = [0u8; 32];
+        let mut qs = [0u8; 128];
+        for n in (0..256).step_by(64) {
+            let chunk = n / 64;
+            for half in 0..2 {
+                for l in 0..32 {
+                    let code = q[n + half * 32 + l];
+                    let low = code & 0x0f;
+                    let idx = chunk * 32 + half * 16 + l / 2;
+                    if l % 2 == 0 {
+                        qs[idx] |= low;
+                    } else {
+                        qs[idx] |= low << 4;
+                    }
+                    if code & 0x10 != 0 {
+                        qh[chunk * 8 + half * 4 + l / 8] |= 1 << (l % 8);
+                    }
+                }
+            }
+        }
+
+        out.extend_from_slice(&d.to_bits().to_le_bytes());
+        out.extend_from_slice(&dmin.to_bits().to_le_bytes());
+        out.extend_from_slice(&packed_scales);
+        out.extend_from_slice(&qh);
+        out.extend_from_slice(&qs);
     }
     out
 }
@@ -843,7 +1232,7 @@ fn verify_values(
         for (j, (x, y)) in a.iter().zip(&b).enumerate() {
             if !y.is_finite() || (*x - *y).abs() > tolerance {
                 return Err(ConvertError::Verify(format!(
-                    "value mismatch in tensor '{}' at element {j}",
+                    "value mismatch in tensor '{}' at element {j}: {x} vs {y} (tolerance {tolerance})",
                     t_in.name
                 )));
             }
@@ -882,16 +1271,6 @@ fn emit(
             bytes_total,
         });
     }
-}
-
-fn write_zeros<W: Write>(w: &mut W, mut n: u64) -> io::Result<()> {
-    const ZEROS: [u8; 8192] = [0u8; 8192];
-    while n > 0 {
-        let k = n.min(ZEROS.len() as u64) as usize;
-        w.write_all(&ZEROS[..k])?;
-        n -= k as u64;
-    }
-    Ok(())
 }
 
 fn paths_same(input: &Path, output: &Path) -> io::Result<bool> {
@@ -935,5 +1314,54 @@ mod tests {
         assert_eq!(values[0], -0.5);
         assert_eq!(values[1], 0.0);
         assert_eq!(values[2], 0.5);
+    }
+
+    #[test]
+    fn q5k_roundtrip_is_close() {
+        let values: Vec<f32> = (0..512)
+            .map(|i| ((i as f32 * 0.017).sin() * 2.5) + (i as f32 * 0.001))
+            .collect();
+        let raw = encode_q5k(&values);
+        assert_eq!(raw.len(), 352);
+        let back = dequant::dequantize(&raw, GgmlType::Q5K, &[512]).unwrap();
+        let max = values.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = values
+            .iter()
+            .zip(&back)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 0.1 * max + 1e-4, "Q5_K error {worst} is too high");
+    }
+
+    #[test]
+    fn niche_codecs_roundtrip_with_expected_loss() {
+        let values: Vec<f32> = (0..512)
+            .map(|i| ((i as f32 * 0.017).sin() * 2.5) + (i as f32 * 0.001))
+            .collect();
+        for ty in [
+            GgmlType::Tq1_0,
+            GgmlType::Tq2_0,
+            GgmlType::Mxfp4,
+            GgmlType::Nvfp4,
+            GgmlType::Q1_0,
+        ] {
+            let raw = quantize::quantize(&values, ty).unwrap();
+            let back = dequant::dequantize(&raw, ty, &[512]).unwrap();
+            let max = values.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = values
+                .iter()
+                .zip(&back)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let expected = match ty {
+                GgmlType::Tq1_0 | GgmlType::Tq2_0 => 0.75,
+                GgmlType::Q1_0 => 0.95,
+                _ => 0.35,
+            };
+            assert!(
+                worst <= max * expected + 1e-4,
+                "{ty:?} error {worst} exceeds {expected} x {max}"
+            );
+        }
     }
 }

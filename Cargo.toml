@@ -21,3 +21,4 @@ rfd = "0.17"
 ureq = { version = "2", features = ["json"] }
 urlencoding = "2"
 image = { version = "0.25", default-features = false, features = ["png"] }
+rayon = "1.10"
