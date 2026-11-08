@@ -1,19 +1,22 @@
 //! RustBlock application state and UI.
 use crate::hf::{self, HfEvent, HfFile, HfModel, HfSort};
 use crate::model::{
-    analyze, human_bytes, human_duration, human_speed, looks_quantized_name, output_path, path_key,
-    shorten, FileKind, Job, JobStatus, OutputMode, RunState, Settings, VerifyKind,
+    analyze, clear_partial_files, human_bytes, human_duration, human_speed, looks_quantized_name,
+    output_path, path_key, shorten, FileKind, Job, JobStatus, OutputMode, RunState, Settings,
+    VerifyKind,
 };
 use crate::theme::{
-    self, ACCENT, BG, BORDER, ERROR, INFO, INK, MUTED, PANEL, PANEL_2, PANEL_3, STEEL_LIGHT, TEXT,
-    WARN,
+    self, ACCENT, BG, BORDER, ERROR, INFO, INK, MUTED, OK, PANEL, PANEL_2, PANEL_3, STEEL_LIGHT,
+    TEXT, WARN,
 };
 use crate::worker::{self, Event, WorkItem, WorkKind};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Id, LayerId, Layout, Margin, Order,
     ProgressBar, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
 };
-use rustblock_core::{Phase, Target, VerifyMode};
+use rustblock_core::{
+    cache_stats, plan_budget, trim_cache, BudgetRequest, FitEstimate, Phase, Target, VerifyMode,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +65,7 @@ struct DownloadUi {
     total: u64,
     speed: f64,
     quantized: bool,
+    projector: bool,
     path: Option<PathBuf>,
     error: Option<String>,
 }
@@ -75,8 +79,8 @@ pub struct RustBlockApp {
     cancel: Option<Arc<AtomicBool>>,
     batch: Option<Batch>,
     last_output_dir: Option<PathBuf>,
-    centered: bool,
-    logo: Option<egui::TextureHandle>,
+    mark: Option<egui::TextureHandle>,
+    wordmark: Option<egui::TextureHandle>,
     ctx: egui::Context,
     hf_query: String,
     hf_sort: HfSort,
@@ -94,6 +98,11 @@ pub struct RustBlockApp {
     hf_file_filter: String,
     discover_loaded: bool,
     download: Option<DownloadUi>,
+    confirm_requantize: Option<WorkKind>,
+    logs: Vec<(LogLevel, String)>,
+    show_log: bool,
+    log_filter: String,
+    show_help: bool,
 }
 impl RustBlockApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -108,8 +117,8 @@ impl RustBlockApp {
             cancel: None,
             batch: None,
             last_output_dir: None,
-            centered: false,
-            logo: theme::load_logo(&cc.egui_ctx),
+            mark: theme::load_gear(&cc.egui_ctx),
+            wordmark: theme::load_wordmark(&cc.egui_ctx),
             ctx: cc.egui_ctx.clone(),
             hf_query: String::new(),
             hf_sort: HfSort::Downloads,
@@ -127,6 +136,11 @@ impl RustBlockApp {
             hf_file_filter: String::new(),
             discover_loaded: false,
             download: None,
+            confirm_requantize: None,
+            logs: Vec::new(),
+            show_log: false,
+            log_filter: String::new(),
+            show_help: false,
         };
         app.log(
             LogLevel::Info,
@@ -148,7 +162,13 @@ impl RustBlockApp {
     fn hf_busy(&self) -> bool {
         self.hf_rx.is_some()
     }
-    fn log(&mut self, _level: LogLevel, _text: String) {}
+    fn log(&mut self, level: LogLevel, text: String) {
+        self.logs.push((level, text));
+        if self.logs.len() > 500 {
+            let excess = self.logs.len() - 500;
+            self.logs.drain(0..excess);
+        }
+    }
     fn job_name(&self, id: u64) -> String {
         self.jobs
             .iter()
@@ -187,6 +207,7 @@ impl RustBlockApp {
         }
     }
     fn add_paths(&mut self, paths: Vec<PathBuf>) {
+        let hardware = rustblock_core::detect_hardware();
         for path in paths {
             let is_gguf = path
                 .extension()
@@ -206,7 +227,7 @@ impl RustBlockApp {
                 );
                 continue;
             }
-            let analysis = analyze(&path);
+            let analysis = analyze(&path, hardware);
             if let Some(error) = &analysis.error {
                 self.log(
                     LogLevel::Error,
@@ -214,6 +235,17 @@ impl RustBlockApp {
                 );
             } else {
                 self.log(LogLevel::Info, format!("Added: {}", path.display()));
+                if analysis.kind == FileKind::Q2 {
+                    self.log(
+                        LogLevel::Info,
+                        format!(
+                            "{} is already upstream Q2_0; no reblock is needed.",
+                            path.file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string())
+                        ),
+                    );
+                }
                 if (analysis.is_quantized() && analysis.kind != FileKind::Pq2)
                     || path
                         .file_name()
@@ -435,6 +467,24 @@ impl RustBlockApp {
         }
     }
     fn start(&mut self, kind: WorkKind) {
+        if kind == WorkKind::Convert && self.requantize_needed() {
+            self.confirm_requantize = Some(kind);
+            return;
+        }
+        self.launch(kind, false);
+    }
+
+    fn requantize_needed(&self) -> bool {
+        let target = self.settings.target;
+        target != Target::Reblock
+            && target.is_quantized()
+            && self
+                .jobs
+                .iter()
+                .any(|job| job.analysis.is_quantized() && job.analysis.can_target(target))
+    }
+
+    fn launch(&mut self, kind: WorkKind, allow_requantize: bool) {
         if self.is_running() {
             return;
         }
@@ -511,6 +561,7 @@ impl RustBlockApp {
                     verify_setting
                 },
                 force: overwrite,
+                allow_requantize,
             });
         }
         for (level, text) in notes {
@@ -551,6 +602,71 @@ impl RustBlockApp {
         self.rx = Some(rx);
         self.worker = Some(handle);
         self.cancel = Some(cancel);
+    }
+
+    fn requantize_modal(&mut self, ctx: &egui::Context) {
+        let Some(kind) = self.confirm_requantize else {
+            return;
+        };
+        let mut cancel = false;
+        let mut proceed = false;
+        egui::Window::new("Requantization warning")
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_max_width(430.0);
+                ui.label(
+                    RichText::new("These files are already quantized.")
+                        .size(15.0)
+                        .strong()
+                        .color(WARN),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Converting a quantized model to another quantized format does not restore the weights lost by the first quantization. The result can only be worse and may be noticeably degraded.\n\nUse F16/F32 to decompress, or continue only if you have a copy of the original float model.",
+                    )
+                    .size(11.0)
+                    .color(TEXT),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Cancel").size(11.0).color(INK))
+                                .fill(PANEL_3)
+                                .min_size(Vec2::new(100.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Requantize anyway")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(INK),
+                            )
+                            .fill(WARN)
+                            .min_size(Vec2::new(160.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        proceed = true;
+                    }
+                });
+            });
+        if cancel {
+            self.confirm_requantize = None;
+        }
+        if proceed {
+            self.confirm_requantize = None;
+            self.launch(kind, true);
+        }
     }
     // ----- Hugging Face -------------------------------------------------
     fn start_search(&mut self) {
@@ -670,13 +786,26 @@ impl RustBlockApp {
     }
 
     fn start_download(&mut self, repo: String, file: HfFile) {
+        let projector = file.projector;
+        self.begin_download(repo, file, projector);
+    }
+
+    fn begin_download(&mut self, repo: String, file: HfFile, projector: bool) {
         if self.hf_busy() {
             return;
         }
-        if let Err(reason) = hf::file_support(&file.path) {
+        if !projector {
+            if let Err(reason) = hf::file_support(&file.path) {
+                self.log(
+                    LogLevel::Warn,
+                    format!("Not downloading {}: {reason}.", file.path),
+                );
+                return;
+            }
+        } else if !hf::is_projector(&file.path) {
             self.log(
                 LogLevel::Warn,
-                format!("Not downloading {}: {reason}.", file.path),
+                format!("Not downloading {}: not a vision projector.", file.path),
             );
             return;
         }
@@ -690,7 +819,8 @@ impl RustBlockApp {
             done: 0,
             total: file.size,
             speed: 0.0,
-            quantized: looks_quantized_name(&file.path),
+            quantized: !projector && looks_quantized_name(&file.path),
+            projector,
             path: None,
             error: None,
         });
@@ -698,7 +828,27 @@ impl RustBlockApp {
         self.hf_cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.hf_cancel.clone();
         self.hf_worker = Some(std::thread::spawn(move || {
-            let result = hf::download(&repo, &revision, &file.path, &dest, false, &cancel, &tx);
+            let result = if projector {
+                hf::download_projector(
+                    &repo,
+                    &revision,
+                    &file.path,
+                    &dest,
+                    file.sha256.as_deref(),
+                    &cancel,
+                    &tx,
+                )
+            } else {
+                hf::download_parallel(
+                    &repo,
+                    &revision,
+                    &file.path,
+                    &dest,
+                    file.sha256.as_deref(),
+                    &cancel,
+                    &tx,
+                )
+            };
             if let Err(error) = result {
                 if error != "download cancelled" {
                     let _ = tx.send(HfEvent::DownloadFailed {
@@ -782,28 +932,43 @@ impl RustBlockApp {
                         };
                     }
                 }
-                HfEvent::Downloaded { repo, file, path } => {
+                HfEvent::Downloaded {
+                    repo,
+                    file,
+                    path,
+                    projector,
+                } => {
                     if let Some(d) = &mut self.download {
                         d.path = Some(path.clone());
                         d.done = d.total;
                     }
-                    self.log(
-                        LogLevel::Ok,
-                        format!("Downloaded {repo}/{file} to {}.", path.display()),
-                    );
-                    if self
-                        .download
-                        .as_ref()
-                        .is_some_and(|download| download.quantized)
-                    {
+                    if projector {
                         self.log(
-                            LogLevel::Warn,
+                            LogLevel::Ok,
                             format!(
-                                "{file} is already quantized. Converting it again cannot recover the original precision; use a virgin F16/BF16 model if available."
+                                "Downloaded projector {repo}/{file} to {}. Keep it next to the model for the runtime.",
+                                path.display()
                             ),
                         );
+                    } else {
+                        self.log(
+                            LogLevel::Ok,
+                            format!("Downloaded {repo}/{file} to {}.", path.display()),
+                        );
+                        if self
+                            .download
+                            .as_ref()
+                            .is_some_and(|download| download.quantized)
+                        {
+                            self.log(
+                                LogLevel::Warn,
+                                format!(
+                                    "{file} is already quantized. Converting it again cannot recover the original precision; use a virgin F16/BF16 model if available."
+                                ),
+                            );
+                        }
+                        self.add_paths(vec![path]);
                     }
-                    self.add_paths(vec![path]);
                 }
                 HfEvent::DownloadFailed { repo, file, error } => {
                     if let Some(d) = &mut self.download {
@@ -854,26 +1019,110 @@ impl RustBlockApp {
 
     // ----- UI -----------------------------------------------------------
     fn top_chrome(&mut self, ui: &mut Ui) {
-        let logo = self.logo.clone();
+        let mark = self.mark.clone();
+        let wordmark = self.wordmark.clone();
         egui::Panel::top("chrome")
-            .exact_size(60.0)
+            .exact_size(58.0)
             .frame(
                 egui::Frame::new()
                     .fill(PANEL)
-                    .inner_margin(Margin::symmetric(20, 10))
+                    .inner_margin(Margin::symmetric(16, 9))
                     .stroke(Stroke::new(1.0, BORDER)),
             )
             .show(ui, |ui| {
+                let chrome_rect = ui.max_rect();
+                let controls_width = 196.0;
+                if let Some(texture) = wordmark.as_ref() {
+                    let texture_size = texture.size_vec2();
+                    let aspect = texture_size.x / texture_size.y;
+                    let height = (chrome_rect.height() * 0.9).min(52.0);
+                    let width = height * aspect;
+                    let background = egui::Rect::from_min_size(
+                        egui::pos2(
+                            chrome_rect.right() - controls_width - width - 20.0,
+                            chrome_rect.center().y - height * 0.5,
+                        ),
+                        Vec2::new(width, height),
+                    );
+                    theme::paint_wordmark(
+                        &ui.painter().with_clip_rect(chrome_rect),
+                        background,
+                        Some(texture),
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 13),
+                    );
+                }
                 ui.horizontal(|ui| {
-                    theme::paint_logo(ui, 28.0, logo.as_ref());
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("RustBlock").size(15.0).strong().color(TEXT));
-                    ui.add_space(26.0);
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    self.brand(ui, mark.as_ref(), wordmark.as_ref());
+                    ui.add_space(10.0);
                     self.nav_tab(ui, Tab::Convert, "Convert");
-                    ui.add_space(4.0);
+                    ui.add_space(2.0);
                     self.nav_tab(ui, Tab::Discover, "Discover");
+                    let drag_width = (ui.available_width() - controls_width).max(0.0);
+                    if drag_width > 1.0 {
+                        let (_, response) = ui.allocate_exact_size(
+                            Vec2::new(drag_width, 30.0),
+                            Sense::click_and_drag(),
+                        );
+                        if response.drag_started() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        if response.double_clicked() {
+                            toggle_maximized(ui.ctx());
+                        }
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if window_button(ui, "×", "Close", true) {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if window_button(ui, "—", "Minimize", false) {
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                        ui.add_space(6.0);
+                        if ui
+                            .button(RichText::new("Log").size(10.0).color(MUTED))
+                            .on_hover_text("Activity log · Ctrl+L")
+                            .clicked()
+                        {
+                            self.show_log = !self.show_log;
+                        }
+                        if ui
+                            .button(RichText::new("?").size(12.0).color(MUTED))
+                            .on_hover_text("Help · F1")
+                            .clicked()
+                        {
+                            self.show_help = true;
+                        }
+                    });
                 });
             });
+    }
+
+    fn brand(
+        &mut self,
+        ui: &mut Ui,
+        mark: Option<&egui::TextureHandle>,
+        wordmark: Option<&egui::TextureHandle>,
+    ) {
+        theme::paint_logo(ui, 32.0, mark);
+        ui.add_space(8.0);
+        let Some(texture) = wordmark else {
+            return;
+        };
+        let height = 34.0;
+        let size = texture.size_vec2();
+        let width = height * (size.x / size.y).max(0.1);
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
+        theme::paint_wordmark(ui.painter(), rect, Some(texture), Color32::WHITE);
+        if response.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if response.double_clicked() {
+            toggle_maximized(ui.ctx());
+        }
+        let _ = response.on_hover_text("Native GGUF toolkit");
     }
 
     fn nav_tab(&mut self, ui: &mut Ui, tab: Tab, label: &str) {
@@ -986,7 +1235,7 @@ impl RustBlockApp {
 
     fn settings_rail(&mut self, ui: &mut Ui) {
         egui::Panel::right("settings_rail")
-            .exact_size(380.0)
+            .exact_size(420.0)
             .resizable(true)
             .frame(
                 egui::Frame::new()
@@ -998,36 +1247,58 @@ impl RustBlockApp {
                 egui::Frame::new()
                     .inner_margin(Margin::symmetric(20, 16))
                     .show(ui, |ui| {
-                        ui.label(RichText::new("Output format").size(10.5).color(MUTED));
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Output format").size(10.5).color(MUTED));
+                            help_dot(
+                                ui,
+                                "Choose the output precision. Q4_K_M is the balanced default; F16/BF16 are best before requantizing.",
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Non so cosa scegliere")
+                                                .size(9.5)
+                                                .color(STEEL_LIGHT),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .on_hover_text(
+                                        "Uses detected RAM/VRAM to suggest a format. You can always change it.",
+                                    )
+                                    .clicked()
+                                {
+                                    self.suggest_target();
+                                }
+                            });
+                        });
                         ui.add_space(1.0);
                         ui.label(
                             RichText::new(self.settings.target.short())
                                 .size(26.0)
                                 .strong()
                                 .color(TEXT),
-                        );
-                        ui.label(
-                            RichText::new(target_caption(self.settings.target))
-                                .size(11.5)
-                                .color(MUTED),
-                        );
-                        ui.add_space(8.0);
+                        )
+                        .on_hover_text(target_caption(self.settings.target));
+                        ui.add_space(6.0);
                         self.format_panel(ui);
                         ui.add_space(8.0);
                         ui.separator();
                         ui.add_space(8.0);
-                        let max_height = (ui.available_height() - 64.0).max(96.0);
+                        let max_height = (ui.available_height() - 145.0).max(46.0);
                         ScrollArea::vertical()
                             .id_salt("settings_scroll")
                             .max_height(max_height)
                             .max_width(ui.available_width())
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                                self.options_panel(ui);
+                                self.destination_panel(ui);
                             });
-                        ui.add_space(8.0);
+                        ui.add_space(4.0);
                         ui.separator();
-                        ui.add_space(8.0);
+                        ui.add_space(4.0);
+                        self.verification_panel(ui);
+                        ui.add_space(4.0);
                         self.start_controls(ui);
                     });
             });
@@ -1036,7 +1307,7 @@ impl RustBlockApp {
     fn hf_inspector_rail(&mut self, ui: &mut Ui) {
         let scroll_top = std::mem::take(&mut self.hf_scroll_top);
         egui::Panel::right("hf_inspector_rail")
-            .exact_size(380.0)
+            .exact_size(420.0)
             .resizable(true)
             .frame(
                 egui::Frame::new()
@@ -1218,7 +1489,7 @@ impl RustBlockApp {
             })
             .collect();
         if available.is_empty() {
-            available.push(Target::Q4K);
+            available.push(Target::Q4KM);
         }
         if !available.contains(&self.settings.target) {
             self.settings.target = available[0];
@@ -1256,11 +1527,15 @@ impl RustBlockApp {
         });
     }
 
-    fn options_panel(&mut self, ui: &mut Ui) {
+    fn destination_panel(&mut self, ui: &mut Ui) {
         let running = self.is_running();
         ui.add_enabled_ui(!running, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Destination").size(10.5).color(MUTED));
+                help_dot(
+                    ui,
+                    "Write next to the source or choose a folder. Existing files are protected unless Overwrite is enabled.",
+                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.checkbox(&mut self.settings.overwrite, "Overwrite")
                         .on_hover_text("Replace output files that already exist.");
@@ -1295,8 +1570,19 @@ impl RustBlockApp {
                 self.settings.output_mode = OutputMode::NextToInput;
             }
 
-            ui.add_space(10.0);
-            ui.label(RichText::new("Verification").size(10.5).color(MUTED));
+        });
+    }
+
+    fn verification_panel(&mut self, ui: &mut Ui) {
+        let running = self.is_running();
+        ui.add_enabled_ui(!running, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Verification").size(10.5).color(MUTED));
+                help_dot(
+                    ui,
+                    "Structure checks the header, offsets and size. Full decodes every tensor again and is slower.",
+                );
+            });
             ui.add_space(4.0);
             let gap = 4.0;
             let width = ((ui.available_width() - gap * 2.0) / 3.0).max(54.0);
@@ -1342,26 +1628,22 @@ impl RustBlockApp {
         let count = self.selected_jobs();
         let running = self.is_running();
         let enabled = !running && count > 0;
-        if self.jobs.is_empty() {
-            ui.label(
-                RichText::new("Add a GGUF file to begin.")
-                    .size(10.5)
-                    .color(MUTED),
-            );
-        } else if count == 0 {
-            ui.label(
-                RichText::new(format!("No file can use {}.", self.settings.target.short()))
-                    .size(10.5)
-                    .color(WARN),
-            );
-        } else if count < self.jobs.len() {
-            ui.label(
-                RichText::new(format!("{count} of {} files ready.", self.jobs.len()))
-                    .size(10.5)
-                    .color(MUTED),
-            );
+        if !self.jobs.is_empty() {
+            if count == 0 {
+                ui.label(
+                    RichText::new(format!("No file can use {}.", self.settings.target.short()))
+                        .size(10.5)
+                        .color(WARN),
+                );
+            } else if count < self.jobs.len() {
+                ui.label(
+                    RichText::new(format!("{count} of {} files ready.", self.jobs.len()))
+                        .size(10.5)
+                        .color(MUTED),
+                );
+            }
         }
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         let label = if running {
             "Converting…".to_string()
         } else if count == 0 {
@@ -1380,9 +1662,171 @@ impl RustBlockApp {
             .fill(if enabled { ACCENT } else { PANEL_3 })
             .stroke(Stroke::new(1.0, if enabled { ACCENT } else { BORDER }))
             .corner_radius(CornerRadius::same(4))
-            .min_size(Vec2::new(ui.available_width(), 42.0));
+            .min_size(Vec2::new(ui.available_width(), 38.0));
         if ui.add_enabled(enabled, button).clicked() {
             self.start(WorkKind::Convert);
+        }
+    }
+
+    fn suggest_target(&mut self) {
+        let hardware = rustblock_core::detect_hardware();
+        if hardware.vram_bytes.is_none() {
+            self.log(
+                LogLevel::Warn,
+                "No NVIDIA GPU detected; the suggestion uses system RAM. Open Help (F1) for the fit estimate."
+                    .to_string(),
+            );
+        }
+        let largest = self.jobs.iter().max_by_key(|job| job.analysis.file_len);
+        if let Some(job) = largest {
+            if job.analysis.kind == FileKind::Pq2 {
+                self.settings.target = Target::Reblock;
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "{} is PQ2_0: the lossless Q2_0 reblock is the safe choice.",
+                        job.file_name()
+                    ),
+                );
+                return;
+            }
+            if hardware.ram_bytes.is_some() || hardware.vram_bytes.is_some() {
+                match plan_budget(
+                    &job.input,
+                    BudgetRequest {
+                        budget_bytes: None,
+                        context: 4096,
+                        overhead_bytes: 512 * 1024 * 1024,
+                        hardware: Some(hardware),
+                    },
+                ) {
+                    Ok(plan) => {
+                        self.settings.target = plan.selected;
+                        self.log(
+                            LogLevel::Info,
+                            format!(
+                                "{}: suggested {} (~{} at 4096 tokens; {}).",
+                                job.file_name(),
+                                plan.selected.short(),
+                                human_bytes(plan.selected_total_bytes),
+                                plan.reason
+                            ),
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        self.log(
+                            LogLevel::Warn,
+                            format!("Could not estimate {}: {error}", job.file_name()),
+                        );
+                    }
+                }
+            }
+        }
+        let target = rustblock_core::suggest_target(hardware.ram_bytes.or(hardware.vram_bytes));
+        self.settings.target = target;
+        self.log(
+            LogLevel::Info,
+            format!(
+                "Detected {} RAM / {} VRAM; suggested {}.",
+                hardware
+                    .ram_bytes
+                    .map(human_bytes)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                hardware
+                    .vram_bytes
+                    .map(human_bytes)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                target.short()
+            ),
+        );
+    }
+
+    fn log_panel(&mut self, ui: &mut Ui) {
+        egui::Panel::bottom("log_panel")
+            .exact_size(180.0)
+            .resizable(true)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .inner_margin(Margin::symmetric(12, 8)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Log").size(11.0).strong().color(TEXT));
+                    ui.add_sized(
+                        [160.0, 22.0],
+                        TextEdit::singleline(&mut self.log_filter)
+                            .hint_text("Filter")
+                            .font(FontId::proportional(9.5)),
+                    );
+                    if ui
+                        .button(RichText::new("Clear").size(9.5).color(MUTED))
+                        .clicked()
+                    {
+                        self.logs.clear();
+                    }
+                    if ui
+                        .button(RichText::new("Close").size(9.5).color(MUTED))
+                        .clicked()
+                    {
+                        self.show_log = false;
+                    }
+                });
+                ui.separator();
+                let filter = self.log_filter.to_ascii_lowercase();
+                ScrollArea::vertical()
+                    .id_salt("log_scroll")
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (level, text) in self.logs.iter().filter(|(_, text)| {
+                            filter.is_empty() || text.to_ascii_lowercase().contains(&filter)
+                        }) {
+                            let color = match level {
+                                LogLevel::Info => MUTED,
+                                LogLevel::Ok => ACCENT,
+                                LogLevel::Warn => WARN,
+                                LogLevel::Error => ERROR,
+                            };
+                            ui.label(RichText::new(text).size(10.0).monospace().color(color));
+                        }
+                    });
+            });
+    }
+
+    fn help_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("RustBlock help")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                ui.label(RichText::new("What the buttons do").size(15.0).strong().color(TEXT));
+                ui.add_space(6.0);
+                for (title, text) in [
+                    ("Reblock (Q2_0)", "Lossless conversion of Prism PQ2_0 files to the upstream Q2_0 layout. Use it when the badge says PQ2_0."),
+                    ("Q4_K_M", "The usual balanced choice for a float model that must fit on a normal desktop. Q5_K_M keeps more quality; Q3_K_M saves more space."),
+                    ("F16 / BF16", "Uncompressed formats. They are large, but they are the safest source if you plan to quantize again later."),
+                    ("Structure / Full verification", "Structure checks the header and offsets. Full decodes every tensor again and is slower."),
+                    ("Fit badge", "An estimate at 4096 tokens: weights plus KV cache plus a fixed runtime overhead. It is a warning, not a guarantee."),
+                    ("GPU not detected", "If VRAM is unknown, the fit badge uses system RAM and marks VRAM as not detected. RustBlock never assumes a GPU; install a supported NVIDIA driver or check the GPU manually. The estimate is a warning, not a guarantee."),
+                ] {
+                    ui.label(RichText::new(title).size(11.0).strong().color(STEEL_LIGHT));
+                    ui.add(egui::Label::new(RichText::new(text).size(10.5).color(MUTED)).wrap());
+                    ui.add_space(5.0);
+                }
+                ui.separator();
+                ui.label(RichText::new("Shortcuts").size(11.0).strong().color(STEEL_LIGHT));
+                ui.label(RichText::new("Ctrl+O add files · Ctrl+S start · Ctrl+L log · F1 help").size(10.5).monospace().color(MUTED));
+            });
+        if !open {
+            self.show_help = false;
         }
     }
 
@@ -1402,9 +1846,10 @@ impl RustBlockApp {
                     .rsplit('/')
                     .next()
                     .unwrap_or(download.file.as_str());
+                let kind = if download.projector { " · projector" } else { "" };
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(shorten(name, 62))
+                        RichText::new(format!("{}{kind}", shorten(name, 62)))
                             .size(11.0)
                             .monospace()
                             .color(STEEL_LIGHT),
@@ -1721,7 +2166,7 @@ impl RustBlockApp {
         let all: Vec<HfFile> = self
             .hf_files
             .iter()
-            .filter(|file| file.supported)
+            .filter(|file| file.supported || file.projector)
             .cloned()
             .collect();
         let filter = self.hf_file_filter.trim().to_ascii_lowercase();
@@ -1768,7 +2213,12 @@ impl RustBlockApp {
         }
         let mut download_start: Option<(String, HfFile)> = None;
         for file in &files {
-            hf_file_row(ui, &repo, file, self.hf_busy(), &mut download_start);
+            let cached = self
+                .settings
+                .download_dir
+                .join(hf::file_name(&file.path))
+                .exists();
+            hf_file_row(ui, &repo, file, self.hf_busy(), cached, &mut download_start);
         }
         if let Some((repo, file)) = download_start {
             self.start_download(repo, file);
@@ -1777,17 +2227,15 @@ impl RustBlockApp {
 
     fn hf_destination(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("Save downloads to").size(9.5).color(MUTED));
+        let download_dir = self.settings.download_dir.clone();
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(shorten(
-                    &self.settings.download_dir.display().to_string(),
-                    30,
-                ))
-                .size(9.5)
-                .monospace()
-                .color(STEEL_LIGHT),
+                RichText::new(shorten(&download_dir.display().to_string(), 30))
+                    .size(9.5)
+                    .monospace()
+                    .color(STEEL_LIGHT),
             )
-            .on_hover_text(self.settings.download_dir.display().to_string());
+            .on_hover_text(download_dir.display().to_string());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add(egui::Button::new(RichText::new("Change").size(9.5)).frame(false))
@@ -1798,6 +2246,84 @@ impl RustBlockApp {
                     }
                 }
             });
+        });
+        let quota_bytes = self
+            .settings
+            .cache_quota_gib
+            .saturating_mul(1024 * 1024 * 1024);
+        let stats = cache_stats(&download_dir, quota_bytes);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Cache limit").size(9.5).color(MUTED));
+            ui.add(
+                egui::DragValue::new(&mut self.settings.cache_quota_gib)
+                    .speed(1.0)
+                    .suffix(" GiB"),
+            );
+        });
+        match &stats {
+            Ok(stats) => {
+                ui.label(
+                    RichText::new(format!(
+                        "{} files · {} / {}",
+                        stats.entries.len(),
+                        human_bytes(stats.total_bytes),
+                        human_bytes(stats.quota_bytes)
+                    ))
+                    .size(9.0)
+                    .color(if stats.over_quota() { WARN } else { MUTED }),
+                );
+            }
+            Err(error) => {
+                ui.label(RichText::new(error).size(9.0).color(ERROR));
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new(RichText::new("Open folder").size(9.5)).frame(false))
+                .clicked()
+            {
+                open_folder(&download_dir);
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Clear partial downloads").size(9.5))
+                        .frame(false),
+                )
+                .clicked()
+            {
+                match clear_partial_files(&download_dir) {
+                    Ok(0) => self.log(LogLevel::Info, "No partial downloads to clear.".to_string()),
+                    Ok(count) => self.log(
+                        LogLevel::Ok,
+                        format!("Removed {count} partial download file(s)."),
+                    ),
+                    Err(error) => self.log(LogLevel::Error, error),
+                }
+            }
+            if ui
+                .add_enabled(
+                    !self.hf_busy(),
+                    egui::Button::new(RichText::new("Trim cache").size(9.5)).frame(false),
+                )
+                .clicked()
+            {
+                match trim_cache(&download_dir, quota_bytes) {
+                    Ok(report) if report.removed == 0 => self.log(
+                        LogLevel::Info,
+                        "Cache is already within the quota.".to_string(),
+                    ),
+                    Ok(report) => self.log(
+                        LogLevel::Ok,
+                        format!(
+                            "Removed {} cache file(s), freed {}; {} remain.",
+                            report.removed,
+                            human_bytes(report.freed_bytes),
+                            human_bytes(report.remaining_bytes)
+                        ),
+                    ),
+                    Err(error) => self.log(LogLevel::Error, error),
+                }
+            }
         });
     }
 
@@ -1838,11 +2364,25 @@ impl RustBlockApp {
 
 impl eframe::App for RustBlockApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.centered {
-            if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
-                ctx.send_viewport_cmd(cmd);
-                self.centered = true;
-            }
+        let (open, save, help, log) = ctx.input_mut(|input| {
+            (
+                input.consume_key(egui::Modifiers::CTRL, egui::Key::O),
+                input.consume_key(egui::Modifiers::CTRL, egui::Key::S),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::F1),
+                input.consume_key(egui::Modifiers::CTRL, egui::Key::L),
+            )
+        });
+        if open {
+            self.browse();
+        }
+        if save && !self.is_running() {
+            self.start(WorkKind::Convert);
+        }
+        if help {
+            self.show_help = !self.show_help;
+        }
+        if log {
+            self.show_log = !self.show_log;
         }
         if self.is_running() && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1857,6 +2397,9 @@ impl eframe::App for RustBlockApp {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.top_chrome(ui);
+        if self.show_log {
+            self.log_panel(ui);
+        }
         match self.tab {
             Tab::Convert => self.settings_rail(ui),
             Tab::Discover => self.hf_inspector_rail(ui),
@@ -1872,7 +2415,137 @@ impl eframe::App for RustBlockApp {
                 Tab::Discover => self.discover_page(ui),
             });
         self.drag_overlay(ui.ctx());
+        self.requantize_modal(ui.ctx());
+        self.help_modal(ui.ctx());
+        resize_edges(ui);
+        paint_window_border(ui.ctx());
     }
+}
+
+fn toggle_maximized(ctx: &egui::Context) {
+    let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+}
+
+fn window_button(ui: &mut Ui, glyph: &str, tooltip: &str, danger: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(34.0, 28.0), Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        let fill = if danger {
+            ERROR.gamma_multiply(0.9)
+        } else {
+            PANEL_3
+        };
+        ui.painter().rect_filled(rect, CornerRadius::same(3), fill);
+    }
+    let color = if danger && hovered {
+        Color32::WHITE
+    } else {
+        MUTED
+    };
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        FontId::proportional(if danger { 16.0 } else { 13.0 }),
+        color,
+    );
+    response.on_hover_text(tooltip).clicked()
+}
+
+fn help_dot(ui: &mut Ui, help: &str) {
+    ui.label(RichText::new("?").size(9.0).color(MUTED))
+        .on_hover_text(help);
+}
+
+fn resize_edges(ui: &mut Ui) {
+    use egui::viewport::ResizeDirection;
+
+    let Some(screen) = ui.ctx().input(|input| input.raw.screen_rect) else {
+        return;
+    };
+    let border = 5.0;
+    let left = screen.left();
+    let right = screen.right();
+    let top = screen.top();
+    let bottom = screen.bottom();
+    let edges = [
+        (
+            ResizeDirection::North,
+            egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, top + border)),
+            egui::CursorIcon::ResizeVertical,
+        ),
+        (
+            ResizeDirection::South,
+            egui::Rect::from_min_max(egui::pos2(left, bottom - border), egui::pos2(right, bottom)),
+            egui::CursorIcon::ResizeVertical,
+        ),
+        (
+            ResizeDirection::West,
+            egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(left + border, bottom)),
+            egui::CursorIcon::ResizeHorizontal,
+        ),
+        (
+            ResizeDirection::East,
+            egui::Rect::from_min_max(egui::pos2(right - border, top), egui::pos2(right, bottom)),
+            egui::CursorIcon::ResizeHorizontal,
+        ),
+        (
+            ResizeDirection::NorthWest,
+            egui::Rect::from_min_max(
+                egui::pos2(left, top),
+                egui::pos2(left + border, top + border),
+            ),
+            egui::CursorIcon::ResizeNwSe,
+        ),
+        (
+            ResizeDirection::NorthEast,
+            egui::Rect::from_min_max(
+                egui::pos2(right - border, top),
+                egui::pos2(right, top + border),
+            ),
+            egui::CursorIcon::ResizeNeSw,
+        ),
+        (
+            ResizeDirection::SouthWest,
+            egui::Rect::from_min_max(
+                egui::pos2(left, bottom - border),
+                egui::pos2(left + border, bottom),
+            ),
+            egui::CursorIcon::ResizeNeSw,
+        ),
+        (
+            ResizeDirection::SouthEast,
+            egui::Rect::from_min_max(
+                egui::pos2(right - border, bottom - border),
+                egui::pos2(right, bottom),
+            ),
+            egui::CursorIcon::ResizeNwSe,
+        ),
+    ];
+    for (index, (direction, rect, cursor)) in edges.into_iter().enumerate() {
+        let response = ui.interact(rect, Id::new(("rustblock-resize", index)), Sense::drag());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(cursor);
+        }
+        if response.drag_started() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+        }
+    }
+}
+
+fn paint_window_border(ctx: &egui::Context) {
+    let Some(screen) = ctx.input(|input| input.raw.screen_rect) else {
+        return;
+    };
+    let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("window-frame")));
+    painter.rect_stroke(
+        screen.shrink(0.5),
+        CornerRadius::same(0),
+        Stroke::new(1.0, BORDER),
+        StrokeKind::Inside,
+    );
 }
 
 fn hf_result_row(ui: &mut Ui, model: &HfModel, selected: bool) -> bool {
@@ -1936,8 +2609,8 @@ fn hf_result_row(ui: &mut Ui, model: &HfModel, selected: bool) -> bool {
 
 fn target_grid(ui: &mut Ui, targets: &[Target], selected: &mut Target) {
     let gap = 4.0;
-    let width = ((ui.available_width() - gap * 3.0) / 4.0).max(48.0);
-    for chunk in targets.chunks(4) {
+    let width = ((ui.available_width() - gap * 5.0) / 6.0).max(48.0);
+    for chunk in targets.chunks(6) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for target in chunk {
@@ -1957,6 +2630,58 @@ fn target_grid(ui: &mut Ui, targets: &[Target], selected: &mut Target) {
                 }
             }
         });
+    }
+}
+
+fn fit_badge(fit: &FitEstimate) -> (String, Color32, String) {
+    let mut hint = format!(
+        "Estimated at {} tokens: {} weights + {} KV cache + {} overhead.",
+        fit.context,
+        human_bytes(fit.weights_bytes),
+        human_bytes(fit.kv_cache_bytes),
+        human_bytes(fit.overhead_bytes)
+    );
+    hint.push_str(&format!(
+        "\nRAM: {}.",
+        fit_verdict_text(fit.hardware.ram_bytes, fit.fits_ram)
+    ));
+    hint.push_str(&format!(
+        "\nVRAM: {}.",
+        fit_verdict_text(fit.hardware.vram_bytes, fit.fits_vram)
+    ));
+    let (label, color) = if fit.fits_vram == Some(true) {
+        fit_label("VRAM", fit.hardware.vram_bytes, fit.total_bytes)
+    } else if fit.fits_ram == Some(true) {
+        fit_label("RAM", fit.hardware.ram_bytes, fit.total_bytes)
+    } else if fit.fits_ram == Some(false) && fit.fits_vram == Some(false) {
+        ("No fit".to_string(), ERROR)
+    } else if fit.fits_ram == Some(false) {
+        ("No RAM fit".to_string(), ERROR)
+    } else if fit.fits_vram == Some(false) {
+        ("No VRAM fit".to_string(), ERROR)
+    } else {
+        ("Fit unknown".to_string(), MUTED)
+    };
+    (label, color, hint)
+}
+
+fn fit_label(device: &str, available: Option<u64>, total: u64) -> (String, Color32) {
+    let Some(available) = available else {
+        return (format!("Fits {device}"), OK);
+    };
+    if available > 0 && total.saturating_mul(100) > available.saturating_mul(88) {
+        (format!("Tight {device}"), WARN)
+    } else {
+        (format!("Fits {device}"), OK)
+    }
+}
+
+fn fit_verdict_text(available: Option<u64>, fits: Option<bool>) -> String {
+    match (available, fits) {
+        (Some(bytes), Some(true)) => format!("fits in {}", human_bytes(bytes)),
+        (Some(bytes), Some(false)) => format!("does not fit in {}", human_bytes(bytes)),
+        (Some(bytes), None) => format!("{} detected; verdict unavailable", human_bytes(bytes)),
+        (None, _) => "not detected".to_string(),
     }
 }
 
@@ -1999,6 +2724,20 @@ fn job_card(
                         job.analysis.tensors,
                         job.analysis.type_summary()
                     ));
+                    if let Some(fit) = &job.analysis.fit {
+                        let (label, color, hint) = fit_badge(fit);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(
+                                RichText::new(format!("fit ~ {}", human_bytes(fit.total_bytes)))
+                                    .size(9.5)
+                                    .color(MUTED),
+                            )
+                            .on_hover_text(&hint);
+                            ui.label(RichText::new(label).size(9.0).strong().color(color))
+                                .on_hover_text(&hint);
+                        });
+                    }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
@@ -2116,10 +2855,11 @@ fn hf_file_row(
     repo: &str,
     file: &HfFile,
     busy: bool,
+    cached: bool,
     download_start: &mut Option<(String, HfFile)>,
 ) {
     let row_width = ui.available_width();
-    let action_width = 70.0;
+    let action_width = if file.projector { 92.0 } else { 70.0 };
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(
             Vec2::new((row_width - action_width - 8.0).max(120.0), 0.0),
@@ -2139,7 +2879,11 @@ fn hf_file_row(
                             .monospace()
                             .color(MUTED),
                     );
-                    if looks_quantized_name(&file.path) {
+                    if file.projector {
+                        ui.label(RichText::new("· vision projector").size(9.5).color(INFO));
+                    } else if cached {
+                        ui.label(RichText::new("· cached locally").size(9.5).color(ACCENT));
+                    } else if looks_quantized_name(&file.path) {
                         ui.label(RichText::new("· already quantized").size(9.5).color(WARN));
                     }
                 });
@@ -2149,8 +2893,18 @@ fn hf_file_row(
             if ui
                 .add_enabled(
                     !busy,
-                    egui::Button::new(RichText::new("Download").size(10.0).color(ACCENT))
-                        .frame(false),
+                    egui::Button::new(
+                        RichText::new(if cached {
+                            "Use cached"
+                        } else if file.projector {
+                            "Projector"
+                        } else {
+                            "Download"
+                        })
+                        .size(10.0)
+                        .color(ACCENT),
+                    )
+                    .frame(false),
                 )
                 .clicked()
             {
@@ -2178,6 +2932,9 @@ fn target_caption(target: Target) -> &'static str {
         Target::Q4K => "4-bit K-quant · balanced",
         Target::Q5K => "5-bit K-quant · high quality",
         Target::Q6K => "6-bit K-quant · near F16",
+        Target::Q3KM => "3-bit mixed · tight fit",
+        Target::Q4KM => "4-bit mixed · balanced",
+        Target::Q5KM => "5-bit mixed · high quality",
         Target::Tq1_0 | Target::Tq2_0 => "Ternary · experimental",
         Target::Mxfp4 => "4-bit block float",
         Target::Nvfp4 => "NVIDIA 4-bit float",
@@ -2271,5 +3028,54 @@ fn open_folder(path: &Path) {
     #[cfg(not(any(windows, unix)))]
     {
         let _ = target;
+    }
+}
+
+#[cfg(test)]
+mod fit_badge_tests {
+    use super::*;
+
+    fn estimate(total: u64, ram: Option<u64>, vram: Option<u64>) -> FitEstimate {
+        FitEstimate {
+            path: "test.gguf".to_string(),
+            architecture: "test".to_string(),
+            layers: 1,
+            context: 4096,
+            kv_heads: 1,
+            head_bytes: 0,
+            weights_bytes: total,
+            dense_kv_bytes: 0,
+            sliding_kv_bytes: 0,
+            mla_kv_bytes: 0,
+            ssm_state_bytes: 0,
+            kv_cache_bytes: 0,
+            overhead_bytes: 0,
+            total_bytes: total,
+            hardware: rustblock_core::Hardware {
+                ram_bytes: ram,
+                vram_bytes: vram,
+            },
+            fits_ram: ram.map(|available| rustblock_core::hardware_fits(total, available)),
+            fits_vram: vram.map(|available| rustblock_core::hardware_fits(total, available)),
+            suggested_target: Target::Q4KM,
+        }
+    }
+
+    #[test]
+    fn badge_distinguishes_fit_tight_and_unknown() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            fit_badge(&estimate(8 * gib, Some(32 * gib), Some(12 * gib))).0,
+            "Fits VRAM"
+        );
+        assert_eq!(
+            fit_badge(&estimate(11 * gib, Some(32 * gib), Some(12 * gib))).0,
+            "Tight VRAM"
+        );
+        assert_eq!(
+            fit_badge(&estimate(64 * gib, Some(8 * gib), Some(8 * gib))).0,
+            "No fit"
+        );
+        assert_eq!(fit_badge(&estimate(8 * gib, None, None)).0, "Fit unknown");
     }
 }

@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -5,10 +6,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use rustblock_core::{
-    convert, source_supported, transcode, type_name, ConvertOptions, Gguf, Phase, Progress, Target,
-    VerifyMode,
+    convert, effective_tensor_types, exact_name_pattern, source_supported, transcode_with_imatrix,
+    transcode_with_overrides, type_name, ConvertOptions, Gguf, ImportanceMatrix, Phase, Progress,
+    Target, TensorOverride, VerifyMode,
 };
 use serde_json::json;
+
+mod advanced;
 
 #[derive(Parser)]
 #[command(
@@ -63,10 +67,65 @@ enum Command {
         /// Post-write verification level.
         #[arg(long, value_enum, default_value_t = VerifyArg::Structure)]
         verify: VerifyArg,
+        /// Override the type of tensors matching REGEX, e.g. `attn_v=q5_k`.
+        /// May be repeated; the first matching rule wins.
+        #[arg(long = "tensor-type", value_name = "REGEX=TYPE")]
+        tensor_types: Vec<String>,
+        /// Read `REGEX=TYPE` rules from a file (one or more per line, # comments).
+        #[arg(long = "tensor-type-file", value_name = "FILE")]
+        tensor_type_file: Option<PathBuf>,
+        /// Write the effective per-tensor type map before converting.
+        #[arg(long = "dump-tensor-types", value_name = "FILE")]
+        dump_tensor_types: Option<PathBuf>,
+        /// Allow requantizing an already-quantized source (lossy).
+        #[arg(long)]
+        allow_requantize: bool,
+        /// Apply importance values from a legacy .imatrix or GGUF imatrix.
+        #[arg(long)]
+        imatrix: Option<PathBuf>,
+        /// Top fraction of tensors promoted to a higher-precision type.
+        #[arg(long, default_value_t = 0.2)]
+        imatrix_percentile: f32,
         /// Print machine-readable JSON on stdout.
         #[arg(long)]
         json: bool,
     },
+    /// Generate an importance matrix with an installed llama-imatrix.
+    Imatrix(advanced::ImatrixArgs),
+    /// Compare source and output tensors with RMSE, SNR and cosine metrics.
+    Quality(advanced::QualityArgs),
+    /// Choose the best target for a size/context budget, optionally converting.
+    Budget(advanced::BudgetArgs),
+    /// Run llama-perplexity for KL-divergence recording or comparison.
+    Kld(advanced::KldArgs),
+    /// Estimate weights and KV-cache memory for a context length.
+    Fit(advanced::FitArgs),
+    /// Split a GGUF into numbered shards.
+    Split(advanced::SplitArgs),
+    /// Merge numbered GGUF shards.
+    Merge(advanced::MergeArgs),
+    /// Read or edit GGUF metadata.
+    Meta(advanced::MetaArgs),
+    /// Remove tensors matching a regex.
+    Prune(advanced::PruneArgs),
+    /// Compare two GGUF files without loading tensor payloads.
+    Diff(advanced::DiffArgs),
+    /// SHA-256 and LFS oid verification.
+    Hash(advanced::HashArgs),
+    /// Bridge to Hugging Face's convert_hf_to_gguf.py.
+    FromSafetensors(advanced::SafetensorsArgs),
+    /// Dequantize native FP8/AWQ safetensors to a BF16 safetensors file.
+    DequantSafetensors(advanced::DequantSafetensorsArgs),
+    /// Download a GGUF with resumable parallel ranges and optional SHA-256.
+    Download(advanced::DownloadArgs),
+    /// Download up to 8 files at once from a JSON-lines/TAB task file.
+    DownloadMany(advanced::DownloadManyArgs),
+    /// Inspect the model cache and enforce a quota by removing oldest files.
+    Cache(advanced::CacheArgs),
+    /// Write an Ollama Modelfile or LM Studio import instructions.
+    Install(advanced::InstallArgs),
+    /// Smoke-test a GGUF with an installed llama-cli.
+    QuickTest(advanced::QuickTestArgs),
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -87,7 +146,7 @@ impl From<VerifyArg> for VerifyMode {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
-enum TargetArg {
+pub(crate) enum TargetArg {
     Reblock,
     F32,
     F16,
@@ -105,11 +164,23 @@ enum TargetArg {
     #[value(name = "q2_k")]
     Q2K,
     #[value(name = "q3_k")]
-    Q3K,
+    Q3KM,
+    #[value(name = "q3_k_m")]
+    Q3KMPreset,
     #[value(name = "q4_k")]
-    Q4K,
+    Q4KM,
+    #[value(name = "q4_k_m")]
+    Q4KMPreset,
     #[value(name = "q5_k")]
-    Q5K,
+    Q5KM,
+    #[value(name = "q5_k_m")]
+    Q5KMPreset,
+    #[value(name = "q3_k_s")]
+    Q3KS,
+    #[value(name = "q4_k_s")]
+    Q4KS,
+    #[value(name = "q5_k_s")]
+    Q5KS,
     #[value(name = "q6_k")]
     Q6K,
     #[value(name = "tq1_0")]
@@ -137,9 +208,15 @@ impl From<TargetArg> for Target {
             TargetArg::Q4_0 => Target::Q4_0,
             TargetArg::Q4_1 => Target::Q4_1,
             TargetArg::Q2K => Target::Q2K,
-            TargetArg::Q3K => Target::Q3K,
-            TargetArg::Q4K => Target::Q4K,
-            TargetArg::Q5K => Target::Q5K,
+            TargetArg::Q3KM => Target::Q3KM,
+            TargetArg::Q3KMPreset => Target::Q3KM,
+            TargetArg::Q4KM => Target::Q4KM,
+            TargetArg::Q4KMPreset => Target::Q4KM,
+            TargetArg::Q5KM => Target::Q5KM,
+            TargetArg::Q5KMPreset => Target::Q5KM,
+            TargetArg::Q3KS => Target::Q3K,
+            TargetArg::Q4KS => Target::Q4K,
+            TargetArg::Q5KS => Target::Q5K,
             TargetArg::Q6K => Target::Q6K,
             TargetArg::Tq1_0 => Target::Tq1_0,
             TargetArg::Tq2_0 => Target::Tq2_0,
@@ -162,16 +239,65 @@ fn main() -> Result<()> {
             force,
             dry_run,
             verify,
+            tensor_types,
+            tensor_type_file,
+            dump_tensor_types,
+            allow_requantize,
+            imatrix,
+            imatrix_percentile,
             json,
-        } => convert_cmd(
-            &input,
-            &output,
-            to.into(),
-            force,
-            dry_run,
-            verify.into(),
-            json,
-        ),
+        } => {
+            let mut overrides = Vec::new();
+            for spec in &tensor_types {
+                overrides.push(
+                    TensorOverride::parse(spec)
+                        .with_context(|| format!("invalid --tensor-type '{spec}'"))?,
+                );
+            }
+            if let Some(path) = &tensor_type_file {
+                overrides.extend(
+                    TensorOverride::load_file(path)
+                        .with_context(|| format!("cannot read '{}'", path.display()))?,
+                );
+            }
+            let matrix = imatrix
+                .as_deref()
+                .map(ImportanceMatrix::load)
+                .transpose()
+                .context("cannot load importance matrix")?;
+            convert_cmd(ConvertCli {
+                input: &input,
+                output: &output,
+                target: to.into(),
+                force,
+                dry_run,
+                verify: verify.into(),
+                allow_requantize,
+                overrides: &overrides,
+                dump_tensor_types: dump_tensor_types.as_deref(),
+                imatrix: matrix.as_ref(),
+                imatrix_percentile,
+                as_json: json,
+            })
+        }
+        Command::Imatrix(args) => advanced::imatrix(args),
+        Command::Quality(args) => advanced::quality(args),
+        Command::Budget(args) => advanced::budget(args),
+        Command::Kld(args) => advanced::kld(args),
+        Command::Fit(args) => advanced::fit(args),
+        Command::Split(args) => advanced::split_cmd(args),
+        Command::Merge(args) => advanced::merge_cmd(args),
+        Command::Meta(args) => advanced::meta(args),
+        Command::Prune(args) => advanced::prune_cmd(args),
+        Command::Diff(args) => advanced::diff_cmd(args),
+        Command::Hash(args) => advanced::hash(args),
+        Command::FromSafetensors(args) => advanced::from_safetensors(args),
+        Command::DequantSafetensors(args) => advanced::dequant_safetensors(args),
+        Command::Download(args) => advanced::download_cmd(args),
+        Command::DownloadMany(args) => advanced::download_many_cmd(args),
+        Command::Cache(args) => advanced::cache_cmd(args),
+        Command::Install(args) => advanced::install_cmd(args),
+        Command::QuickTest(args) => advanced::quicktest_cmd(args),
     }
 }
 
@@ -179,6 +305,11 @@ fn inspect(file: &Path, as_json: bool) -> Result<()> {
     let g = Gguf::open(file).with_context(|| format!("cannot read '{}'", file.display()))?;
 
     let pq2 = g.pq2_count();
+    let q2 = g
+        .tensors
+        .iter()
+        .filter(|t| t.ty == rustblock_core::TY_Q2_0)
+        .count();
     let ptq1 = g
         .tensors
         .iter()
@@ -201,8 +332,11 @@ fn inspect(file: &Path, as_json: bool) -> Result<()> {
             "tensors": g.tensors.len(),
             "pq2_0": pq2,
             "ptq1_0": ptq1,
+            "already_q2_0": q2 == g.tensors.len(),
             "file_type": g.file_type,
             "hadamard_metadata": g.has_hadamard_version,
+            "mtp_metadata": g.has_mtp_metadata,
+            "prism_metadata_entries": g.prism_metadata_signature().len(),
             "convertible": reblockable,
             "reblock": reblockable,
             "native_convert": native_convert,
@@ -234,6 +368,14 @@ fn inspect(file: &Path, as_json: bool) -> Result<()> {
         "hadamard:  {}",
         if g.has_hadamard_version {
             "prism.hadamard.* metadata present"
+        } else {
+            "not found"
+        }
+    );
+    println!(
+        "mtp:       {}",
+        if g.has_mtp_metadata {
+            "prism.mtp.* metadata present (preserved, not interpreted)"
         } else {
             "not found"
         }
@@ -357,20 +499,57 @@ fn verify_cmd(file: &Path, quick: bool, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-fn convert_cmd(
-    input: &Path,
-    output: &Path,
+struct ConvertCli<'a> {
+    input: &'a Path,
+    output: &'a Path,
     target: Target,
     force: bool,
     dry_run: bool,
     verify: VerifyMode,
+    allow_requantize: bool,
+    overrides: &'a [TensorOverride],
+    dump_tensor_types: Option<&'a Path>,
+    imatrix: Option<&'a ImportanceMatrix>,
+    imatrix_percentile: f32,
     as_json: bool,
-) -> Result<()> {
+}
+
+fn convert_cmd(args: ConvertCli<'_>) -> Result<()> {
+    let ConvertCli {
+        input,
+        output,
+        target,
+        force,
+        dry_run,
+        verify,
+        allow_requantize,
+        overrides,
+        dump_tensor_types,
+        imatrix,
+        imatrix_percentile,
+        as_json,
+    } = args;
+    if target == Target::Reblock && (!overrides.is_empty() || dump_tensor_types.is_some()) {
+        anyhow::bail!("tensor-type options cannot be used with the lossless reblock target");
+    }
     let opts = ConvertOptions {
         force,
         dry_run,
         verify,
+        allow_requantize,
     };
+
+    if let Some(path) = dump_tensor_types {
+        let g = Gguf::open(input).with_context(|| format!("cannot read '{}'", input.display()))?;
+        let mut text = String::new();
+        for (name, ty) in effective_tensor_types(&g.tensors, target, overrides) {
+            text.push_str(&exact_name_pattern(&name));
+            text.push('=');
+            text.push_str(&type_name(ty).to_ascii_lowercase());
+            text.push('\n');
+        }
+        fs::write(path, text).with_context(|| format!("cannot write '{}'", path.display()))?;
+    }
 
     let pb = ProgressBar::new(0);
     pb.set_style(
@@ -394,8 +573,22 @@ fn convert_cmd(
         ));
     };
 
-    let report = transcode(input, output, target, opts, Some(&mut progress))
-        .with_context(|| format!("conversion of '{}' failed", input.display()))?;
+    let report = if let Some(matrix) = imatrix {
+        transcode_with_imatrix(
+            input,
+            output,
+            target,
+            opts,
+            overrides,
+            matrix,
+            imatrix_percentile,
+            Some(&mut progress),
+        )
+        .with_context(|| format!("conversion of '{}' failed", input.display()))?
+    } else {
+        transcode_with_overrides(input, output, target, opts, overrides, Some(&mut progress))
+            .with_context(|| format!("conversion of '{}' failed", input.display()))?
+    };
     pb.finish_and_clear();
 
     if as_json {

@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rustblock_core::{
-    source_supported, type_name, Gguf, Phase, Report, Target, VerifyMode, TY_PTQ1_0, TY_Q2_0,
+    source_supported, type_name, FitEstimate, FitRequest, Gguf, Hardware, Phase, Report, Target,
+    VerifyMode, TY_PTQ1_0, TY_Q2_0,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,7 @@ pub struct Analysis {
     pub types: Vec<(u32, usize)>,
     pub supported: bool,
     pub kind: FileKind,
+    pub fit: Option<FitEstimate>,
     pub error: Option<String>,
 }
 
@@ -46,6 +48,7 @@ impl Analysis {
             types: Vec::new(),
             supported: false,
             kind: FileKind::Invalid,
+            fit: None,
             error: Some(error),
         }
     }
@@ -65,11 +68,11 @@ impl Analysis {
         if self.pq2 > 0 {
             Target::Reblock
         } else if matches!(self.kind, FileKind::Float) {
-            Target::Q4K
+            Target::Q4KM
         } else if matches!(self.kind, FileKind::Quantized | FileKind::Mixed) {
             Target::F16
         } else {
-            Target::Q4K
+            Target::Q4KM
         }
     }
 
@@ -132,7 +135,7 @@ pub fn looks_quantized_name(name: &str) -> bool {
         })
 }
 
-pub fn analyze(path: &Path) -> Analysis {
+pub fn analyze(path: &Path, hardware: Hardware) -> Analysis {
     let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let g = match Gguf::open(path) {
         Ok(g) => g,
@@ -199,6 +202,15 @@ pub fn analyze(path: &Path) -> Analysis {
         FileKind::Other
     };
 
+    let fit = rustblock_core::estimate_fit(
+        path,
+        FitRequest {
+            hardware: Some(hardware),
+            ..FitRequest::default()
+        },
+    )
+    .ok();
+
     Analysis {
         version: g.version,
         file_len: g.file_len,
@@ -209,6 +221,7 @@ pub fn analyze(path: &Path) -> Analysis {
         types,
         supported,
         kind,
+        fit,
         error: None,
     }
 }
@@ -354,6 +367,7 @@ pub struct Settings {
     pub overwrite: bool,
     pub output_mode: OutputMode,
     pub download_dir: PathBuf,
+    pub cache_quota_gib: u64,
 }
 
 impl Default for Settings {
@@ -364,6 +378,7 @@ impl Default for Settings {
             overwrite: false,
             output_mode: OutputMode::NextToInput,
             download_dir: default_download_dir(),
+            cache_quota_gib: 50,
         }
     }
 }
@@ -489,6 +504,25 @@ pub fn human_duration(d: Duration) -> String {
     }
 }
 
+/// Remove only interrupted-download sidecars from the model folder. Completed
+/// `.gguf` files and unrelated files are left untouched.
+pub fn clear_partial_files(dir: &Path) -> Result<usize, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot read download folder: {error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("part") {
+            continue;
+        }
+        std::fs::remove_file(&path)
+            .map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 pub fn shorten(text: &str, max_chars: usize) -> String {
     if max_chars < 8 {
         return text.to_string();
@@ -507,7 +541,7 @@ pub fn shorten(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::looks_quantized_name;
+    use super::{clear_partial_files, looks_quantized_name};
 
     #[test]
     fn recognizes_quantized_file_names_without_flagging_qwen() {
@@ -517,5 +551,17 @@ mod tests {
         assert!(looks_quantized_name("model-TQ2_0.gguf"));
         assert!(!looks_quantized_name("Qwen3-8B-F16.gguf"));
         assert!(!looks_quantized_name("virgin-model.gguf"));
+    }
+
+    #[test]
+    fn clears_only_partial_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join("model.gguf.part");
+        let complete = dir.path().join("model.gguf");
+        std::fs::write(&partial, b"partial").unwrap();
+        std::fs::write(&complete, b"complete").unwrap();
+        assert_eq!(clear_partial_files(dir.path()).unwrap(), 1);
+        assert!(!partial.exists());
+        assert!(complete.exists());
     }
 }

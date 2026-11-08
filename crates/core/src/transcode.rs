@@ -32,6 +32,8 @@ use std::os::windows::fs::FileExt;
 
 use crate::convert::{convert, ConvertError, ConvertOptions, Phase, Progress, Report, VerifyMode};
 use crate::gguf::{align_up, patch_u32, patch_u64, Gguf, TensorInfo};
+use crate::imatrix::ImportanceMatrix;
+use crate::recipe::{self, RecipeContext, TensorMeta, TensorOverride};
 use crate::types::{type_info, TY_PQ2_0, TY_Q2_0};
 
 /// The conversion menu shown by the GUI and CLI.
@@ -57,14 +59,20 @@ pub enum Target {
     Q4_1,
     /// 2-bit K-quant (smallest common K format).
     Q2K,
-    /// 3-bit K-quant.
+    /// Uniform 3-bit K-quant (llama.cpp Q3_K_S).
     Q3K,
-    /// 4-bit K-quant (uniform, not the mixed Q4_K_M preset).
+    /// Uniform 4-bit K-quant (llama.cpp Q4_K_S).
     Q4K,
-    /// 5-bit K-quant.
+    /// Uniform 5-bit K-quant (llama.cpp Q5_K_S).
     Q5K,
     /// 6-bit K-quant.
     Q6K,
+    /// Mixed 3-bit K-quant preset (llama.cpp Q3_K_M).
+    Q3KM,
+    /// Mixed 4-bit K-quant preset (llama.cpp Q4_K_M).
+    Q4KM,
+    /// Mixed 5-bit K-quant preset (llama.cpp Q5_K_M).
+    Q5KM,
     /// Ternary 1.69-bit format for ternary-friendly models.
     Tq1_0,
     /// Ternary 2.06-bit format for ternary-friendly models.
@@ -78,7 +86,7 @@ pub enum Target {
 }
 
 impl Target {
-    pub const ALL: [Target; 19] = [
+    pub const ALL: [Target; 22] = [
         Target::Reblock,
         Target::F32,
         Target::F16,
@@ -93,6 +101,9 @@ impl Target {
         Target::Q4K,
         Target::Q5K,
         Target::Q6K,
+        Target::Q3KM,
+        Target::Q4KM,
+        Target::Q5KM,
         Target::Tq1_0,
         Target::Tq2_0,
         Target::Mxfp4,
@@ -112,10 +123,13 @@ impl Target {
             Target::Q4_0 => "Q4_0",
             Target::Q4_1 => "Q4_1",
             Target::Q2K => "Q2_K",
-            Target::Q3K => "Q3_K",
-            Target::Q4K => "Q4_K",
-            Target::Q5K => "Q5_K",
+            Target::Q3K => "Q3_K_S",
+            Target::Q4K => "Q4_K_S",
+            Target::Q5K => "Q5_K_S",
             Target::Q6K => "Q6_K",
+            Target::Q3KM => "Q3_K_M",
+            Target::Q4KM => "Q4_K_M",
+            Target::Q5KM => "Q5_K_M",
             Target::Tq1_0 => "TQ1_0",
             Target::Tq2_0 => "TQ2_0",
             Target::Mxfp4 => "MXFP4",
@@ -135,11 +149,14 @@ impl Target {
             Target::Q5_1 => "Quantize to Q5_1 (5-bit + minimum)",
             Target::Q4_0 => "Quantize to Q4_0 (4-bit)",
             Target::Q4_1 => "Quantize to Q4_1 (4-bit + minimum)",
-            Target::Q2K => "Quantize to Q2_K (2-bit K-quant)",
-            Target::Q3K => "Quantize to Q3_K (3-bit K-quant)",
-            Target::Q4K => "Quantize to Q4_K (4-bit K-quant)",
-            Target::Q5K => "Quantize to Q5_K (5-bit K-quant)",
+            Target::Q2K => "Quantize to Q2_K (mixed 2-bit K-quant)",
+            Target::Q3K => "Quantize to Q3_K_S (uniform 3-bit K-quant)",
+            Target::Q4K => "Quantize to Q4_K_S (uniform 4-bit K-quant)",
+            Target::Q5K => "Quantize to Q5_K_S (uniform 5-bit K-quant)",
             Target::Q6K => "Quantize to Q6_K (6-bit K-quant)",
+            Target::Q3KM => "Quantize to Q3_K_M (mixed 3-bit K-quant)",
+            Target::Q4KM => "Quantize to Q4_K_M (mixed 4-bit K-quant)",
+            Target::Q5KM => "Quantize to Q5_K_M (mixed 5-bit K-quant)",
             Target::Tq1_0 => "Quantize to TQ1_0 (ternary 1.69-bit)",
             Target::Tq2_0 => "Quantize to TQ2_0 (ternary 2.06-bit)",
             Target::Mxfp4 => "Quantize to MXFP4 (4-bit block float)",
@@ -178,19 +195,28 @@ impl Target {
                 "4-bit blocks with a stored minimum as well as a scale. Slightly better than Q4_0 at a slightly larger size; Q4_K is usually the better modern choice."
             }
             Target::Q2K => {
-                "2-bit K-quant base. Very small, with noticeable quality loss. Output, embeddings and value tensors are kept at Q4_K; best for large models that otherwise would not fit in memory."
+                "Mixed 2-bit K-quant preset. Very small, with noticeable quality loss. Attention values use Q4_K when GQA is at least 4, ffn_down and attention output use Q3_K, and output/tied embeddings use Q6_K. Best for large models that otherwise would not fit in memory."
             }
             Target::Q3K => {
-                "3-bit K-quant base. A compromise for very tight memory; output, embeddings and value tensors are kept at Q5_K. Prefer Q4_K when it fits."
+                "Uniform Q3_K_S. Every quantizable weight uses Q3_K, except the adaptive protection of output, embeddings and value tensors. Prefer a mixed preset for normal use."
             }
             Target::Q4K => {
-                "4-bit K-quant with 256-value super-blocks. The usual quality/size sweet spot. The base is Q4_K; output, embeddings and value tensors stay at Q6_K. Not the full Q4_K_M preset."
+                "Uniform Q4_K_S. Every quantizable weight uses Q4_K, except the adaptive protection of output, embeddings and value tensors. The mixed Q4_K_M preset is usually the better choice."
             }
             Target::Q5K => {
-                "5-bit K-quant. Better quality than Q4_K at a larger size; output, embeddings and value tensors stay at Q6_K. Good for small models or high-quality local inference."
+                "Uniform Q5_K_S. Every quantizable weight uses Q5_K, except the adaptive protection of output, embeddings and value tensors. The mixed Q5_K_M preset is usually the better choice."
             }
             Target::Q6K => {
                 "6-bit K-quant. Near-F16 quality at a smaller size; usually the highest-quality practical quant."
+            }
+            Target::Q3KM => {
+                "Mixed Q3_K_M preset matching llama.cpp: the first two attention-value tensors use Q5_K, other attention values and most ffn_down tensors use Q4_K, early ffn_down tensors use Q5_K, attention output uses Q4_K, and output/tied embeddings use Q6_K."
+            }
+            Target::Q4KM => {
+                "Mixed Q4_K_M preset matching llama.cpp: Q4_K base with Q6_K on the first/last eighth and every third tensor of attention values and ffn_down, plus Q6_K output/tied embeddings. The usual quality/size sweet spot."
+            }
+            Target::Q5KM => {
+                "Mixed Q5_K_M preset matching llama.cpp: Q5_K base with Q6_K on the first/last eighth and every third tensor of attention values and ffn_down, plus Q6_K output/tied embeddings."
             }
             Target::Tq1_0 => {
                 "Ternary 1.69-bit format for models trained to tolerate ternary weights. Tiny, but only useful with a compatible runtime and a model that survives it. Experimental."
@@ -226,6 +252,9 @@ impl Target {
             Target::Q4K => Some(12),
             Target::Q5K => Some(13),
             Target::Q6K => Some(14),
+            Target::Q3KM => Some(11),
+            Target::Q4KM => Some(12),
+            Target::Q5KM => Some(13),
             Target::Tq1_0 => Some(34),
             Target::Tq2_0 => Some(35),
             Target::Mxfp4 => Some(39),
@@ -247,11 +276,23 @@ impl Target {
                 | Target::Q4K
                 | Target::Q5K
                 | Target::Q6K
+                | Target::Q3KM
+                | Target::Q4KM
+                | Target::Q5KM
                 | Target::Tq1_0
                 | Target::Tq2_0
                 | Target::Mxfp4
                 | Target::Nvfp4
                 | Target::Q1_0
+        )
+    }
+
+    /// True for a preset that mixes several tensor types. Uniform targets use
+    /// the legacy adaptive protection instead.
+    pub fn is_mixed(self) -> bool {
+        matches!(
+            self,
+            Target::Q2K | Target::Q3KM | Target::Q4KM | Target::Q5KM
         )
     }
 
@@ -268,7 +309,6 @@ impl Target {
     /// architecture from metadata.
     pub fn protected_target(self) -> Option<Target> {
         match self {
-            Target::Q2K => Some(Target::Q4K),
             Target::Q3K => Some(Target::Q5K),
             Target::Q4K | Target::Q5K => Some(Target::Q6K),
             _ => None,
@@ -291,19 +331,15 @@ impl Target {
             Target::Q4K => Some(14),
             Target::Q5K => Some(16),
             Target::Q6K => Some(18),
+            Target::Q3KM => Some(12),
+            Target::Q4KM => Some(15),
+            Target::Q5KM => Some(17),
             Target::Tq1_0 => Some(36),
             Target::Tq2_0 => Some(37),
             Target::Mxfp4 => Some(38),
             Target::Nvfp4 => Some(39),
             Target::Q1_0 => Some(40),
         }
-    }
-
-    fn block(self) -> u64 {
-        self.type_id()
-            .and_then(type_info)
-            .map(|info| info.block)
-            .unwrap_or(1)
     }
 }
 
@@ -330,8 +366,25 @@ pub fn transcode(
     output: &Path,
     target: Target,
     opts: ConvertOptions,
+    on_progress: Option<&mut dyn FnMut(&Progress)>,
+) -> Result<Report, ConvertError> {
+    transcode_with_overrides(input, output, target, opts, &[], on_progress)
+}
+
+/// Like [`transcode`], with explicit per-tensor recipe overrides.
+pub fn transcode_with_overrides(
+    input: &Path,
+    output: &Path,
+    target: Target,
+    opts: ConvertOptions,
+    overrides: &[TensorOverride],
     mut on_progress: Option<&mut dyn FnMut(&Progress)>,
 ) -> Result<Report, ConvertError> {
+    if target == Target::Reblock && !overrides.is_empty() {
+        return Err(ConvertError::Codec(
+            "tensor-type overrides cannot be used with the lossless reblock target".into(),
+        ));
+    }
     if target == Target::Reblock {
         return convert(input, output, opts, on_progress);
     }
@@ -353,7 +406,15 @@ pub fn transcode(
         });
     }
 
-    let plans = plan_layout(&g, target)?;
+    let (context, metas) = recipe::analyze_tensors(&g.tensors);
+    let plans = plan_layout(
+        &g,
+        target,
+        &context,
+        &metas,
+        overrides,
+        opts.allow_requantize,
+    )?;
     let new_data_size = plans
         .iter()
         .map(|p| p.new_offset + p.new_size)
@@ -509,6 +570,30 @@ pub fn transcode(
         dry_run: false,
         verified: opts.verify,
     })
+}
+
+/// Quantize with an importance matrix. Importance selects the highest-value
+/// tensors for a higher-precision concrete type before the normal recipe is
+/// evaluated; explicit user overrides still come first.
+#[allow(clippy::too_many_arguments)]
+pub fn transcode_with_imatrix(
+    input: &Path,
+    output: &Path,
+    target: Target,
+    opts: ConvertOptions,
+    overrides: &[TensorOverride],
+    imatrix: &ImportanceMatrix,
+    percentile: f32,
+    on_progress: Option<&mut dyn FnMut(&Progress)>,
+) -> Result<Report, ConvertError> {
+    let g = Gguf::open(input)?;
+    let mut combined = overrides.to_vec();
+    combined.extend(
+        imatrix
+            .type_overrides(&g.tensors, target, percentile)
+            .map_err(|error| ConvertError::Codec(error.to_string()))?,
+    );
+    transcode_with_overrides(input, output, target, opts, &combined, on_progress)
 }
 
 /// Number of workers for one conversion. The explicit environment override is
@@ -745,24 +830,14 @@ fn write_all_at(file: &File, offset: u64, mut buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn is_sensitive_tensor(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    if !name.ends_with(".weight") {
-        return false;
-    }
-    name.contains("output")
-        || name.contains("lm_head")
-        || name.contains("token_embd")
-        || name.contains("tok_embeddings")
-        || name.contains("embed_tokens")
-        || name.contains("embedding")
-        || name.contains("word_embeddings")
-        || name.contains("wte.weight")
-        || name.contains("attn_v")
-        || name.contains("v_proj")
-}
-
-fn plan_layout(g: &Gguf, target: Target) -> Result<Vec<Plan>, ConvertError> {
+fn plan_layout(
+    g: &Gguf,
+    target: Target,
+    context: &RecipeContext,
+    metas: &[TensorMeta],
+    overrides: &[TensorOverride],
+    allow_requantize: bool,
+) -> Result<Vec<Plan>, ConvertError> {
     let mut order: Vec<usize> = (0..g.tensors.len()).collect();
     order.sort_by_key(|&i| g.tensors[i].offset);
 
@@ -771,24 +846,20 @@ fn plan_layout(g: &Gguf, target: Target) -> Result<Vec<Plan>, ConvertError> {
     for index in order {
         let t = &g.tensors[index];
         let elems = t.element_count();
-        let out_ty = if target.is_quantized() {
-            let block = target.block();
-            if t.dims.len() >= 2 && t.dims[0].is_multiple_of(block) && elems.is_multiple_of(block) {
-                let base = target.type_id().expect("quantized target has a type id");
-                if is_sensitive_tensor(&t.name) {
-                    target
-                        .protected_target()
-                        .and_then(Target::type_id)
-                        .unwrap_or(base)
-                } else {
-                    base
-                }
-            } else {
-                0 // 1-D tensors and unaligned rows stay F32
-            }
-        } else {
-            target.type_id().expect("float target has a type id")
-        };
+        let requested = recipe::select_type(target, t, &metas[index], context, overrides);
+        let out_ty = requested.and_then(Target::type_id).unwrap_or(t.ty);
+
+        if !allow_requantize
+            && is_quantized_type(t.ty)
+            && is_quantized_type(out_ty)
+            && t.ty != out_ty
+        {
+            return Err(ConvertError::Requantize {
+                name: t.name.clone(),
+                from: crate::types::type_name(t.ty),
+                to: crate::types::type_name(out_ty),
+            });
+        }
 
         let info = type_info(out_ty).ok_or_else(|| ConvertError::UnsupportedTensor {
             name: t.name.clone(),
@@ -816,6 +887,10 @@ fn plan_layout(g: &Gguf, target: Target) -> Result<Vec<Plan>, ConvertError> {
         });
     }
     Ok(plans)
+}
+
+fn is_quantized_type(ty: u32) -> bool {
+    type_info(ty).is_some() && !matches!(ty, 0 | 1 | 24..=28 | 30)
 }
 
 fn build_header(g: &Gguf, target: Target, plans: &[Plan]) -> Result<(Vec<u8>, u64), ConvertError> {
@@ -1171,9 +1246,9 @@ fn verify_structure(
             target.file_type()
         )));
     }
-    if output.has_hadamard_version != input.has_hadamard_version {
+    if output.prism_metadata_signature() != input.prism_metadata_signature() {
         return Err(ConvertError::Verify(
-            "prism.hadamard.version metadata was not preserved".into(),
+            "prism.* metadata (Hadamard/MTP) was not preserved byte-for-byte".into(),
         ));
     }
     Ok(())

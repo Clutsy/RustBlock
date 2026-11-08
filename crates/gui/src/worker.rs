@@ -28,6 +28,7 @@ pub struct WorkItem {
     pub target: Target,
     pub verify: VerifyMode,
     pub force: bool,
+    pub allow_requantize: bool,
 }
 
 #[derive(Debug)]
@@ -98,6 +99,7 @@ fn run_batch(items: Vec<WorkItem>, tx: Sender<Event>, cancel: Arc<AtomicBool>) {
                         force: item.force,
                         dry_run: false,
                         verify: item.verify,
+                        allow_requantize: item.allow_requantize,
                     },
                     Some(&mut progress),
                 ) {

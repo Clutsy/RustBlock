@@ -4,7 +4,10 @@ use std::path::Path;
 
 use half::f16;
 use rustblock_core::gguf::Gguf;
-use rustblock_core::{transcode, ConvertOptions, Target, VerifyMode, TY_PQ2_0, TY_Q2_0};
+use rustblock_core::{
+    effective_tensor_types, transcode, ConvertError, ConvertOptions, Target, TensorOverride,
+    VerifyMode, TY_PQ2_0, TY_Q2_0,
+};
 
 fn push_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
@@ -65,6 +68,50 @@ fn build_gguf(
     file.write_all(&header).unwrap();
     file.write_all(data).unwrap();
     file.flush().unwrap();
+}
+
+struct TensorSpec<'a> {
+    name: &'a str,
+    dims: &'a [u64],
+    ty: u32,
+    data: &'a [u8],
+}
+
+fn build_multi_gguf(path: &Path, tensors: &[TensorSpec<'_>], alignment: u32, file_type: u32) {
+    let align = alignment as u64;
+    let mut offsets = Vec::with_capacity(tensors.len());
+    let mut cursor = 0u64;
+    for tensor in tensors {
+        cursor = cursor.div_ceil(align) * align;
+        offsets.push(cursor);
+        cursor += tensor.data.len() as u64;
+    }
+
+    let mut header = Vec::new();
+    header.extend_from_slice(b"GGUF");
+    push_u32(&mut header, 3);
+    push_u64(&mut header, tensors.len() as u64);
+    push_u64(&mut header, 3);
+    kv_str(&mut header, "general.architecture", "test");
+    kv_u32(&mut header, "general.alignment", alignment);
+    kv_u32(&mut header, "general.file_type", file_type);
+    for (tensor, offset) in tensors.iter().zip(offsets.iter()) {
+        push_str(&mut header, tensor.name);
+        push_u32(&mut header, tensor.dims.len() as u32);
+        for dim in tensor.dims {
+            push_u64(&mut header, *dim);
+        }
+        push_u32(&mut header, tensor.ty);
+        push_u64(&mut header, *offset);
+    }
+    let data_start = (header.len() as u64).div_ceil(align) * align;
+    header.resize(data_start as usize, 0);
+    header.resize(data_start as usize + cursor as usize, 0);
+    for (tensor, offset) in tensors.iter().zip(offsets.iter()) {
+        let start = data_start as usize + *offset as usize;
+        header[start..start + tensor.data.len()].copy_from_slice(tensor.data);
+    }
+    fs::write(path, header).unwrap();
 }
 
 fn float_values(n: usize) -> Vec<f32> {
@@ -250,7 +297,7 @@ fn k_quant_targets_keep_their_protected_layout() {
         1,
     );
     for (target, expected) in [
-        (Target::Q2K, 12),
+        (Target::Q2K, 14),
         (Target::Q3K, 13),
         (Target::Q4K, 14),
         (Target::Q5K, 14),
@@ -499,8 +546,8 @@ fn unaligned_rows_fall_back_to_float_instead_of_failing() {
     .unwrap();
 
     let g = Gguf::open(&output).unwrap();
-    assert_eq!(g.tensors[0].ty, 0);
-    assert_eq!(g.tensors[0].size, Some(204));
+    assert_eq!(g.tensors[0].ty, 1);
+    assert_eq!(g.tensors[0].size, Some(102));
     assert_eq!(g.file_type, Some(36));
 }
 
@@ -527,4 +574,140 @@ fn large_tensor_parallel_chunks_verify() {
     let g = Gguf::open(&output).unwrap();
     assert_eq!(g.tensors[0].ty, 13);
     assert_eq!(g.tensors[0].element_count(), 4096 * 512);
+}
+
+#[test]
+fn mixed_preset_end_to_end_writes_the_recipe_map_and_file_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("mixed-in.gguf");
+    let output = dir.path().join("mixed-out.gguf");
+    let attn_v = f16_bytes(&float_values(256));
+    let ffn_down = f16_bytes(&float_values(256));
+    let output_weight = f16_bytes(&float_values(256));
+    let norm = f32_bytes(&float_values(256));
+    let tensors = [
+        TensorSpec {
+            name: "blk.0.attn_v.weight",
+            dims: &[256, 1],
+            ty: 1,
+            data: &attn_v,
+        },
+        TensorSpec {
+            name: "blk.0.ffn_down.weight",
+            dims: &[256, 1],
+            ty: 1,
+            data: &ffn_down,
+        },
+        TensorSpec {
+            name: "blk.0.attn_norm.weight",
+            dims: &[256],
+            ty: 0,
+            data: &norm,
+        },
+        TensorSpec {
+            name: "output.weight",
+            dims: &[256, 1],
+            ty: 1,
+            data: &output_weight,
+        },
+    ];
+    build_multi_gguf(&input, &tensors, 32, 1);
+
+    let g = Gguf::open(&input).unwrap();
+    let map = effective_tensor_types(&g.tensors, Target::Q4KM, &[]);
+    assert_eq!(map[0].1, 12, "single attention value should stay Q4_K");
+    assert_eq!(map[1].1, 12, "single ffn_down should stay Q4_K");
+    assert_eq!(map[2].1, 0, "norm keeps its source type");
+    assert_eq!(map[3].1, 14, "output uses Q6_K");
+
+    transcode(
+        &input,
+        &output,
+        Target::Q4KM,
+        ConvertOptions {
+            verify: VerifyMode::Full,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+
+    let out = Gguf::open(&output).unwrap();
+    let ty = |name: &str| {
+        out.tensors
+            .iter()
+            .find(|tensor| tensor.name == name)
+            .unwrap()
+            .ty
+    };
+    assert_eq!(ty("blk.0.attn_v.weight"), 12);
+    assert_eq!(ty("blk.0.ffn_down.weight"), 12);
+    assert_eq!(ty("blk.0.attn_norm.weight"), 0);
+    assert_eq!(ty("output.weight"), 14);
+    assert_eq!(out.file_type, Some(15));
+    assert!(out
+        .kv
+        .iter()
+        .any(|kv| kv.key == "general.quantization_version"));
+}
+
+#[test]
+fn explicit_override_wins_over_the_mixed_recipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("override-in.gguf");
+    let output = dir.path().join("override-out.gguf");
+    let values = f16_bytes(&float_values(512));
+    build_gguf(&input, "blk.0.attn_v.weight", &[256, 2], 1, &values, 32, 1);
+    let rule = TensorOverride::parse(r"^blk\.0\.attn_v\.weight$=q4_k").unwrap();
+
+    rustblock_core::transcode_with_overrides(
+        &input,
+        &output,
+        Target::Q4KM,
+        ConvertOptions {
+            verify: VerifyMode::Full,
+            ..Default::default()
+        },
+        &[rule],
+        None,
+    )
+    .unwrap();
+
+    let out = Gguf::open(&output).unwrap();
+    assert_eq!(out.tensors[0].ty, 12);
+}
+
+#[test]
+fn requantization_requires_an_explicit_opt_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("float.gguf");
+    let first = dir.path().join("q4.gguf");
+    let second = dir.path().join("q5.gguf");
+    let values = f16_bytes(&float_values(512));
+    build_gguf(&input, "w", &[256, 2], 1, &values, 32, 1);
+    transcode(&input, &first, Target::Q4K, ConvertOptions::default(), None).unwrap();
+
+    let error = transcode(
+        &first,
+        &second,
+        Target::Q5K,
+        ConvertOptions::default(),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(error, ConvertError::Requantize { .. }));
+    assert!(!second.exists());
+
+    transcode(
+        &first,
+        &second,
+        Target::Q5K,
+        ConvertOptions {
+            allow_requantize: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(Gguf::open(&second).unwrap().tensors[0].ty, 13);
 }

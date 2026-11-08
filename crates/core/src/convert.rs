@@ -44,6 +44,15 @@ pub enum ConvertError {
     Ptq1,
     #[error("tensor '{name}' has unsupported type {ty}")]
     UnsupportedTensor { name: String, ty: u32 },
+    #[error(
+        "tensor '{name}' is already quantized as {from} and would be requantized to {to}; \
+         requantization loses quality and needs explicit confirmation (--allow-requantize)"
+    )]
+    Requantize {
+        name: String,
+        from: &'static str,
+        to: &'static str,
+    },
     #[error("input and output refer to the same file")]
     SameFile,
     #[error("output file already exists (use --force to overwrite): {0}")]
@@ -71,6 +80,9 @@ pub struct ConvertOptions {
     pub force: bool,
     pub dry_run: bool,
     pub verify: VerifyMode,
+    /// Requantizing an already-quantized source is refused by default. The UI
+    /// asks for explicit confirmation; the CLI exposes `--allow-requantize`.
+    pub allow_requantize: bool,
 }
 
 impl Default for ConvertOptions {
@@ -79,6 +91,7 @@ impl Default for ConvertOptions {
             force: false,
             dry_run: false,
             verify: VerifyMode::Structure,
+            allow_requantize: false,
         }
     }
 }
@@ -555,9 +568,9 @@ fn verify_structure(input: &Gguf, output: &Gguf, plans: &[Plan]) -> Result<(), C
             output.file_type, LLAMA_FTYPE_MOSTLY_Q2_0
         )));
     }
-    if output.has_hadamard_version != input.has_hadamard_version {
+    if output.prism_metadata_signature() != input.prism_metadata_signature() {
         return Err(ConvertError::Verify(
-            "prism.hadamard.version metadata was not preserved".into(),
+            "prism.* metadata (Hadamard/MTP) was not preserved byte-for-byte".into(),
         ));
     }
 

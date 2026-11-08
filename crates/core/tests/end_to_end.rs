@@ -48,7 +48,7 @@ fn build_gguf(path: &Path, tensors: &[TestTensor], alignment: u32, file_type: Op
     push_u32(&mut header, 3);
     push_u64(&mut header, tensors.len() as u64);
 
-    let kv_count = 2 + file_type.is_some() as u64 + 1; // architecture, alignment, optional file_type, hadamard
+    let kv_count = 2 + file_type.is_some() as u64 + 2; // architecture, alignment, optional file_type, hadamard, mtp
     push_u64(&mut header, kv_count);
 
     kv_str(&mut header, "general.architecture", "test");
@@ -57,6 +57,7 @@ fn build_gguf(path: &Path, tensors: &[TestTensor], alignment: u32, file_type: Op
         kv_u32(&mut header, "general.file_type", ft);
     }
     kv_u32(&mut header, "prism.hadamard.version", 1);
+    kv_u32(&mut header, "prism.mtp.version", 1);
 
     let align = alignment as u64;
     let mut offsets = Vec::new();
@@ -165,6 +166,8 @@ fn end_to_end_is_lossless_and_preserves_metadata() {
     assert_eq!(g.alignment, 32);
     assert_eq!(g.file_type, Some(41));
     assert!(g.has_hadamard_version);
+    assert!(g.has_mtp_metadata);
+    assert_eq!(g.prism_metadata_signature().len(), 2);
     assert_eq!(g.tensors[0].ty, TY_Q2_0);
     assert_eq!(g.tensors[0].dims, vec![256]);
     assert_eq!(g.tensors[0].size, Some(4 * Q2_BLOCK as u64));

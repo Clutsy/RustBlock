@@ -12,6 +12,11 @@ half.workspace = true
 tempfile.workspace = true
 pmetal-gguf = "0.5"
 rayon.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ureq.workspace = true
+minijinja = "2"
 
 [dev-dependencies]
 proptest = "1"

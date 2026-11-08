@@ -6,14 +6,13 @@
 //! Setting `HF_TOKEN` enables gated/private repositories.
 //! Downloads are resumable through `.part` files and byte ranges.
 
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use serde_json::Value;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Mutex;
 use std::time::Instant;
-
-use serde_json::Value;
 
 const BASE: &str = "https://huggingface.co";
 const UA: &str = "RustBlock/0.1 (GGUF conversion desktop app)";
@@ -181,6 +180,9 @@ mod tests {
         assert!(file_support("model.safetensors").is_err());
         assert!(file_support("imatrix_unsloth.gguf").is_err());
         assert!(file_support("mmproj-model-f16.gguf").is_err());
+        assert!(is_projector("mmproj-model-f16.gguf"));
+        assert!(is_projector("nested/projector-vision.gguf"));
+        assert!(!is_projector("model-Q4_K_M.gguf"));
         assert!(file_support("model-lora.gguf").is_err());
         assert!(file_support("model-PTQ1_0.gguf").is_err());
         assert!(file_support("model-00001-of-00003.gguf").is_err());
@@ -191,18 +193,36 @@ mod tests {
     fn download_rejects_unsupported_files_before_touching_network() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let error = download(
+        let error = download_parallel(
             "owner/repo",
             "main",
             "imatrix_unsloth.gguf",
             Path::new("target"),
-            false,
+            None,
             &cancel,
             &tx,
         )
         .unwrap_err();
         assert!(error.contains("importance matrix"));
         assert!(!Path::new("target/imatrix_unsloth.gguf").exists());
+    }
+
+    #[test]
+    fn projector_download_rejects_a_model_before_touching_network() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let error = download_projector(
+            "owner/repo",
+            "main",
+            "model-Q4_K_M.gguf",
+            Path::new("target"),
+            None,
+            &cancel,
+            &tx,
+        )
+        .unwrap_err();
+        assert!(error.contains("not a vision projector"));
+        assert!(!Path::new("target/model-Q4_K_M.gguf").exists());
     }
 
     #[test]
@@ -236,9 +256,24 @@ impl HfModel {
 pub struct HfFile {
     pub path: String,
     pub size: u64,
+    /// SHA-256 published by the Hub for LFS files. Used as the expected
+    /// digest when the download finishes.
+    pub sha256: Option<String>,
     /// False for GGUF containers that are not standalone models (importance
     /// matrices, projectors, adapters, split shards, rejected Prism builds).
     pub supported: bool,
+    /// A vision projector can be downloaded explicitly next to its model, but
+    /// it must never enter the conversion queue as a standalone model.
+    pub projector: bool,
+}
+
+pub fn is_projector(path: &str) -> bool {
+    let name = path.to_ascii_lowercase();
+    name.contains("mmproj") || name.contains("projector")
+}
+
+pub fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// Reject files that have a .gguf suffix but are not a supported standalone
@@ -252,7 +287,7 @@ pub fn file_support(path: &str) -> Result<(), &'static str> {
     if name.contains("imatrix") || name.contains("importance") {
         return Err("importance matrix, not a model");
     }
-    if name.contains("mmproj") || name.contains("projector") {
+    if is_projector(name) {
         return Err("vision projector, not a standalone model");
     }
     if name.contains("lora") || name.contains("adapter") {
@@ -307,6 +342,7 @@ pub enum HfEvent {
         repo: String,
         file: String,
         path: PathBuf,
+        projector: bool,
     },
     DownloadFailed {
         repo: String,
@@ -411,188 +447,30 @@ pub fn list_files(repo: &str, revision: &str) -> Result<Vec<HfFile>, String> {
                     .and_then(Value::as_u64)
             })
             .unwrap_or(0);
-        let support = file_support(path);
+        let sha256 = item
+            .get("lfs")
+            .and_then(|lfs| lfs.get("oid"))
+            .and_then(Value::as_str)
+            .filter(|oid| oid.len() == 64 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .map(str::to_string);
+        let projector = is_projector(path);
+        let support = if projector {
+            Err("vision projector")
+        } else {
+            file_support(path)
+        };
         out.push(HfFile {
             path: path.to_string(),
             size,
+            sha256,
             supported: support.is_ok(),
+            projector,
         });
     }
     // Keep usable models first; unsupported artifacts remain visible with a
     // warning so the user understands why a file is not downloadable.
     out.sort_by_key(|f| (!f.supported, f.size));
     Ok(out)
-}
-
-/// Downloads one file. Returns the final path.
-pub fn download(
-    repo: &str,
-    revision: &str,
-    file: &str,
-    dest_dir: &Path,
-    overwrite: bool,
-    cancel: &AtomicBool,
-    tx: &Sender<HfEvent>,
-) -> Result<PathBuf, String> {
-    file_support(file).map_err(|reason| format!("Cannot download {file}: {reason}."))?;
-    fs::create_dir_all(dest_dir).map_err(|e| format!("cannot create download folder: {e}"))?;
-    let name = file
-        .rsplit('/')
-        .next()
-        .filter(|n| !n.is_empty())
-        .unwrap_or("model.gguf");
-    let final_path = dest_dir.join(name);
-    if final_path.exists() && !overwrite {
-        validate_download(&final_path)?;
-        let _ = tx.send(HfEvent::Downloaded {
-            repo: repo.to_string(),
-            file: file.to_string(),
-            path: final_path.clone(),
-        });
-        return Ok(final_path);
-    }
-
-    let partial = dest_dir.join(format!("{name}.part"));
-    let mut start = partial.metadata().map(|m| m.len()).unwrap_or(0);
-    if start > 0 && final_path.exists() && !overwrite {
-        start = 0;
-    }
-    let url = format!(
-        "{BASE}/{}/resolve/{}/{}\n",
-        // Placeholder replaced below; keeping the URL construction in one place
-        // makes the encoded path handling explicit.
-        encode_path(repo),
-        encode_path(if revision.is_empty() {
-            "main"
-        } else {
-            revision
-        }),
-        encode_path(file)
-    );
-    let url = url.trim_end().to_string();
-
-    let mut attempt = 0;
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            let _ = tx.send(HfEvent::DownloadCancelled);
-            return Err("download cancelled".to_string());
-        }
-        let mut request = ureq::get(&url).set("User-Agent", UA);
-        if let Ok(token) = std::env::var("HF_TOKEN") {
-            if !token.trim().is_empty() {
-                request = request.set("Authorization", &format!("Bearer {}", token.trim()));
-            }
-        }
-        if start > 0 {
-            request = request.set("Range", &format!("bytes={start}-"));
-        }
-        let response = match request.call() {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, resp)) => {
-                if code == 416 && start > 0 {
-                    let _ = fs::remove_file(&partial);
-                    start = 0;
-                    attempt += 1;
-                    if attempt < 2 {
-                        continue;
-                    }
-                }
-                let body = resp.into_string().unwrap_or_default();
-                let hint = if code == 401 || code == 403 {
-                    " This repository is gated or private: set HF_TOKEN to a token with read access."
-                } else {
-                    ""
-                };
-                return Err(format!(
-                    "Hugging Face returned HTTP {code}.{hint} {}",
-                    body.chars().take(180).collect::<String>()
-                ));
-            }
-            Err(e) => return Err(format!("network error: {e}")),
-        };
-
-        let status = response.status();
-        let content_len = response
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-        if status == 200 && start > 0 {
-            // The server ignored Range: restart from zero.
-            start = 0;
-        }
-        let total = if status == 206 {
-            start.saturating_add(content_len)
-        } else {
-            content_len
-        };
-        let _ = tx.send(HfEvent::DownloadStarted {
-            repo: repo.to_string(),
-            file: file.to_string(),
-            total,
-        });
-
-        let mut reader = response.into_reader();
-        let mut out_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(start > 0)
-            .truncate(start == 0)
-            .open(&partial)
-            .map_err(|e| format!("cannot open partial download: {e}"))?;
-        let mut done = start;
-        let mut last_report = Instant::now();
-        let mut last_done = done;
-        let mut buf = vec![0u8; 128 * 1024];
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = tx.send(HfEvent::DownloadCancelled);
-                return Err("download cancelled".to_string());
-            }
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    out_file
-                        .write_all(&buf[..n])
-                        .map_err(|e| format!("cannot write download: {e}"))?;
-                    done += n as u64;
-                    let now = Instant::now();
-                    let dt = now.duration_since(last_report).as_secs_f64();
-                    if dt >= 0.12 {
-                        let speed = (done - last_done) as f64 / dt;
-                        let _ = tx.send(HfEvent::DownloadProgress {
-                            done,
-                            total: total.max(done),
-                            speed,
-                        });
-                        last_report = now;
-                        last_done = done;
-                    }
-                }
-                Err(e) => return Err(format!("download interrupted: {e}")),
-            }
-        }
-        out_file.flush().map_err(|e| e.to_string())?;
-        drop(out_file);
-        if total > 0 && done < total {
-            return Err(format!(
-                "download ended early ({done} of {total} bytes); click Download to resume"
-            ));
-        }
-        if final_path.exists() {
-            fs::remove_file(&final_path).map_err(|e| e.to_string())?;
-        }
-        fs::rename(&partial, &final_path).map_err(|e| e.to_string())?;
-        if let Err(error) = validate_download(&final_path) {
-            let _ = fs::remove_file(&final_path);
-            return Err(error);
-        }
-        let _ = tx.send(HfEvent::Downloaded {
-            repo: repo.to_string(),
-            file: file.to_string(),
-            path: final_path.clone(),
-        });
-        return Ok(final_path);
-    }
 }
 
 /// Re-open the completed file before announcing it. A `.gguf` name is not a
@@ -615,6 +493,157 @@ fn validate_download(path: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Download through the core's parallel/resumable transfer engine. The GUI
+/// used to keep its own single-stream implementation; this wrapper preserves
+/// the UI events while using the same 16-range downloader as the CLI.
+pub fn download_parallel(
+    repo: &str,
+    revision: &str,
+    file: &str,
+    dest_dir: &Path,
+    expected_sha256: Option<&str>,
+    cancel: &AtomicBool,
+    tx: &Sender<HfEvent>,
+) -> Result<PathBuf, String> {
+    download_artifact(
+        repo,
+        revision,
+        file,
+        dest_dir,
+        false,
+        expected_sha256,
+        cancel,
+        tx,
+        false,
+    )
+}
+
+/// Download a vision projector explicitly. Projectors are GGUF containers but
+/// are not standalone models, so they are kept out of the model download path.
+pub fn download_projector(
+    repo: &str,
+    revision: &str,
+    file: &str,
+    dest_dir: &Path,
+    expected_sha256: Option<&str>,
+    cancel: &AtomicBool,
+    tx: &Sender<HfEvent>,
+) -> Result<PathBuf, String> {
+    download_artifact(
+        repo,
+        revision,
+        file,
+        dest_dir,
+        false,
+        expected_sha256,
+        cancel,
+        tx,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_artifact(
+    repo: &str,
+    revision: &str,
+    file: &str,
+    dest_dir: &Path,
+    overwrite: bool,
+    expected_sha256: Option<&str>,
+    cancel: &AtomicBool,
+    tx: &Sender<HfEvent>,
+    projector: bool,
+) -> Result<PathBuf, String> {
+    if projector {
+        if !is_projector(file) {
+            return Err(format!("Cannot download {file}: not a vision projector."));
+        }
+    } else {
+        file_support(file).map_err(|reason| format!("Cannot download {file}: {reason}."))?;
+    }
+    fs::create_dir_all(dest_dir).map_err(|e| format!("cannot create download folder: {e}"))?;
+    let name = file_name(file);
+    let name = if name.is_empty() { "model.gguf" } else { name };
+    let final_path = dest_dir.join(name);
+    let existed = final_path.exists();
+    let url = format!(
+        "{BASE}/{}/resolve/{}/{}",
+        encode_path(repo),
+        encode_path(if revision.is_empty() {
+            "main"
+        } else {
+            revision
+        }),
+        encode_path(file)
+    );
+    let options = rustblock_core::DownloadOptions {
+        connections: 16,
+        force: overwrite,
+        expected_sha256: expected_sha256.map(str::to_string),
+        token: std::env::var("HF_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+    };
+    let started = AtomicBool::new(false);
+    let meter = Mutex::new((Instant::now(), 0u64));
+    let send_started = |total: u64| {
+        let _ = tx.send(HfEvent::DownloadStarted {
+            repo: repo.to_string(),
+            file: file.to_string(),
+            total,
+        });
+    };
+    let progress_tx = tx.clone();
+    let report = rustblock_core::download_url_with_progress(
+        &url,
+        &final_path,
+        &options,
+        cancel,
+        &move |done, total| {
+            if !started.swap(true, Ordering::Relaxed) {
+                send_started(total);
+            }
+            let now = Instant::now();
+            let mut previous = meter.lock().expect("download speed lock");
+            let elapsed = now.duration_since(previous.0).as_secs_f64();
+            let speed = if elapsed > 0.0 && done >= previous.1 {
+                (done - previous.1) as f64 / elapsed
+            } else {
+                0.0
+            };
+            *previous = (now, done);
+            drop(previous);
+            let _ = progress_tx.send(HfEvent::DownloadProgress {
+                done,
+                total: total.max(done),
+                speed,
+            });
+        },
+    )
+    .map_err(|error| {
+        let message = error.to_string();
+        if message.contains("cancelled") {
+            let _ = tx.send(HfEvent::DownloadCancelled);
+            "download cancelled".to_string()
+        } else {
+            message
+        }
+    })?;
+    if let Err(error) = validate_download(&final_path) {
+        if !existed {
+            let _ = fs::remove_file(&final_path);
+        }
+        return Err(error);
+    }
+    let _ = tx.send(HfEvent::Downloaded {
+        repo: repo.to_string(),
+        file: file.to_string(),
+        path: report.path.clone(),
+        projector,
+    });
+    Ok(report.path)
 }
 
 fn gated_field(item: &Value) -> bool {

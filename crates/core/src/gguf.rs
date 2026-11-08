@@ -52,6 +52,8 @@ pub struct KvEntry {
     pub value_type: u32,
     /// Absolute file offset of the value payload (after key and type).
     pub value_pos: u64,
+    /// Absolute file offset just past the value payload.
+    pub value_end: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +93,9 @@ pub struct Gguf {
     pub file_type: Option<u32>,
     pub file_type_pos: Option<u64>,
     pub has_hadamard_version: bool,
+    /// True when any `prism.mtp.*` metadata is present. The reblocker keeps
+    /// these keys and values byte-for-byte; it does not reinterpret MTP.
+    pub has_mtp_metadata: bool,
 }
 
 impl Gguf {
@@ -130,6 +135,7 @@ impl Gguf {
         let mut file_type = None;
         let mut file_type_pos = None;
         let mut has_hadamard_version = false;
+        let mut has_mtp_metadata = false;
 
         for _ in 0..kv_count {
             let key = r.string()?;
@@ -173,10 +179,16 @@ impl Gguf {
                 }
             }
 
+            if key.starts_with("prism.mtp") {
+                has_mtp_metadata = true;
+            }
+            let value_end = r.pos;
+
             kv.push(KvEntry {
                 key,
                 value_type,
                 value_pos,
+                value_end,
             });
         }
 
@@ -329,6 +341,7 @@ impl Gguf {
             file_type,
             file_type_pos,
             has_hadamard_version,
+            has_mtp_metadata,
         })
     }
 
@@ -338,6 +351,26 @@ impl Gguf {
 
     pub fn has_ptq1(&self) -> bool {
         self.tensors.iter().any(|t| t.ty == TY_PTQ1_0)
+    }
+
+    /// Exact metadata bytes for every `prism.*` key, in header order. Used by
+    /// conversion verification so Hadamard/MTP keys cannot be silently lost or
+    /// rewritten. Numeric MTP execution is a separate, external check.
+    pub fn prism_metadata_signature(&self) -> Vec<(String, u32, Vec<u8>)> {
+        self.kv
+            .iter()
+            .filter(|entry| entry.key.starts_with("prism."))
+            .map(|entry| {
+                let start = usize::try_from(entry.value_pos).unwrap_or(0);
+                let end = usize::try_from(entry.value_end).unwrap_or(start);
+                let bytes = if start <= end && end <= self.header.len() {
+                    self.header[start..end].to_vec()
+                } else {
+                    Vec::new()
+                };
+                (entry.key.clone(), entry.value_type, bytes)
+            })
+            .collect()
     }
 
     pub fn type_histogram(&self) -> BTreeMap<u32, usize> {

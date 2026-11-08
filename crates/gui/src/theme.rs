@@ -4,6 +4,7 @@
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, IconData, Pos2, Shape, Stroke, StrokeKind, TextStyle, Vec2,
 };
+use std::collections::VecDeque;
 use std::f32::consts::TAU;
 
 pub const BG: Color32 = Color32::from_rgb(14, 16, 18);
@@ -21,6 +22,7 @@ pub const STEEL_DARK: Color32 = Color32::from_rgb(104, 112, 118);
 pub const WARN: Color32 = Color32::from_rgb(190, 184, 168);
 pub const ERROR: Color32 = Color32::from_rgb(222, 105, 92);
 pub const INFO: Color32 = Color32::from_rgb(132, 153, 158);
+pub const OK: Color32 = Color32::from_rgb(126, 174, 138);
 pub const INK: Color32 = Color32::from_rgb(14, 16, 18);
 
 pub fn install(ctx: &egui::Context) {
@@ -104,12 +106,112 @@ fn visuals() -> egui::Visuals {
 }
 
 pub const LOGO_PNG: &[u8] = include_bytes!("../assets/rustblock-logo.png");
+pub const WORDMARK_PNG: &[u8] = include_bytes!("../assets/rustblock-wordmark.png");
 
-pub fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+pub fn load_wordmark(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let mut decoded = image::load_from_memory(WORDMARK_PNG).ok()?.to_rgba8();
+    clear_connected_border(&mut decoded);
+    let (width, height) = decoded.dimensions();
+    let mut bounds = (width, height, 0u32, 0u32);
+    for (x, y, pixel) in decoded.enumerate_pixels() {
+        if pixel[3] > 8 {
+            bounds.0 = bounds.0.min(x);
+            bounds.1 = bounds.1.min(y);
+            bounds.2 = bounds.2.max(x);
+            bounds.3 = bounds.3.max(y);
+        }
+    }
+    if bounds.2 >= bounds.0 && bounds.3 >= bounds.1 {
+        decoded = image::imageops::crop_imm(
+            &decoded,
+            bounds.0,
+            bounds.1,
+            bounds.2 - bounds.0 + 1,
+            bounds.3 - bounds.1 + 1,
+        )
+        .to_image();
+    }
+    let size = [decoded.width() as usize, decoded.height() as usize];
+    let image = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
+    Some(ctx.load_texture("rustblock-wordmark", image, egui::TextureOptions::LINEAR))
+}
+
+/// Remove a flat canvas connected to the image border without punching holes
+/// inside the artwork. The supplied wordmark is black-on-black with a dark
+/// cube; a global key would hollow the cube and the white letters, so only the
+/// background reachable from the edges is cleared.
+fn clear_connected_border(image: &mut image::RgbaImage) {
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return;
+    }
+    let background = *image.get_pixel(0, 0);
+    if background[3] == 0 {
+        return;
+    }
+    let matches = |pixel: &image::Rgba<u8>| {
+        pixel[3] > 0
+            && pixel[0].abs_diff(background[0]) <= 6
+            && pixel[1].abs_diff(background[1]) <= 6
+            && pixel[2].abs_diff(background[2]) <= 6
+    };
+    let mut visited = vec![false; (width as usize) * (height as usize)];
+    let mut queue = VecDeque::new();
+    for x in 0..width {
+        queue.push_back((x, 0));
+        queue.push_back((x, height - 1));
+    }
+    for y in 1..height - 1 {
+        queue.push_back((0, y));
+        queue.push_back((width - 1, y));
+    }
+    while let Some((x, y)) = queue.pop_front() {
+        let index = y as usize * width as usize + x as usize;
+        if visited[index] {
+            continue;
+        }
+        visited[index] = true;
+        if !matches(image.get_pixel(x, y)) {
+            continue;
+        }
+        image.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+        if x > 0 {
+            queue.push_back((x - 1, y));
+        }
+        if x + 1 < width {
+            queue.push_back((x + 1, y));
+        }
+        if y > 0 {
+            queue.push_back((x, y - 1));
+        }
+        if y + 1 < height {
+            queue.push_back((x, y + 1));
+        }
+    }
+}
+
+pub fn load_gear(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     let decoded = image::load_from_memory(LOGO_PNG).ok()?.to_rgba8();
     let size = [decoded.width() as usize, decoded.height() as usize];
     let image = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
-    Some(ctx.load_texture("rustblock-logo", image, egui::TextureOptions::LINEAR))
+    Some(ctx.load_texture("rustblock-gear", image, egui::TextureOptions::LINEAR))
+}
+
+pub fn paint_wordmark(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    texture: Option<&egui::TextureHandle>,
+    tint: Color32,
+) {
+    let Some(texture) = texture else {
+        return;
+    };
+    painter.image(
+        texture.id(),
+        rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        tint,
+    );
 }
 
 pub fn paint_logo(ui: &mut egui::Ui, size: f32, logo: Option<&egui::TextureHandle>) {
@@ -256,5 +358,72 @@ pub fn app_icon() -> IconData {
         rgba: resized.into_raw(),
         width: 128,
         height: 128,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel(value: u8) -> f32 {
+        let value = value as f32 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn luminance(color: Color32) -> f32 {
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (lighter, darker) = if luminance(a) >= luminance(b) {
+            (luminance(a), luminance(b))
+        } else {
+            (luminance(b), luminance(a))
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    #[test]
+    fn text_and_status_colors_meet_wcag_aa() {
+        for (foreground, background) in [
+            (TEXT, BG),
+            (TEXT, PANEL),
+            (TEXT, PANEL_2),
+            (MUTED, BG),
+            (MUTED, PANEL),
+            (MUTED, PANEL_2),
+            (MUTED, PANEL_3),
+            (WARN, PANEL),
+            (ERROR, PANEL),
+            (OK, PANEL),
+            (INFO, PANEL),
+            (INK, ACCENT),
+            (STEEL_LIGHT, PANEL),
+        ] {
+            let ratio = contrast(foreground, background);
+            assert!(
+                ratio >= 4.5,
+                "contrast {ratio:.2}:1 is below WCAG AA for {foreground:?} on {background:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn border_keying_keeps_enclosed_dark_pixels() {
+        let mut image = image::RgbaImage::from_pixel(9, 9, image::Rgba([0, 0, 0, 255]));
+        for y in 2..7 {
+            for x in 2..7 {
+                image.put_pixel(x, y, image::Rgba([240, 240, 240, 255]));
+            }
+        }
+        image.put_pixel(4, 4, image::Rgba([0, 0, 0, 255]));
+        clear_connected_border(&mut image);
+        assert_eq!(image.get_pixel(0, 0)[3], 0);
+        assert_eq!(image.get_pixel(2, 2)[3], 255);
+        assert_eq!(image.get_pixel(4, 4)[3], 255);
     }
 }
