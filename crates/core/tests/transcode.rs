@@ -217,14 +217,16 @@ fn q4k_quantization_adds_quantization_version() {
 }
 
 #[test]
-fn sensitive_tensors_get_extra_precision_on_every_model() {
+fn q4_k_s_bumps_the_output_and_the_first_attention_values() {
+    // llama.cpp keeps Q4_K_S uniform except for output/tied embeddings (Q6_K)
+    // and the first four attention-value tensors (Q5_K).
     let dir = tempfile::tempdir().unwrap();
     let values = float_values(512);
-    for name in [
-        "output.weight",
-        "token_embd.weight",
-        "blk.0.attn_v.weight",
-        "transformer.word_embeddings.weight",
+    for (name, expected) in [
+        ("output.weight", 14),
+        ("token_embd.weight", 14),
+        ("blk.0.attn_v.weight", 13),
+        ("transformer.word_embeddings.weight", 12),
     ] {
         let input = dir.path().join(format!("{}.gguf", name.replace('.', "_")));
         let output = dir
@@ -245,8 +247,7 @@ fn sensitive_tensors_get_extra_precision_on_every_model() {
         .unwrap_or_else(|e| panic!("{name} failed: {e}"));
 
         let g = Gguf::open(&output).unwrap();
-        assert_eq!(g.tensors[0].ty, 14, "{name} should be protected as Q6_K");
-        assert_eq!(g.file_type, Some(14));
+        assert_eq!(g.tensors[0].ty, expected, "{name}");
     }
 }
 
@@ -283,7 +284,7 @@ fn ternary_targets_are_not_mixed_with_protected_precision() {
 }
 
 #[test]
-fn k_quant_targets_keep_their_protected_layout() {
+fn k_quant_targets_put_the_output_tensor_at_q6_k() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("output.gguf");
     let values = float_values(512);
@@ -298,7 +299,7 @@ fn k_quant_targets_keep_their_protected_layout() {
     );
     for (target, expected) in [
         (Target::Q2K, 14),
-        (Target::Q3K, 13),
+        (Target::Q3K, 14),
         (Target::Q4K, 14),
         (Target::Q5K, 14),
     ] {
@@ -615,8 +616,10 @@ fn mixed_preset_end_to_end_writes_the_recipe_map_and_file_type() {
 
     let g = Gguf::open(&input).unwrap();
     let map = effective_tensor_types(&g.tensors, Target::Q4KM, &[]);
-    assert_eq!(map[0].1, 12, "single attention value should stay Q4_K");
-    assert_eq!(map[1].1, 12, "single ffn_down should stay Q4_K");
+    // A one-layer model is both the first and the last eighth, so llama.cpp's
+    // use_more_bits promotes attn_v and ffn_down to Q6_K.
+    assert_eq!(map[0].1, 14, "attention value uses Q6_K");
+    assert_eq!(map[1].1, 14, "ffn_down uses Q6_K");
     assert_eq!(map[2].1, 0, "norm keeps its source type");
     assert_eq!(map[3].1, 14, "output uses Q6_K");
 
@@ -640,8 +643,8 @@ fn mixed_preset_end_to_end_writes_the_recipe_map_and_file_type() {
             .unwrap()
             .ty
     };
-    assert_eq!(ty("blk.0.attn_v.weight"), 12);
-    assert_eq!(ty("blk.0.ffn_down.weight"), 12);
+    assert_eq!(ty("blk.0.attn_v.weight"), 14);
+    assert_eq!(ty("blk.0.ffn_down.weight"), 14);
     assert_eq!(ty("blk.0.attn_norm.weight"), 0);
     assert_eq!(ty("output.weight"), 14);
     assert_eq!(out.file_type, Some(15));

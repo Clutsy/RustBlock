@@ -106,7 +106,22 @@ pub struct RustBlockApp {
 }
 impl RustBlockApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        theme::install(&cc.egui_ctx);
+        let mut app = Self::with_context(&cc.egui_ctx);
+        let files: Vec<PathBuf> = std::env::args_os()
+            .skip(1)
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .collect();
+        if !files.is_empty() {
+            app.add_paths(files);
+        }
+        app
+    }
+
+    /// Build against an existing egui context. `new` passes the window's
+    /// context; the headless layout tests pass one without creating a window.
+    fn with_context(ctx: &egui::Context) -> Self {
+        theme::install(ctx);
         let mut app = Self {
             tab: Tab::Convert,
             jobs: Vec::new(),
@@ -117,9 +132,9 @@ impl RustBlockApp {
             cancel: None,
             batch: None,
             last_output_dir: None,
-            mark: theme::load_gear(&cc.egui_ctx),
-            wordmark: theme::load_wordmark(&cc.egui_ctx),
-            ctx: cc.egui_ctx.clone(),
+            mark: theme::load_gear(ctx),
+            wordmark: theme::load_wordmark(ctx),
+            ctx: ctx.clone(),
             hf_query: String::new(),
             hf_sort: HfSort::Downloads,
             hf_state: HfState::Idle,
@@ -146,14 +161,6 @@ impl RustBlockApp {
             LogLevel::Info,
             "Ready. Add a GGUF file or search Hugging Face for a GGUF repository.".to_string(),
         );
-        let files: Vec<PathBuf> = std::env::args_os()
-            .skip(1)
-            .map(PathBuf::from)
-            .filter(|p| p.exists())
-            .collect();
-        if !files.is_empty() {
-            app.add_paths(files);
-        }
         app
     }
     fn is_running(&self) -> bool {
@@ -1018,43 +1025,42 @@ impl RustBlockApp {
     }
 
     // ----- UI -----------------------------------------------------------
+    /// The square mark is the app backdrop: large, centred and faint, painted
+    /// behind the content of the active view (never in the title bar).
+    fn paint_backdrop(&self, ui: &Ui) {
+        let Some(texture) = self.mark.as_ref() else {
+            return;
+        };
+        let area = ui.max_rect();
+        let rect = backdrop_rect(area);
+        ui.painter().with_clip_rect(area).image(
+            texture.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+        );
+    }
+
     fn top_chrome(&mut self, ui: &mut Ui) {
         let mark = self.mark.clone();
         let wordmark = self.wordmark.clone();
         egui::Panel::top("chrome")
-            .exact_size(58.0)
+            .exact_size(56.0)
             .frame(
                 egui::Frame::new()
                     .fill(PANEL)
-                    .inner_margin(Margin::symmetric(16, 9))
+                    .inner_margin(Margin::symmetric(14, 8))
                     .stroke(Stroke::new(1.0, BORDER)),
             )
             .show(ui, |ui| {
-                let chrome_rect = ui.max_rect();
                 let controls_width = 196.0;
-                if let Some(texture) = wordmark.as_ref() {
-                    let texture_size = texture.size_vec2();
-                    let aspect = texture_size.x / texture_size.y;
-                    let height = (chrome_rect.height() * 0.9).min(52.0);
-                    let width = height * aspect;
-                    let background = egui::Rect::from_min_size(
-                        egui::pos2(
-                            chrome_rect.right() - controls_width - width - 20.0,
-                            chrome_rect.center().y - height * 0.5,
-                        ),
-                        Vec2::new(width, height),
-                    );
-                    theme::paint_wordmark(
-                        &ui.painter().with_clip_rect(chrome_rect),
-                        background,
-                        Some(texture),
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 13),
-                    );
-                }
+                // Keep the title bar flat: the mark lives behind the content.
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     self.brand(ui, mark.as_ref(), wordmark.as_ref());
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
                     self.nav_tab(ui, Tab::Convert, "Convert");
                     ui.add_space(2.0);
                     self.nav_tab(ui, Tab::Discover, "Discover");
@@ -1105,12 +1111,12 @@ impl RustBlockApp {
         mark: Option<&egui::TextureHandle>,
         wordmark: Option<&egui::TextureHandle>,
     ) {
-        theme::paint_logo(ui, 32.0, mark);
+        theme::paint_logo(ui, 24.0, mark);
         ui.add_space(8.0);
         let Some(texture) = wordmark else {
             return;
         };
-        let height = 34.0;
+        let height = 18.0;
         let size = texture.size_vec2();
         let width = height * (size.x / size.y).max(0.1);
         let (rect, response) =
@@ -1128,7 +1134,7 @@ impl RustBlockApp {
     fn nav_tab(&mut self, ui: &mut Ui, tab: Tab, label: &str) {
         let active = self.tab == tab;
         let response = ui.add_sized(
-            [96.0, 32.0],
+            [92.0, 30.0],
             egui::Button::new(
                 RichText::new(label)
                     .size(12.5)
@@ -1144,7 +1150,7 @@ impl RustBlockApp {
                 1.0,
                 if active { BORDER } else { Color32::TRANSPARENT },
             ))
-            .corner_radius(CornerRadius::same(4)),
+            .corner_radius(CornerRadius::same(6)),
         );
         if response.clicked() {
             self.tab = tab;
@@ -1154,11 +1160,11 @@ impl RustBlockApp {
     fn convert_page(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new("Convert").size(28.0).strong().color(TEXT));
+                ui.label(RichText::new("Convert").size(26.0).strong().color(TEXT));
                 let ready = self.selected_jobs();
                 ui.label(
                     RichText::new(format!(
-                        "{} · {} ready for {}",
+                        "{}  ·  {} ready for {}",
                         if self.jobs.len() == 1 {
                             "1 file".to_string()
                         } else {
@@ -1176,8 +1182,8 @@ impl RustBlockApp {
                     egui::Button::new(RichText::new("Add files").size(12.0).strong().color(INK))
                         .fill(ACCENT)
                         .stroke(Stroke::new(1.0, ACCENT))
-                        .corner_radius(CornerRadius::same(4))
-                        .min_size(Vec2::new(104.0, 34.0));
+                        .corner_radius(CornerRadius::same(6))
+                        .min_size(Vec2::new(108.0, 32.0));
                 if ui.add(add).clicked() {
                     self.browse();
                 }
@@ -1199,16 +1205,23 @@ impl RustBlockApp {
 
     fn empty_queue(&mut self, ui: &mut Ui) {
         egui::Frame::new()
-            .fill(PANEL)
+            .fill(Color32::from_rgba_unmultiplied(22, 25, 28, 168))
             .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(Margin::symmetric(28, 46))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(32, 56))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.vertical_centered(|ui| {
                     ui.label(
+                        RichText::new("DROP ZONE")
+                            .size(9.5)
+                            .strong()
+                            .color(STEEL_LIGHT),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
                         RichText::new("Drop GGUF files here")
-                            .size(20.0)
+                            .size(18.0)
                             .strong()
                             .color(TEXT),
                     );
@@ -1235,7 +1248,7 @@ impl RustBlockApp {
 
     fn settings_rail(&mut self, ui: &mut Ui) {
         egui::Panel::right("settings_rail")
-            .exact_size(420.0)
+            .exact_size(380.0)
             .resizable(true)
             .frame(
                 egui::Frame::new()
@@ -1307,7 +1320,7 @@ impl RustBlockApp {
     fn hf_inspector_rail(&mut self, ui: &mut Ui) {
         let scroll_top = std::mem::take(&mut self.hf_scroll_top);
         egui::Panel::right("hf_inspector_rail")
-            .exact_size(420.0)
+            .exact_size(380.0)
             .resizable(true)
             .frame(
                 egui::Frame::new()
@@ -1341,12 +1354,12 @@ impl RustBlockApp {
 
     fn queue_panel(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Queue").size(13.0).strong().color(TEXT));
+            ui.label(RichText::new("Queue").size(15.0).strong().color(TEXT));
             ui.label(
                 RichText::new(self.jobs.len().to_string())
-                    .size(10.5)
+                    .size(9.5)
                     .monospace()
-                    .color(MUTED),
+                    .color(STEEL_LIGHT),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
@@ -1377,8 +1390,8 @@ impl RustBlockApp {
             egui::Frame::new()
                 .fill(PANEL_2)
                 .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(CornerRadius::same(4))
-                .inner_margin(Margin::symmetric(12, 10))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(14, 12))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
@@ -1415,7 +1428,7 @@ impl RustBlockApp {
                                     )
                                     .fill(PANEL)
                                     .stroke(Stroke::new(1.0, BORDER))
-                                    .corner_radius(CornerRadius::same(4)),
+                                    .corner_radius(CornerRadius::same(6)),
                                 )
                                 .clicked()
                             {
@@ -1445,8 +1458,8 @@ impl RustBlockApp {
         egui::Frame::new()
             .fill(Color32::TRANSPARENT)
             .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(4))
-            .inner_margin(Margin::symmetric(12, 10))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(14, 12))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
@@ -1744,19 +1757,24 @@ impl RustBlockApp {
 
     fn log_panel(&mut self, ui: &mut Ui) {
         egui::Panel::bottom("log_panel")
-            .exact_size(180.0)
+            .exact_size(188.0)
             .resizable(true)
             .frame(
                 egui::Frame::new()
                     .fill(PANEL)
                     .stroke(Stroke::new(1.0, BORDER))
-                    .inner_margin(Margin::symmetric(12, 8)),
+                    .inner_margin(Margin::symmetric(16, 10)),
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Log").size(11.0).strong().color(TEXT));
+                    ui.label(
+                        RichText::new("ACTIVITY LOG")
+                            .size(9.5)
+                            .strong()
+                            .color(STEEL_LIGHT),
+                    );
                     ui.add_sized(
-                        [160.0, 22.0],
+                        [140.0, 26.0],
                         TextEdit::singleline(&mut self.log_filter)
                             .hint_text("Filter")
                             .font(FontId::proportional(9.5)),
@@ -1968,7 +1986,7 @@ impl RustBlockApp {
     fn discover_header(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new("Discover").size(28.0).strong().color(TEXT));
+                ui.label(RichText::new("Discover").size(26.0).strong().color(TEXT));
                 ui.label(
                     RichText::new("GGUF models on Hugging Face")
                         .size(11.5)
@@ -1983,16 +2001,16 @@ impl RustBlockApp {
             egui::Frame::new()
                 .fill(PANEL)
                 .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(CornerRadius::same(4))
+                .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin::symmetric(12, 0))
                 .show(ui, |ui| {
                     let response = ui.add_sized(
-                        [field_width - 24.0, 38.0],
+                        [field_width - 24.0, 36.0],
                         TextEdit::singleline(&mut self.hf_query)
                             .hint_text("Search a model or paste a Hugging Face link")
                             .font(FontId::proportional(13.0))
                             .frame(egui::Frame::NONE)
-                            .margin(Vec2::new(0.0, 9.0)),
+                            .margin(Vec2::new(0.0, 8.0)),
                     );
                     if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         self.start_search();
@@ -2006,8 +2024,8 @@ impl RustBlockApp {
             )
             .fill(ACCENT)
             .stroke(Stroke::new(1.0, ACCENT))
-            .corner_radius(CornerRadius::same(4))
-            .min_size(Vec2::new(92.0, 38.0));
+            .corner_radius(CornerRadius::same(6))
+            .min_size(Vec2::new(96.0, 36.0));
             if ui.add(search).clicked() {
                 self.start_search();
             }
@@ -2058,10 +2076,10 @@ impl RustBlockApp {
         match self.hf_state.clone() {
             HfState::Idle => {
                 egui::Frame::new()
-                    .fill(PANEL)
+                    .fill(Color32::from_rgba_unmultiplied(22, 25, 28, 168))
                     .stroke(Stroke::new(1.0, BORDER))
-                    .corner_radius(CornerRadius::same(6))
-                    .inner_margin(Margin::symmetric(28, 36))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::symmetric(32, 44))
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.vertical_centered(|ui| {
@@ -2408,11 +2426,14 @@ impl eframe::App for RustBlockApp {
             .frame(
                 egui::Frame::new()
                     .fill(BG)
-                    .inner_margin(Margin::symmetric(20, 14)),
+                    .inner_margin(Margin::symmetric(22, 16)),
             )
-            .show(ui, |ui| match self.tab {
-                Tab::Convert => self.convert_page(ui),
-                Tab::Discover => self.discover_page(ui),
+            .show(ui, |ui| {
+                self.paint_backdrop(ui);
+                match self.tab {
+                    Tab::Convert => self.convert_page(ui),
+                    Tab::Discover => self.discover_page(ui),
+                }
             });
         self.drag_overlay(ui.ctx());
         self.requantize_modal(ui.ctx());
@@ -2535,6 +2556,14 @@ fn resize_edges(ui: &mut Ui) {
     }
 }
 
+/// Geometry of the app backdrop: a square centred in the content area, never
+/// larger than the area it decorates.
+fn backdrop_rect(area: egui::Rect) -> egui::Rect {
+    let limit = area.width().min(area.height()).max(1.0);
+    let size = (limit * 0.82).clamp(64.0, limit);
+    egui::Rect::from_center_size(area.center(), Vec2::splat(size))
+}
+
 fn paint_window_border(ctx: &egui::Context) {
     let Some(screen) = ctx.input(|input| input.raw.screen_rect) else {
         return;
@@ -2550,18 +2579,21 @@ fn paint_window_border(ctx: &egui::Context) {
 
 fn hf_result_row(ui: &mut Ui, model: &HfModel, selected: bool) -> bool {
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 60.0), Sense::click());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 64.0), Sense::click());
     if selected {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(3), PANEL_2);
+            .rect_filled(rect, CornerRadius::same(8), PANEL_2);
         ui.painter().rect_filled(
-            egui::Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
-            CornerRadius::same(0),
+            egui::Rect::from_min_size(
+                rect.min + Vec2::new(1.0, 10.0),
+                Vec2::new(2.0, rect.height() - 20.0),
+            ),
+            CornerRadius::same(2),
             ACCENT,
         );
     } else if response.hovered() {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(3), PANEL_2.gamma_multiply(0.7));
+            .rect_filled(rect, CornerRadius::same(8), PANEL_2.gamma_multiply(0.7));
     }
     ui.painter().line_segment(
         [
@@ -2571,26 +2603,26 @@ fn hf_result_row(ui: &mut Ui, model: &HfModel, selected: bool) -> bool {
         Stroke::new(1.0, BORDER),
     );
     let clip = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 12.0, rect.top()),
+        egui::pos2(rect.left() + 16.0, rect.top()),
         egui::pos2(rect.left() + rect.width() * 0.64, rect.bottom()),
     );
     let painter = ui.painter().with_clip_rect(clip);
     painter.text(
-        egui::pos2(rect.left() + 12.0, rect.top() + 15.0),
+        egui::pos2(rect.left() + 16.0, rect.top() + 21.0),
         Align2::LEFT_CENTER,
         &model.author,
         FontId::proportional(10.5),
         MUTED,
     );
     painter.text(
-        egui::pos2(rect.left() + 12.0, rect.top() + 38.0),
+        egui::pos2(rect.left() + 16.0, rect.top() + 43.0),
         Align2::LEFT_CENTER,
         &model.name,
         FontId::proportional(13.0),
         TEXT,
     );
     ui.painter().text(
-        egui::pos2(rect.right() - 12.0, rect.center().y),
+        egui::pos2(rect.right() - 16.0, rect.center().y),
         Align2::RIGHT_CENTER,
         format!(
             "{} files · {} downloads · {}",
@@ -2623,14 +2655,56 @@ fn target_grid(ui: &mut Ui, targets: &[Target], selected: &mut Target) {
                 )
                 .fill(if is_selected { ACCENT } else { PANEL_2 })
                 .stroke(Stroke::new(1.0, if is_selected { ACCENT } else { BORDER }))
-                .corner_radius(CornerRadius::same(4))
-                .min_size(Vec2::new(width, 28.0));
+                .corner_radius(CornerRadius::same(6))
+                .min_size(Vec2::new(width, 30.0));
                 if ui.add(button).on_hover_text(target.description()).clicked() {
                     *selected = *target;
                 }
             }
         });
     }
+}
+
+/// 512 MiB of runtime overhead, the same constant the full estimate uses.
+const DOWNLOAD_OVERHEAD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Hardware detection is slow on Windows (PowerShell and `nvidia-smi`), so the
+/// Discover list reuses one detection per process.
+fn detected_hardware() -> rustblock_core::Hardware {
+    static HARDWARE: std::sync::OnceLock<rustblock_core::Hardware> = std::sync::OnceLock::new();
+    *HARDWARE.get_or_init(rustblock_core::detect_hardware)
+}
+
+/// Fit verdict available before a download. Only the published weight size is
+/// known, so the KV cache is excluded and the tooltip says so instead of
+/// pretending the number is a full estimate.
+fn size_fit_badge(weights: u64, hardware: rustblock_core::Hardware) -> (String, Color32, String) {
+    let total = weights.saturating_add(DOWNLOAD_OVERHEAD_BYTES);
+    let hint = format!(
+        "Download estimate: {} weights + {} runtime overhead. The KV cache needs the model header, so it is not included before download.",
+        human_bytes(weights),
+        human_bytes(DOWNLOAD_OVERHEAD_BYTES)
+    );
+    let fits_ram = hardware
+        .ram_bytes
+        .map(|available| rustblock_core::hardware_fits(total, available));
+    let fits_vram = hardware
+        .vram_bytes
+        .map(|available| rustblock_core::hardware_fits(total, available));
+    let (label, color) = if fits_vram == Some(true) {
+        fit_label("VRAM", hardware.vram_bytes, total)
+    } else if fits_ram == Some(true) {
+        fit_label("RAM", hardware.ram_bytes, total)
+    } else if fits_ram == Some(false) && fits_vram == Some(false) {
+        ("No fit".to_string(), ERROR)
+    } else if fits_ram == Some(false) {
+        ("No RAM fit".to_string(), ERROR)
+    } else if fits_vram == Some(false) {
+        ("No VRAM fit".to_string(), ERROR)
+    } else {
+        ("Fit unknown".to_string(), MUTED)
+    };
+    (label, color, hint)
 }
 
 fn fit_badge(fit: &FitEstimate) -> (String, Color32, String) {
@@ -2696,8 +2770,8 @@ fn job_card(
     egui::Frame::new()
         .fill(PANEL)
         .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(4))
-        .inner_margin(Margin::symmetric(12, 10))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(14, 12))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -2872,13 +2946,19 @@ fn hf_file_row(
                         .color(STEEL_LIGHT),
                 )
                 .on_hover_text(&file.path);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
                     ui.label(
                         RichText::new(human_bytes(file.size))
                             .size(9.5)
                             .monospace()
                             .color(MUTED),
                     );
+                    if !file.projector {
+                        let (label, color, hint) = size_fit_badge(file.size, detected_hardware());
+                        ui.label(RichText::new(label).size(9.0).strong().color(color))
+                            .on_hover_text(hint);
+                    }
                     if file.projector {
                         ui.label(RichText::new("· vision projector").size(9.5).color(INFO));
                     } else if cached {
@@ -2912,7 +2992,7 @@ fn hf_file_row(
             }
         });
     });
-    ui.add_space(6.0);
+    ui.add_space(8.0);
     ui.separator();
 }
 
@@ -3032,6 +3112,117 @@ fn open_folder(path: &Path) {
 }
 
 #[cfg(test)]
+mod backdrop_tests {
+    use super::*;
+
+    #[test]
+    fn backdrop_is_centred_in_the_content_area() {
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 56.0), Vec2::new(740.0, 520.0));
+        let rect = backdrop_rect(area);
+        assert_eq!(rect.center(), area.center());
+        assert!(rect.width() == rect.height());
+        assert!(rect.width() <= area.width() && rect.height() <= area.height());
+    }
+
+    fn textured_images(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
+        let mut rects = Vec::new();
+        for clipped in shapes {
+            if let egui::Shape::Mesh(mesh) = &clipped.shape {
+                if mesh.texture_id != egui::TextureId::Managed(0) {
+                    rects.push(mesh.calc_bounds());
+                }
+            }
+        }
+        rects
+    }
+
+    /// Renders one real frame without a window: the title bar must stay flat
+    /// and the only large mark must be the backdrop behind the content.
+    #[test]
+    fn backdrop_renders_once_behind_the_content() {
+        let ctx = egui::Context::default();
+        let mut app = RustBlockApp::with_context(&ctx);
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(1120.0, 680.0));
+        let raw = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(raw, |ui| {
+            app.top_chrome(ui);
+            app.paint_backdrop(ui);
+        });
+        let images = textured_images(&output.shapes);
+        assert!(!images.is_empty(), "the brand textures must render");
+        let large: Vec<egui::Rect> = images
+            .iter()
+            .copied()
+            .filter(|rect| rect.width() > 300.0)
+            .collect();
+        assert_eq!(large.len(), 1, "exactly one large mark expected: {large:?}");
+        let backdrop = large[0];
+        assert!((backdrop.width() - backdrop.height()).abs() < 1.0);
+        assert!((backdrop.center().x - screen.center().x).abs() < 1.5);
+        assert!(
+            backdrop.top() >= 56.0,
+            "the backdrop must sit below the title bar, got {backdrop:?}"
+        );
+    }
+
+    /// Drives the real view code for every surface that was restyled
+    /// (title bar, queue, settings rail, Discover, log) without a window.
+    #[test]
+    fn every_surface_renders_without_panicking() {
+        let ctx = egui::Context::default();
+        let mut app = RustBlockApp::with_context(&ctx);
+        app.discover_loaded = true;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                Vec2::new(1120.0, 680.0),
+            )),
+            ..Default::default()
+        };
+        for tab in [Tab::Convert, Tab::Discover] {
+            app.tab = tab;
+            app.show_log = true;
+            let _ = ctx.run_ui(raw.clone(), |ui| {
+                app.top_chrome(ui);
+                if app.show_log {
+                    app.log_panel(ui);
+                }
+                match app.tab {
+                    Tab::Convert => app.settings_rail(ui),
+                    Tab::Discover => app.hf_inspector_rail(ui),
+                }
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .fill(BG)
+                            .inner_margin(Margin::symmetric(22, 16)),
+                    )
+                    .show(ui, |ui| {
+                        app.paint_backdrop(ui);
+                        match app.tab {
+                            Tab::Convert => app.convert_page(ui),
+                            Tab::Discover => app.discover_page(ui),
+                        }
+                    });
+            });
+        }
+    }
+
+    #[test]
+    fn backdrop_never_overflows_a_tiny_window() {
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(120.0, 80.0));
+        let rect = backdrop_rect(area);
+        assert!(
+            area.contains_rect(rect),
+            "{rect:?} must fit inside {area:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod fit_badge_tests {
     use super::*;
 
@@ -3059,6 +3250,23 @@ mod fit_badge_tests {
             fits_vram: vram.map(|available| rustblock_core::hardware_fits(total, available)),
             suggested_target: Target::Q4KM,
         }
+    }
+
+    #[test]
+    fn download_badge_uses_weights_only_and_says_so() {
+        let gib = 1024 * 1024 * 1024;
+        let hw = |ram, vram| rustblock_core::Hardware {
+            ram_bytes: ram,
+            vram_bytes: vram,
+        };
+        let (label, _, hint) = size_fit_badge(8 * gib, hw(Some(32 * gib), Some(12 * gib)));
+        assert_eq!(label, "Fits VRAM");
+        assert!(hint.contains("not included"), "{hint}");
+        assert_eq!(
+            size_fit_badge(116 * gib, hw(Some(32 * gib), Some(12 * gib))).0,
+            "No fit"
+        );
+        assert_eq!(size_fit_badge(8 * gib, hw(None, None)).0, "Fit unknown");
     }
 
     #[test]

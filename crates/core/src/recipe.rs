@@ -281,8 +281,17 @@ pub fn select_type(
         Target::Q4KM => q4_k_m_type(meta, context),
         Target::Q5KM => q5_k_m_type(meta, context),
         Target::Q3K | Target::Q4K | Target::Q5K => {
-            if legacy_sensitive(&tensor.name) {
-                target.protected_target().unwrap_or(target)
+            // llama.cpp keeps the uniform `_S` presets uniform: only the output
+            // tensor (and a tied token embedding) moves to Q6_K, and Q4_K_S
+            // promotes the first four attention-value tensors to Q5_K.
+            if is_output_like(meta, context) {
+                Target::Q6K
+            } else if target == Target::Q4K
+                && ((meta.category.is_attention_v_like() && meta.attention_index < 4)
+                    || (meta.category == TensorCategory::FfnDown
+                        && meta.layer < context.n_ffn_down / 8))
+            {
+                Target::Q5K
             } else {
                 target
             }
@@ -299,10 +308,12 @@ pub fn use_more_bits(index: usize, total: usize) -> bool {
         return false;
     }
     let eighth = total / 8;
-    if index < eighth || index >= total.saturating_sub(eighth) {
+    // Integer division matters: llama.cpp uses `7 * n_layers / 8`, which is
+    // earlier than `total - eighth` when the layer count is not a multiple of 8.
+    if index < eighth || index >= (7 * total) / 8 {
         return true;
     }
-    index >= eighth && (index - eighth) % 3 == 2
+    (index - eighth) % 3 == 2
 }
 
 fn q2_k_type(meta: &TensorMeta, context: &RecipeContext) -> Target {
@@ -336,7 +347,9 @@ fn q3_k_m_type(meta: &TensorMeta, context: &RecipeContext) -> Target {
         };
     }
     if meta.category == TensorCategory::FfnDown {
-        return if meta.layer < context.n_layer / 16 {
+        // llama.cpp counts ffn_down tensors, not layers: for MoE models the two
+        // numbers differ by the expert count.
+        return if meta.layer < context.n_ffn_down / 16 {
             Target::Q5K
         } else {
             Target::Q4K
@@ -357,7 +370,7 @@ fn q4_k_m_type(meta: &TensorMeta, context: &RecipeContext) -> Target {
     {
         return Target::Q6K;
     }
-    if meta.category == TensorCategory::FfnDown && use_more_bits(meta.layer, context.n_layer) {
+    if meta.category == TensorCategory::FfnDown && use_more_bits(meta.layer, context.n_ffn_down) {
         return Target::Q6K;
     }
     Target::Q4K
@@ -372,7 +385,7 @@ fn q5_k_m_type(meta: &TensorMeta, context: &RecipeContext) -> Target {
     {
         return Target::Q6K;
     }
-    if meta.category == TensorCategory::FfnDown && use_more_bits(meta.layer, context.n_layer) {
+    if meta.category == TensorCategory::FfnDown && use_more_bits(meta.layer, context.n_ffn_down) {
         return Target::Q6K;
     }
     Target::Q5K
@@ -471,22 +484,6 @@ pub fn effective_tensor_types(
 /// A regex that matches exactly one tensor name, for a dump file.
 pub fn exact_name_pattern(name: &str) -> String {
     format!("^{}$", regex::escape(name))
-}
-
-fn legacy_sensitive(name: &str) -> bool {
-    if !name.ends_with(".weight") {
-        return false;
-    }
-    name.contains("output")
-        || name.contains("lm_head")
-        || name.contains("token_embd")
-        || name.contains("tok_embeddings")
-        || name.contains("embed_tokens")
-        || name.contains("embedding")
-        || name.contains("word_embeddings")
-        || name.contains("wte.weight")
-        || name.contains("attn_v")
-        || name.contains("v_proj")
 }
 
 pub fn tensor_category(name: &str) -> TensorCategory {

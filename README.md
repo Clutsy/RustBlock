@@ -35,7 +35,7 @@ Conversion is **multicore and memory-bounded**: independent tensors run in paral
 | **NVFP4** | NVIDIA 4-bit block float | No, lossy | Recent NVIDIA runtimes; experimental |
 | **Q1_0** | 1-bit | No, lossy | Extreme compression; experimental |
 
-The K-quant targets use **llama.cpp-compatible mixed recipes**. `Q4_K_M` and `Q5_K_M` promote attention values and `ffn_down` on the first/last eighth and every third tensor, exactly like `llama-quantize`; `Q3_K_M` uses the early-layer bumps; `Q2_K` uses the GQA-aware value rule. Output and tied embeddings use `Q6_K`. The `_S` targets stay uniform, with the older adaptive protection of output, embeddings and value projections. Norms, MoE routers, SSM/hybrid state tensors and other non-quantizable tensors keep their source type. This is a recipe engine, not an importance-matrix calibration. IQ formats can be read as sources, but writing them requires an importance matrix and is intentionally not offered.
+The K-quant targets use **llama.cpp-compatible mixed recipes**. `Q4_K_M` and `Q5_K_M` promote attention values and `ffn_down` on the first/last eighth and every third tensor, exactly like `llama-quantize`; `Q3_K_M` uses the early-layer bumps; `Q2_K` uses the GQA-aware value rule. Output and tied embeddings use `Q6_K`. The `_S` targets stay uniform like `llama-quantize`: only the output tensor (and a tied token embedding) moves to `Q6_K`, and `Q4_K_S` promotes the first four attention-value tensors to `Q5_K`. Norms, MoE routers, SSM/hybrid state tensors and other non-quantizable tensors keep their source type. This is a recipe engine, not an importance-matrix calibration. IQ formats can be read as sources, but writing them requires an importance matrix and is intentionally not offered.
 
 Ternary, MXFP4, NVFP4 and Q1_0 are **real native targets**, not placeholders: the output is a valid GGUF that the matching runtime can load. They are extremely lossy on a dense model. TQ1_0/TQ2_0 are meant for models trained or distilled for ternary weights; MXFP4/NVFP4 need a recent runtime; Q1_0 is a last-resort size experiment. Use `Full` verification when you want RustBlock to decode the output again and compare it.
 
@@ -62,11 +62,11 @@ Both use the same 2-bit ternary codec. RustBlock splits each 128-value block int
 - **Fit at a glance.** Each queued file shows a green/yellow/red RAM/VRAM verdict at 4096 tokens; hover for weights, KV cache and overhead. **Non so cosa scegliere** runs the budget planner on the largest queued model and keeps lossless Reblock for PQ2_0.
 - Output next to each input or in a custom folder, with overwrite protection and duplicate-path checks.
 - Choose `Off`, `Structure` or `Full` verification per batch; `Structure` is the default. The CLI exposes the same `--verify none|structure|full` levels for scripted checks.
-- **Discover** view: opens on the most downloaded GGUF repositories, then search Hugging Face, paste a full `huggingface.co/author/model` link, sort by downloads, likes or update time, and open a repository to see its downloadable GGUF files and sizes.
+- **Discover** view: opens on the most downloaded GGUF repositories, then search Hugging Face, paste a full `huggingface.co/author/model` link, sort by downloads, likes or update time, and open a repository to see its downloadable GGUF files and sizes. Every file row shows a fit verdict computed **before the download** from the published weight size plus 512 MiB of runtime overhead; the tooltip states that the KV cache is not included because it needs the model header.
 - Downloads use a transfer panel with byte counts, percentage, smoothed speed, ETA, cancellation and resumable `.part` files. The panel stays visible on both Convert and Discover, and finished downloads are added to Convert automatically.
 - Files whose names indicate an existing quantization (`Q4_K_M`, `Q8_0`, `IQ…`, `TQ…`, `MXFP4`, …) are marked **already quantized** before download. After conversion starts, the tensor types are checked as well. Converting a quantized model to another quantized format requires a confirmation, because it compounds the loss; a virgin F16/BF16 release is the better source.
 - **Supported standalone GGUF models can be downloaded.** Non-GGUF files are hidden; importance matrices, adapters, split shards and PTQ1_0 containers are rejected. Vision projectors are handled by a separate **Projector** action and never enter the conversion queue. The download function repeats the check before the network request, then re-opens the finished file, verifies its tensor types and deletes it if the native engine cannot decode it. Files already present are shown as cached, and the cache panel can enforce a GiB quota by removing the oldest model artifacts.
-- **Frameless custom chrome.** The supplied RustBlock wordmark is both the brand and a subtle title-bar background; the gear mark is the app icon. Minimize and close are inside the app, the window can be dragged from the bar or the wordmark and resized from its edges. Double-click the bar to maximize.
+- **Frameless custom chrome.** The RustBlock wordmark appears once, at the left of the title bar, as the brand; the square gear mark is the app icon and a large, faint backdrop behind the content of the active view. Minimize and close are inside the app, the window can be dragged from the bar or the wordmark and resized from its edges. Double-click the bar to maximize.
 - The interface is deliberately minimal: dark graphite, neutral steel and square controls, with one action per view. The log panel is collapsed by default and opens with `Ctrl+L` or the Log button; it keeps the last 500 entries.
 
 Network access is used **only** when you search or download from Hugging Face. Local conversion works offline.
@@ -247,6 +247,13 @@ Validated on 2026-11-07 on the development machine (Windows, 8C/16T, 31.8 GB RAM
 - Prism 2B PQ2_0 -> Q2_0: the reblocked file loaded in llama.cpp and generated the same prefix as the original file in the Prism fork.
 - GUI: 0.22-0.43 s from process start to a visible client window over five runs; the initial 1120x680 window fits the 1366x768 work area. Twelve primary/status color pairs pass WCAG AA (>= 4.5:1).
 
+Validated on 2026-11-19 on Ubuntu 24.04 (2 vCPU) against the pinned CPU build llama.cpp **b12359** (commit b1b770d90):
+
+- **Recipe parity:** the differential harness (`crates/core/tests/quantize_parity.rs`) passes for `Q2_K`, `Q3_K_S/M`, `Q4_K_S/M`, `Q5_K_S/M`, `Q6_K` and `Q8_0` on an eight-layer F16 fixture: the per-tensor type map is identical to `llama-quantize`. Header bytes, offsets and tensor payloads are not compared, so this is type-map parity, not a byte-identical claim.
+- **Runtime:** stories15M converted F16 -> `Q4_K_M` (57 tensors, 93.11 MiB -> 19.32 MiB in 2.0 s) loads in `llama-cli` b12359 and generates coherent text.
+- **Resumable download:** `stories15M.gguf` (98,357,920 B) was interrupted at 31% with `stories15M.part` on disk, then resumed (`resumed: true`, first progress at byte 31,377,790), finished at the full size with SHA-256 `61b50d45…f3704a`, identical to a clean download and to the Hub `x-linked-etag`.
+- **Split/merge and metadata:** the same model was split into three 40 MiB shards and merged back; the result is byte-identical to the original (SHA-256 `61b50d45…f3704a`, confirmed by `hash --expected`). `meta --validate` passes on the file.
+
 Not validated in this environment: 7B/70B runtime, the 10-model fit comparison, numerical MTP/Hadamard execution, a full tensor-by-tensor AWQ comparison, and the 5-person usability study. These remain open in the roadmap; no large model artifacts are kept in the repository.
 
 ## Tests
@@ -254,6 +261,15 @@ Not validated in this environment: 7B/70B runtime, the 10-model fit comparison, 
 ```bash
 cargo test --workspace
 ```
+
+The `llama-quantize` differential parity test is ignored by default because it needs an external pinned build:
+
+```bash
+RUSTBLOCK_LLAMA_QUANTIZE=/path/to/llama-quantize \
+    cargo test -p rustblock-core --test quantize_parity -- --ignored
+```
+
+It quantizes a synthetic F16 GGUF with representative tensor names and compares the per-tensor type map with llama.cpp. Without the variable it reports a skip; the pinned reference build is not bundled.
 
 Coverage includes lossless PQ2_0 reblocking, exact F16 conversion, all target conversions, the Q2_K/Q3_K_M/Q4_K_M/Q5_K_M recipes, regex and file overrides, MoE/SSM protection, tied embeddings, shape fallback, requantization opt-in, mixed-preset end-to-end metadata, pure ternary output, parallel large-tensor conversion, alignment preservation, source immutability on error, dry-run, overwrite protection, download gating/validation, local HTTP range/hash tests, projector handling, cache quota trimming, budget fallback (including no-hardware and no-fit cases), exact split/merge SHA-256, sliding/MLA/SSM fit estimation, fit-badge classification, Jinja compilation/metadata validation, chat-template rendering with a JSON context, JSON-lines batch download events, native dense/MoE safetensors-to-GGUF conversion, SentencePiece vocabularies, E4M3FN boundary values, native AWQ/FP8 dequantization, border keying of the supplied wordmark, and WCAG AA contrast for the GUI palette.
 

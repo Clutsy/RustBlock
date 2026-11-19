@@ -30,11 +30,11 @@ pub fn install(ctx: &egui::Context) {
 
     ctx.all_styles_mut(|style| {
         style.visuals = visuals();
-        style.spacing.item_spacing = Vec2::new(10.0, 8.0);
-        style.spacing.button_padding = Vec2::new(12.0, 7.0);
-        style.spacing.interact_size = Vec2::new(38.0, 30.0);
+        style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+        style.spacing.button_padding = Vec2::new(10.0, 6.0);
+        style.spacing.interact_size = Vec2::new(36.0, 28.0);
         style.spacing.menu_margin = egui::Margin::same(6);
-        style.animation_time = 0.10;
+        style.animation_time = 0.12;
         style
             .text_styles
             .insert(TextStyle::Heading, FontId::proportional(24.0));
@@ -61,8 +61,8 @@ fn visuals() -> egui::Visuals {
     v.faint_bg_color = PANEL_2;
     v.code_bg_color = Color32::from_rgb(26, 31, 35);
     v.window_stroke = Stroke::new(1.0, BORDER);
-    v.window_corner_radius = CornerRadius::same(6);
-    v.menu_corner_radius = CornerRadius::same(0);
+    v.window_corner_radius = CornerRadius::same(8);
+    v.menu_corner_radius = CornerRadius::same(6);
     v.window_shadow = egui::epaint::Shadow::NONE;
     v.popup_shadow = egui::epaint::Shadow::NONE;
     v.selection.bg_fill = ACCENT.gamma_multiply(0.35);
@@ -72,7 +72,7 @@ fn visuals() -> egui::Visuals {
     v.error_fg_color = ERROR;
     v.override_text_color = Some(TEXT);
 
-    let corner = CornerRadius::same(4);
+    let corner = CornerRadius::same(6);
     v.widgets.noninteractive.bg_fill = PANEL;
     v.widgets.noninteractive.weak_bg_fill = PANEL;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);

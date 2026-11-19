@@ -24,9 +24,9 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 | 1 — Motore di ricette | 1–8 | ✅ | Preset misti, override, protezioni, CLI/GUI e test |
 | 2 — imatrix | 9–11 | ◐ | Parser legacy/GGUF, override pesati, CLI e generatore esterno; fixture reali non disponibili |
 | 3 — Qualità misurabile | 12–15 | ◐ | RMSE/SNR/coseno, ranking, report JSON/CSV, planner budget corretto nei fallback e KLD via `llama-perplexity`; test su 7B e 10 modelli non eseguito |
-| 4 — Operazioni GGUF | 16–18 | ◐ | Split/merge con manifest, round-trip SHA-256, metadati, prune, diff, SHA-256/LFS, compilazione Jinja, rendering del template con contesto JSON e validazione rope |
+| 4 — Operazioni GGUF | 16–18 | ◐ | Split/merge con manifest, round-trip SHA-256 verificato su shard reali, metadati, prune, diff, SHA-256/LFS, compilazione Jinja, rendering del template con contesto JSON e validazione rope |
 | 5 — Stima fit RAM/VRAM | 19–20 | ◐ | Pesi, KV GQA per-layer, sliding window, MLA e stato SSM, hardware, badge fit verde/giallo/rosso e suggerimento a budget; confronto reale con llmvram/hf-mem non eseguito |
-| 6 — Discover e installazione | 21–24 | ◐ | CLI download 16 range/file e 8 file, eventi JSON-lines, mmproj, cache con quota, Ollama/LM Studio hand-off, quick test; GUI usa download parallelo, projector esplicito, hash LFS e riuso cache locale |
+| 6 — Discover e installazione | 21–24 | ◐ | CLI download 16 range/file e 8 file, eventi JSON-lines, mmproj, cache con quota, Ollama/LM Studio hand-off, quick test; GUI usa download parallelo, projector esplicito, hash LFS e riuso cache locale; resume reale verificato con hash della Hub |
 | 7 — Famiglia Prism | 25–27 | ◐ | Reblock, auto-detect Q2_0, PTQ1 rifiutato e metadati `prism.*` preservati byte per byte; reblock reale 2B caricato, ma verifica numerica MTP/Hadamard non eseguita |
 | 8 — safetensors → GGUF | tardiva | ◐ | Bridge esterno; dequant nativo FP8/AWQ; conversione streaming per LLaMA/Mistral/Mixtral/Qwen2/Qwen3 dense e MoE con BPE o SentencePiece, verificata con llama.cpp; confronto AWQ tensore-per-tensore aperto |
 | 5.2 — Guide in-app | trasversale | ◐ | Help F1, popover “?” sui parametri, badge fit verde/giallo/rosso, suggerimento a budget, tooltip; test con 5 utenti non eseguito |
@@ -48,13 +48,15 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 - Requantizzazione non silenziosa: default rifiutato, `--allow-requantize` esplicito e conferma nella GUI.
 - CLI con `--tensor-type`, `--tensor-type-file`, `--dump-tensor-types`, `--allow-requantize`.
 - GUI con griglia a cinque colonne, preset visibili e default `Q4_K_M` per i modelli float.
+- Ricette riallineate a `llama-quant.cpp` b12359: `use_more_bits` con divisione intera `7*n/8` (prima l'ultimo ottavo era `n - n/8`), preset `_S` uniformi (solo output/tied embedding a `Q6_K`, `Q4_K_S` che promuove le prime quattro `attn_v` a `Q5_K`), regole `ffn_down` basate sul conteggio dei tensori `ffn_down` (corretto anche per i MoE) e `Q4_K_S` con la soglia `layer < n_ffn_down/8`.
+- Harness differenziale `quantize_parity` e job CI `parity` contro la build pinnata b12359.
 - Test golden, override, MoE/SSM, embedding legati, fallback shape, parser, requantizzazione ed end-to-end.
 - README e screenshot aggiornati.
 
 ### Limiti noti
 
-- La parità **byte-per-byte** con `llama-quantize` non è stata verificata con un confronto reale. La copertura attuale riguarda la mappa dei tipi, le regole della ricetta, i metadati e i fallback.
-- Non esiste ancora una build di riferimento pinnata di `llama-quantize` in CI.
+- La parità **byte-per-byte** dell'output non è verificata: l'harness confronta la mappa dei tipi per tensore, non header, offset e payload. Il gate dichiarato nella metrica di successo (§7) resta quindi aperto su quel punto.
+- **Evidenza 2026-11-19:** l'harness (`crates/core/tests/quantize_parity.rs`) è stato eseguito contro la build pinnata llama.cpp **b12359** (commit b1b770d90) e passa per `Q2_K`, `Q3_K_S/M`, `Q4_K_S/M`, `Q5_K_S/M`, `Q6_K` e `Q8_0`: la mappa dei tipi è identica a `llama-quantize` su un fixture F16 di 8 layer. Il job CI `parity` scarica la stessa release e ripete il confronto.
 - Le fasi successive non sono incluse nella Fase 1.
 
 ---
@@ -136,7 +138,8 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 
 **Stato:** ◐ parziale; split/merge con manifest, verifica SHA-256, comandi operativi, compilazione Jinja con minijinja, validazione rope/chat-template e rendering del template con un contesto JSON presenti; il controllo delle coppie rope contro il runtime effettivo resta esterno.
 **Già presente:** parser GGUF, reblock PQ2_0 → Q2_0, split/merge con header originale, metadati, prune, diff, SHA-256/LFS, round-trip byte-identico verificato dal manifest, `meta --validate` con compilazione Jinja e `meta --render-template` con contesto JSON.
-**Assente:** controllo delle coppie rope contro il runtime effettivo e prova con shard reali di modello.
+**Evidenza 2026-11-19:** un modello reale (`stories15M.gguf`, 98.357.920 B) è stato diviso in 3 shard da 40 MiB con `split` e ricomposto con `merge`; il file risultante ha SHA-256 `61b50d45…f3704a`, identico byte per byte all'originale, e `hash --expected` lo conferma. `meta --validate` passa sullo stesso file.  
+**Assente:** controllo delle coppie rope contro il runtime effettivo.
 
 ### Obiettivi
 
@@ -171,7 +174,7 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 ## Fase 5 — Stima del fit RAM/VRAM (settimane 19–20)
 
 **Stato:** ◐ parziale; pesi, KV per-layer GQA, sliding window, MLA e stato SSM presenti; confronto reale con llmvram/hf-mem e 70B non eseguito.
-**Aggiornamento:** la GUI mostra un badge fit verde/giallo/rosso con dettaglio di pesi, KV cache e overhead; “Non so cosa scegliere” usa il planner a budget sul modello più grande in coda e mantiene il reblock lossless per PQ2_0. Restano il confronto su 10 modelli e il caso 70B su 24 GB, che richiedono file reali.
+**Aggiornamento:** la GUI mostra un badge fit verde/giallo/rosso con dettaglio di pesi, KV cache e overhead; “Non so cosa scegliere” usa il planner a budget sul modello più grande in coda e mantiene il reblock lossless per PQ2_0. **Discover mostra un badge calcolato prima del download** dai byte pubblicati + 512 MiB di overhead: il KV cache non è calcolabile senza header, quindi è escluso e dichiarato nel tooltip, e con hardware sconosciuto il badge dice “Fit unknown”. Restano il confronto su 10 modelli, il caso 70B su 24 GB e il badge completo (con KV) nel dettaglio repo, che richiedono file reali.
 **Dipendenze:** Fase 4 per i metadati di architettura; rilevamento hardware locale.
 
 ### Obiettivi
@@ -195,7 +198,7 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 - Confronto con tool esistenti su 10 modelli: errore inferiore al 5%.
 - La stima per un modello 70B su GPU da 24 GB è coerente con la realtà.
 - Ogni stima riporta i parametri usati (contesto, cache, overhead) e non mostra un badge definitivo se l'hardware è sconosciuto.
-- Il badge Discover viene calcolato prima del download.
+- Il badge Discover viene calcolato prima del download. *(implementato sui soli pesi: il KV richiede l'header, assente prima dello scaricamento)*
 
 ### Note
 
@@ -208,7 +211,8 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 
 **Stato:** ◐ parziale  
 **Già presente:** Discover, ricerca, repo detail, download parallelo 16 range dalla GUI e dalla CLI, resume `.part`, annullamento, validazione GGUF, mmproj CLI e GUI, hash LFS/SHA-256 dalla GUI, rilevamento dei file già presenti, indice cache con quota e poda selettiva (`cache` CLI e GUI), installazione LM Studio/Ollama e quick test, download headless con stream JSON-lines (`download --events`, `download-many --events`).  
-**Assente:** installazione verificata su un ambiente Ollama/LM Studio reale e prova di download interrotto/ripreso contro un repository esterno; non sono stati eseguiti qui.
+**Evidenza 2026-11-19:** download interrotto e ripreso contro `ggml-org/models-moved` (`stories15M.gguf`, 98.357.920 B): interruzione al 31% con `.part` su disco, ripresa da byte 31.377.790 (`resumed: true`), dimensione finale completa e SHA-256 identico al download pulito e a `x-linked-etag` della Hub.  
+**Assente:** installazione verificata su un ambiente Ollama/LM Studio reale, che richiede quelle applicazioni installate.
 
 ### Obiettivi
 
@@ -382,7 +386,7 @@ Il match bit-identico va misurato con una build di riferimento fissata, non dedo
 
 ## 8. Ordine di lavoro e gate
 
-1. **Gate correttezza:** congelare una build di riferimento di `llama-quantize` (per esempio b8999 o successiva) e aggiungere il test differenziale in CI.
+1. **Gate correttezza:** ✅ build di riferimento congelata a llama.cpp **b12359** (commit b1b770d90, asset `llama-b12359-bin-ubuntu-x64.tar.gz`) e test differenziale eseguito con esito positivo il 2026-11-19. Il job CI `parity` in `.github/workflows/ci.yml` scarica la stessa release e ripete il confronto. Resta fuori solo la parità byte-per-byte dell'output.
 2. **Fase 2:** parser imatrix, pesi per `Q2_K`/`Q3_K`, generazione esterna opzionale; la parte IQ resta bloccata finché non esiste un encoder IQ.
 3. **Fase 4:** split/merge e metadati, perché sbloccano shard, hash e parte della Fase 6.
 4. **Fase 3:** metriche e budget, riusando la stima fit della Fase 5.
