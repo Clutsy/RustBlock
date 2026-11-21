@@ -391,11 +391,12 @@ fn inspect(file: &Path, as_json: bool) -> Result<()> {
     println!(
         "native:    {}",
         match (native_convert, ptq1 > 0) {
-            (true, _) => {
-                "yes (19 targets: float, Q4_0..Q6_K, TQ1_0/TQ2_0, MXFP4/NVFP4, Q1_0)"
-            }
-            (false, true) => "no (PTQ1_0 is not supported)",
-            (false, false) => "no (file contains an unsupported tensor type)",
+            (true, _) => format!(
+                "yes ({} targets: float, legacy block quants, K-quants, mixed K-quant presets, TQ1_0/TQ2_0, MXFP4/NVFP4, Q1_0)",
+                Target::ALL.len() - 1 // `Reblock` is not a native target
+            ),
+            (false, true) => "no (PTQ1_0 is not supported)".to_string(),
+            (false, false) => "no (file contains an unsupported tensor type)".to_string(),
         }
     );
     println!("types:");

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rustblock_core::{
-    source_supported, type_name, FitEstimate, FitRequest, Gguf, Hardware, Phase, Report, Target,
-    VerifyMode, TY_PTQ1_0, TY_Q2_0,
+    estimate_fit, source_supported, type_name, FitEstimate, FitRequest, Gguf, Hardware, Phase,
+    Report, Target, VerifyMode, TY_PTQ1_0, TY_Q2_0,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +351,80 @@ impl Job {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.input.display().to_string())
+    }
+
+    /// The output path the job will produce (or produced), given the mode.
+    pub fn planned_output(&self, mode: &OutputMode) -> PathBuf {
+        output_path(&self.input, self.target, mode)
+    }
+
+    /// The output path of a finished job, if it is done and the file exists.
+    pub fn done_output(&self) -> Option<PathBuf> {
+        match &self.status {
+            JobStatus::Done { report, .. } => report.output.exists().then(|| report.output.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// A loaded GGUF for the inspector view: facts, metadata, tensor histogram
+/// and the memory estimate. `open` returns `None` for unreadable files.
+#[derive(Debug, Clone)]
+pub struct InspectorData {
+    pub path: PathBuf,
+    pub version: u32,
+    pub file_len: u64,
+    pub alignment: u64,
+    pub data_start: u64,
+    pub tensors: usize,
+    pub pq2: usize,
+    pub ptq1: usize,
+    pub file_type: Option<u32>,
+    /// Up to 12 `(key, value)` metadata entries, in header order.
+    pub metadata: Vec<(String, String)>,
+    /// `(type name, count, bytes on disk)` sorted by disk size, biggest first.
+    pub histogram: Vec<(String, usize, u64)>,
+    pub weights_bytes: u64,
+    pub fit: Option<FitEstimate>,
+}
+
+impl InspectorData {
+    pub fn open(path: &Path) -> Option<Self> {
+        let g = Gguf::open(path).ok()?;
+        let fit = estimate_fit(
+            path,
+            FitRequest {
+                hardware: Some(Hardware::default()),
+                ..FitRequest::default()
+            },
+        )
+        .ok();
+        let mut by_type: BTreeMap<u32, (usize, u64)> = BTreeMap::new();
+        for tensor in &g.tensors {
+            let entry = by_type.entry(tensor.ty).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += tensor.size.unwrap_or(0);
+        }
+        let mut histogram: Vec<(String, usize, u64)> = by_type
+            .into_iter()
+            .map(|(ty, (count, bytes))| (type_name(ty).to_string(), count, bytes))
+            .collect();
+        histogram.sort_by_key(|(_, _, bytes)| std::cmp::Reverse(*bytes));
+        Some(Self {
+            path: path.to_path_buf(),
+            version: g.version,
+            file_len: g.file_len,
+            alignment: g.alignment,
+            data_start: g.data_start,
+            tensors: g.tensors.len(),
+            pq2: g.pq2_count(),
+            ptq1: g.tensors.iter().filter(|t| t.ty == TY_PTQ1_0).count(),
+            file_type: g.file_type,
+            metadata: g.metadata_summary(12),
+            histogram,
+            weights_bytes: g.tensors.iter().filter_map(|t| t.size).sum(),
+            fit,
+        })
     }
 }
 

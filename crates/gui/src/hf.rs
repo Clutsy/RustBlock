@@ -244,6 +244,8 @@ pub struct HfModel {
     pub gated: bool,
     pub sha: String,
     pub gguf_files: usize,
+    /// License declared on the Hub, when the API exposes one.
+    pub license: Option<String>,
 }
 
 impl HfModel {
@@ -409,6 +411,7 @@ fn parse_model(item: &Value) -> Option<HfModel> {
             .unwrap_or("main")
             .to_string(),
         gguf_files,
+        license: str_field(item, "license").map(str::to_string),
     })
 }
 

@@ -384,6 +384,63 @@ impl Gguf {
     pub fn tensor_data_offset(&self, t: &TensorInfo) -> u64 {
         self.data_start + t.offset
     }
+
+    /// Decoded `(key, value)` pairs for the first `limit` metadata entries,
+    /// in header order. Values that cannot be decoded show their type id.
+    pub fn metadata_summary(&self, limit: usize) -> Vec<(String, String)> {
+        self.kv
+            .iter()
+            .take(limit)
+            .map(|entry| {
+                let value = self
+                    .header
+                    .get(entry.value_pos as usize..entry.value_end as usize)
+                    .map(|bytes| metadata_display(bytes, entry.value_type))
+                    .unwrap_or_else(|| format!("<type {}>", entry.value_type));
+                (entry.key.clone(), value)
+            })
+            .collect()
+    }
+}
+
+fn metadata_display(bytes: &[u8], ty: u32) -> String {
+    match ty {
+        8 => {
+            // GGUF string: u64 length + payload.
+            if bytes.len() >= 8 {
+                let len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+                String::from_utf8_lossy(&bytes[8..(8 + len).min(bytes.len())]).into_owned()
+            } else {
+                String::new()
+            }
+        }
+        9 => {
+            // GGUF array: u32 element type + u64 count.
+            if bytes.len() >= 12 {
+                let element = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+                let count = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+                format!("array[{count}] of type {element}")
+            } else {
+                "array".to_string()
+            }
+        }
+        _ => {
+            let mut buf = [0u8; 8];
+            let take = fixed_value_size(ty).unwrap_or(0) as usize;
+            let take = take.min(bytes.len()).min(8);
+            buf[..take].copy_from_slice(&bytes[..take]);
+            match ty {
+                0..=1 => format!("{}", buf[0]),
+                7 => if buf[0] != 0 { "true" } else { "false" }.to_string(),
+                2..=3 => format!("{}", u16::from_le_bytes([buf[0], buf[1]])),
+                4 => format!("{}", u32::from_le_bytes(buf[..4].try_into().unwrap())),
+                5 => format!("{}", i32::from_le_bytes(buf[..4].try_into().unwrap())),
+                6 => format!("{}", f32::from_le_bytes(buf[..4].try_into().unwrap())),
+                10..=12 => format!("{}", u64::from_le_bytes(buf[..8].try_into().unwrap())),
+                _ => format!("<type {ty}>"),
+            }
+        }
+    }
 }
 
 /// Aligns `value` up to the next multiple of `alignment`.

@@ -203,19 +203,56 @@ struct HeadInfo {
 }
 
 fn request_head(url: &str, options: &DownloadOptions) -> Result<HeadInfo, DownloadError> {
+    if let Some(head) = try_head(url, options) {
+        return Ok(head);
+    }
+    probe_range_head(url, options)
+}
+
+fn try_head(url: &str, options: &DownloadOptions) -> Option<HeadInfo> {
     let mut request = ureq::head(url).set("User-Agent", "RustBlock/0.1");
     if let Some(token) = &options.token {
         request = request.set("Authorization", &format!("Bearer {token}"));
     }
-    let response = request
-        .call()
-        .map_err(|error| DownloadError::Http(error.to_string()))?;
+    let response = request.call().ok()?;
     let ranges = response
         .header("accept-ranges")
         .is_some_and(|value| value.to_ascii_lowercase().contains("bytes"));
     let length = response
         .header("content-length")
         .and_then(|value| value.parse().ok());
+    Some(HeadInfo { length, ranges })
+}
+
+/// Some servers reject HEAD or answer non-2xx. A one-byte `Range` GET still
+/// reports the total through `Content-Range`; when ranges are unsupported the
+/// server answers 200 and the full size comes from `Content-Length`.
+fn probe_range_head(url: &str, options: &DownloadOptions) -> Result<HeadInfo, DownloadError> {
+    let mut request = ureq::get(url)
+        .set("User-Agent", "RustBlock/0.1")
+        .set("Range", "bytes=0-0");
+    if let Some(token) = &options.token {
+        request = request.set("Authorization", &format!("Bearer {token}"));
+    }
+    let response = request
+        .call()
+        .map_err(|error| DownloadError::Http(error.to_string()))?;
+    let status = response.status();
+    let length: Option<u64> = if status == 206 {
+        response
+            .header("content-range")
+            .and_then(|value| value.rsplit('/').next())
+            .and_then(|value| value.trim().parse().ok())
+    } else {
+        response
+            .header("content-length")
+            .and_then(|value| value.parse().ok())
+    };
+    let ranges = status == 206
+        || response
+            .header("accept-ranges")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("bytes"));
+    drop(response);
     Ok(HeadInfo { length, ranges })
 }
 
@@ -670,5 +707,97 @@ mod tests {
         assert!(results.iter().all(Result::is_ok));
         assert_eq!(std::fs::read(&jobs[0].1).unwrap(), data);
         assert_eq!(std::fs::read(&jobs[1].1).unwrap(), data);
+    }
+
+    fn serve_range_only(mut stream: TcpStream, data: &[u8]) {
+        let mut buffer = [0u8; 8192];
+        let mut request = String::new();
+        loop {
+            let Ok(read) = stream.read(&mut buffer) else {
+                return;
+            };
+            if read == 0 {
+                break;
+            }
+            request.push_str(&String::from_utf8_lossy(&buffer[..read]));
+            if request.contains("\r\n\r\n") || request.len() >= 8192 {
+                break;
+            }
+        }
+        let first = request.lines().next().unwrap_or_default();
+        if first.starts_with("HEAD ") {
+            let _ = stream.write_all(
+                b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            return;
+        }
+        let range = request.lines().find_map(|line| {
+            line.strip_prefix("Range: bytes=")
+                .and_then(|value| value.split_once('-'))
+        });
+        let (start, end) = range
+            .and_then(|(start, end)| {
+                let start = start.parse::<usize>().ok()?;
+                let end = end.parse::<usize>().ok()?;
+                Some((start, end.min(data.len().saturating_sub(1))))
+            })
+            .unwrap_or((0, data.len().saturating_sub(1)));
+        let body = &data[start..=end];
+        let response = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+            body.len(),
+            start,
+            end,
+            data.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(body);
+    }
+
+    fn range_only_server(data: Vec<u8>) -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let data = Arc::new(data);
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => serve_range_only(stream, &data),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{address}/model.gguf"), stop, handle)
+    }
+
+    #[test]
+    fn head_failure_falls_back_to_a_range_probe() {
+        let data = (0..262_144u32)
+            .map(|value| (value % 251) as u8)
+            .collect::<Vec<_>>();
+        let (url, stop, handle) = range_only_server(data.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("model.gguf");
+        let cancel = AtomicBool::new(false);
+        let report = download_url(
+            &url,
+            &destination,
+            &DownloadOptions {
+                connections: 4,
+                token: None,
+                ..DownloadOptions::default()
+            },
+            &cancel,
+        )
+        .unwrap();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        assert_eq!(report.bytes, data.len() as u64);
+        assert_eq!(std::fs::read(&destination).unwrap(), data);
     }
 }

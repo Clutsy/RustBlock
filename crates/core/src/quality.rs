@@ -225,6 +225,17 @@ fn decode(
     })
 }
 
+/// Quote and escape a text field for CSV. Tensor names come from model files
+/// and may contain commas, quotes or newlines; an unescaped field would split
+/// rows or corrupt the report.
+fn csv_field(text: &str) -> String {
+    if text.contains(',') || text.contains('"') || text.contains('\n') || text.contains('\r') {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text.to_string()
+    }
+}
+
 /// Write the per-tensor report as CSV without pulling a CSV dependency into
 /// the core library. The CLI passes the resulting string to stdout/file.
 pub fn to_csv(report: &QualityReport) -> String {
@@ -234,9 +245,9 @@ pub fn to_csv(report: &QualityReport) -> String {
     for tensor in &report.tensors {
         out.push_str(&format!(
             "{},{},{},{},{:.8},{:.8},{:.8},{}\n",
-            tensor.name,
-            tensor.source_type,
-            tensor.output_type,
+            csv_field(&tensor.name),
+            csv_field(&tensor.source_type),
+            csv_field(&tensor.output_type),
             tensor.elements,
             tensor.rmse,
             tensor.snr_db,
@@ -248,6 +259,46 @@ pub fn to_csv(report: &QualityReport) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_fields_escape_commas_quotes_and_newlines() {
+        assert_eq!(csv_field("plain.weight"), "plain.weight");
+        assert_eq!(csv_field("a,b.weight"), "\"a,b.weight\"");
+        assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_field("a\nb"), "\"a\nb\"");
+    }
+
+    #[test]
+    fn to_csv_keeps_rows_for_tensor_names_with_commas() {
+        let report = QualityReport {
+            source: "a.gguf".into(),
+            output: "b.gguf".into(),
+            tensors: vec![TensorQuality {
+                name: "blk.0.a, b.weight".into(),
+                source_type: "F32".into(),
+                output_type: "F16".into(),
+                elements: 8,
+                rmse: 0.0,
+                snr_db: f64::INFINITY,
+                cosine: 1.0,
+                weighted_snr_db: None,
+            }],
+            total_elements: 8,
+            mean_rmse: 0.0,
+            mean_snr_db: f64::INFINITY,
+            mean_cosine: 1.0,
+            weighted_snr_db: None,
+        };
+        let csv = to_csv(&report);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with("\"blk.0.a, b.weight\",F32,F16,8,"));
+    }
 }
 
 #[derive(Debug, Clone)]

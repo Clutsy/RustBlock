@@ -453,6 +453,7 @@ pub fn metadata_set(
     value: &str,
     force: bool,
 ) -> Result<(), OpsError> {
+    refuse_same_path(input, output)?;
     let content = content(input)?;
     let parsed = serde_json::from_str::<serde_json::Value>(value)
         .ok()
@@ -834,6 +835,7 @@ fn close_jinja_block(
 }
 
 pub fn prune(input: &Path, output: &Path, pattern: &str, force: bool) -> Result<usize, OpsError> {
+    refuse_same_path(input, output)?;
     let content = content(input)?;
     let regex =
         regex::Regex::new(pattern).map_err(|error| OpsError::Metadata(error.to_string()))?;
@@ -978,5 +980,91 @@ fn format_value(value: &MetadataValue) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+    }
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Writing in place would let `finish` delete the very file it is writing
+/// from; that is data loss, so it is refused up front.
+fn refuse_same_path(input: &Path, output: &Path) -> Result<(), OpsError> {
+    if same_path(input, output) {
+        return Err(OpsError::Write(format!(
+            "input and output are the same file: {}",
+            output.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pmetal_gguf::{GgufBuilder, MetadataValue};
+
+    fn tiny_model(path: &Path) {
+        let mut builder = GgufBuilder::new();
+        builder.add_f32_tensor("w.weight", vec![4], vec![1.0, 2.0, 3.0, 4.0]);
+        builder.add_metadata(
+            "general.architecture",
+            MetadataValue::String("llama".into()),
+        );
+        let mut file = File::create(path).unwrap();
+        builder.write(&mut file).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn metadata_set_refuses_same_input_and_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        tiny_model(&model);
+        let before = sha256_file(&model).unwrap();
+        let error = metadata_set(&model, &model, "tokenizer.chat_template", "\"x\"", true)
+            .expect_err("same input and output must be rejected");
+        assert!(error.to_string().contains("same file"), "{error}");
+        assert_eq!(sha256_file(&model).unwrap(), before);
+    }
+
+    #[test]
+    fn prune_refuses_same_input_and_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        tiny_model(&model);
+        let before = sha256_file(&model).unwrap();
+        let error =
+            prune(&model, &model, "w.*", true).expect_err("same input and output must be rejected");
+        assert!(error.to_string().contains("same file"), "{error}");
+        assert_eq!(sha256_file(&model).unwrap(), before);
+    }
+
+    #[test]
+    fn metadata_set_to_a_new_file_preserves_the_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        tiny_model(&model);
+        let before = sha256_file(&model).unwrap();
+        let output = dir.path().join("model-meta.gguf");
+        metadata_set(
+            &model,
+            &output,
+            "tokenizer.chat_template",
+            "\"hello\"",
+            true,
+        )
+        .unwrap();
+        assert_eq!(sha256_file(&model).unwrap(), before);
+        assert!(output.exists());
+        assert_eq!(
+            metadata_get(&output, "tokenizer.chat_template")
+                .unwrap()
+                .as_deref(),
+            Some("hello")
+        );
     }
 }

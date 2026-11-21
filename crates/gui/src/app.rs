@@ -1,29 +1,52 @@
-//! RustBlock application state and UI.
+//! RustBlock — GUI: queue manager (Convert), discovery (Discover), GGUF inspector.
+//!
+//! Rewritten from zero (2026-11-21) with a three-tab layout:
+//!
+//! - **Convert**: the job queue with per-job details, inline progress,
+//!   batch progress, and a benchmark banner (llama-bench integration).
+//! - **Discover**: Hugging Face search with license display and richer cards.
+//! - **Inspector**: facts, metadata and tensor histogram of a local GGUF.
+//!
+//! The activity log has per-level filters and a level/level-count header.
+//! Colors, chrome and the general language follow [`crate::theme`].
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
 use crate::hf::{self, HfEvent, HfFile, HfModel, HfSort};
 use crate::model::{
     analyze, clear_partial_files, human_bytes, human_duration, human_speed, looks_quantized_name,
-    output_path, path_key, shorten, FileKind, Job, JobStatus, OutputMode, RunState, Settings,
-    VerifyKind,
+    output_path, path_key, shorten, FileKind, InspectorData, Job, JobStatus, OutputMode, RunState,
+    Settings, VerifyKind,
 };
 use crate::theme::{
-    self, ACCENT, BG, BORDER, ERROR, INFO, INK, MUTED, OK, PANEL, PANEL_2, PANEL_3, STEEL_LIGHT,
-    TEXT, WARN,
+    self, ACCENT, BG, BORDER, ERROR, INFO, INK, MUTED, OK, PANEL, PANEL_2, PANEL_3, STEEL,
+    STEEL_LIGHT, TEXT, WARN,
 };
 use crate::worker::{self, Event, WorkItem, WorkKind};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Id, LayerId, Layout, Margin, Order,
     ProgressBar, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
 };
+use rustblock_core::imatrix::find_tool;
 use rustblock_core::{
     cache_stats, plan_budget, trim_cache, BudgetRequest, FitEstimate, Phase, Target, VerifyMode,
 };
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+
+/// The three views of the new GUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Convert,
+    Discover,
+    Inspector,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogLevel {
     Info,
@@ -31,6 +54,46 @@ enum LogLevel {
     Warn,
     Error,
 }
+
+#[derive(Debug, Clone)]
+struct LogEntry {
+    level: LogLevel,
+    text: String,
+}
+
+impl LogLevel {
+    fn index(self) -> usize {
+        match self {
+            LogLevel::Info => 0,
+            LogLevel::Ok => 1,
+            LogLevel::Warn => 2,
+            LogLevel::Error => 3,
+        }
+    }
+    fn color(self) -> Color32 {
+        match self {
+            LogLevel::Info => MUTED,
+            LogLevel::Ok => OK,
+            LogLevel::Warn => WARN,
+            LogLevel::Error => ERROR,
+        }
+    }
+    fn short(self) -> &'static str {
+        match self {
+            LogLevel::Info => "I",
+            LogLevel::Ok => "✓",
+            LogLevel::Warn => "⚠",
+            LogLevel::Error => "✗",
+        }
+    }
+}
+
+fn log_entry_visible(entry: &LogEntry, filter: &str, levels: &[bool; 4]) -> bool {
+    levels[entry.level.index()]
+        && (filter.is_empty() || entry.text.to_ascii_lowercase().contains(filter))
+}
+
+#[derive(Debug, Clone)]
 struct Batch {
     kind: WorkKind,
     total: usize,
@@ -45,18 +108,7 @@ impl Batch {
         self.started.elapsed()
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Convert,
-    Discover,
-}
-#[derive(Debug, Clone)]
-enum HfState {
-    Idle,
-    Searching,
-    Results(Vec<HfModel>),
-    Error(String),
-}
+
 #[derive(Debug, Clone)]
 struct DownloadUi {
     repo: String,
@@ -69,10 +121,32 @@ struct DownloadUi {
     path: Option<PathBuf>,
     error: Option<String>,
 }
+
+#[derive(Debug)]
+enum BenchmarkEvent {
+    Done { ok: bool, text: String },
+}
+
+#[derive(Debug)]
+struct BenchmarkUi {
+    model: PathBuf,
+    receiver: Receiver<BenchmarkEvent>,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Debug, Clone)]
+enum HfState {
+    Idle,
+    Searching,
+    Results(Vec<HfModel>),
+    Error(String),
+}
+
 pub struct RustBlockApp {
     tab: Tab,
     jobs: Vec<Job>,
     next_id: u64,
+    selected_job: Option<u64>,
     settings: Settings,
     rx: Option<Receiver<Event>>,
     worker: Option<JoinHandle<()>>,
@@ -82,6 +156,19 @@ pub struct RustBlockApp {
     mark: Option<egui::TextureHandle>,
     wordmark: Option<egui::TextureHandle>,
     ctx: egui::Context,
+    // Benchmark (llama-bench on the largest finished model)
+    benchmark: Option<BenchmarkUi>,
+    // Activity log
+    logs: Vec<LogEntry>,
+    show_log: bool,
+    log_filter: String,
+    log_levels: [bool; 4],
+    // Help
+    show_help: bool,
+    // GGUF inspector
+    inspector_path: Option<PathBuf>,
+    inspector: Option<InspectorData>,
+    // Discover
     hf_query: String,
     hf_sort: HfSort,
     hf_state: HfState,
@@ -99,11 +186,57 @@ pub struct RustBlockApp {
     discover_loaded: bool,
     download: Option<DownloadUi>,
     confirm_requantize: Option<WorkKind>,
-    logs: Vec<(LogLevel, String)>,
-    show_log: bool,
-    log_filter: String,
-    show_help: bool,
 }
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn done_output_name(job: &Job) -> Option<String> {
+    job.done_output()
+        .map(|path| file_name_of(&path))
+        .filter(|name| !name.is_empty())
+}
+
+fn spawn_benchmark(model: PathBuf) -> BenchmarkUi {
+    let (tx, rx) = mpsc::channel();
+    let model_thread = model.clone();
+    let handle = thread::spawn(move || {
+        let result: Result<(bool, String), String> = if let Some(tool) = find_tool("llama-bench") {
+            Command::new(&tool)
+                .arg("-m")
+                .arg(&model_thread)
+                .arg("-ngl")
+                .arg("99")
+                .output()
+                .map(|output| {
+                    let ok = output.status.success();
+                    let text = if ok {
+                        String::from_utf8_lossy(&output.stdout).into_owned()
+                    } else {
+                        String::from_utf8_lossy(&output.stderr).into_owned()
+                    };
+                    (ok, text)
+                })
+                .map_err(|error| format!("cannot run llama-bench: {error}"))
+        } else {
+            Err("llama-bench not found; install llama.cpp tools or set LLAMA_BENCH".to_string())
+        };
+        let (ok, text) = match result {
+            Ok(values) => values,
+            Err(message) => (false, message),
+        };
+        let _ = tx.send(BenchmarkEvent::Done { ok, text });
+    });
+    BenchmarkUi {
+        model,
+        receiver: rx,
+        handle,
+    }
+}
+
 impl RustBlockApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::with_context(&cc.egui_ctx);
@@ -118,14 +251,13 @@ impl RustBlockApp {
         app
     }
 
-    /// Build against an existing egui context. `new` passes the window's
-    /// context; the headless layout tests pass one without creating a window.
     fn with_context(ctx: &egui::Context) -> Self {
         theme::install(ctx);
         let mut app = Self {
             tab: Tab::Convert,
             jobs: Vec::new(),
             next_id: 1,
+            selected_job: None,
             settings: Settings::default(),
             rx: None,
             worker: None,
@@ -135,6 +267,14 @@ impl RustBlockApp {
             mark: theme::load_gear(ctx),
             wordmark: theme::load_wordmark(ctx),
             ctx: ctx.clone(),
+            benchmark: None,
+            logs: Vec::new(),
+            show_log: false,
+            log_filter: String::new(),
+            log_levels: [true, true, true, true],
+            show_help: false,
+            inspector_path: None,
+            inspector: None,
             hf_query: String::new(),
             hf_sort: HfSort::Downloads,
             hf_state: HfState::Idle,
@@ -152,30 +292,30 @@ impl RustBlockApp {
             discover_loaded: false,
             download: None,
             confirm_requantize: None,
-            logs: Vec::new(),
-            show_log: false,
-            log_filter: String::new(),
-            show_help: false,
         };
         app.log(
             LogLevel::Info,
-            "Ready. Add a GGUF file or search Hugging Face for a GGUF repository.".to_string(),
+            "Ready. Add a GGUF file, search Hugging Face, or open the GGUF inspector.".to_string(),
         );
         app
     }
+
     fn is_running(&self) -> bool {
         self.rx.is_some()
     }
+
     fn hf_busy(&self) -> bool {
         self.hf_rx.is_some()
     }
+
     fn log(&mut self, level: LogLevel, text: String) {
-        self.logs.push((level, text));
+        self.logs.push(LogEntry { level, text });
         if self.logs.len() > 500 {
             let excess = self.logs.len() - 500;
             self.logs.drain(0..excess);
         }
     }
+
     fn job_name(&self, id: u64) -> String {
         self.jobs
             .iter()
@@ -183,11 +323,13 @@ impl RustBlockApp {
             .map(|j| j.file_name())
             .unwrap_or_else(|| format!("#{id}"))
     }
+
     fn batch_completed(&mut self) {
         if let Some(batch) = &mut self.batch {
             batch.completed += 1;
         }
     }
+
     fn finish_batch(&mut self) {
         self.rx = None;
         if let Some(handle) = self.worker.take() {
@@ -201,6 +343,7 @@ impl RustBlockApp {
             }
         }
     }
+
     fn handle_dropped(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -213,6 +356,7 @@ impl RustBlockApp {
             self.add_paths(dropped);
         }
     }
+
     fn add_paths(&mut self, paths: Vec<PathBuf>) {
         let hardware = rustblock_core::detect_hardware();
         for path in paths {
@@ -247,9 +391,7 @@ impl RustBlockApp {
                         LogLevel::Info,
                         format!(
                             "{} is already upstream Q2_0; no reblock is needed.",
-                            path.file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.display().to_string())
+                            file_name_of(&path)
                         ),
                     );
                 }
@@ -262,9 +404,7 @@ impl RustBlockApp {
                         LogLevel::Warn,
                         format!(
                             "{} is already quantized. Converting it again cannot recover the original precision; a virgin F16/BF16 model is the better source.",
-                            path.file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.display().to_string())
+                            file_name_of(&path)
                         ),
                     );
                 }
@@ -293,6 +433,7 @@ impl RustBlockApp {
             });
         }
     }
+
     fn browse(&mut self) {
         if let Some(files) = rfd::FileDialog::new()
             .add_filter("GGUF model", &["gguf"])
@@ -301,6 +442,7 @@ impl RustBlockApp {
             self.add_paths(files);
         }
     }
+
     fn poll_worker(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
         let mut disconnected = false;
@@ -327,6 +469,7 @@ impl RustBlockApp {
             self.finish_batch();
         }
     }
+
     fn handle_event(&mut self, event: Event, ctx: &egui::Context) {
         match event {
             Event::Started { id } => {
@@ -473,6 +616,7 @@ impl RustBlockApp {
             }
         }
     }
+
     fn start(&mut self, kind: WorkKind) {
         if kind == WorkKind::Convert && self.requantize_needed() {
             self.confirm_requantize = Some(kind);
@@ -675,7 +819,900 @@ impl RustBlockApp {
             self.launch(kind, true);
         }
     }
-    // ----- Hugging Face -------------------------------------------------
+
+    // ----- Benchmark ------------------------------------------------------
+    fn done_job_output(&self) -> Option<PathBuf> {
+        self.jobs.iter().rev().find_map(Job::done_output)
+    }
+
+    fn start_benchmark(&mut self) {
+        if self.benchmark.is_some() {
+            return;
+        }
+        let Some(model) = self.done_job_output() else {
+            return;
+        };
+        let ui = spawn_benchmark(model.clone());
+        self.log(
+            LogLevel::Info,
+            format!("Benchmark: llama-bench -m {}", model.display()),
+        );
+        self.benchmark = Some(ui);
+    }
+
+    fn poll_benchmark(&mut self) {
+        let mut done = None;
+        if let Some(bm) = &self.benchmark {
+            while let Ok(event) = bm.receiver.try_recv() {
+                match event {
+                    BenchmarkEvent::Done { ok, text } => done = Some((ok, text)),
+                }
+            }
+        }
+        if let Some((ok, text)) = done {
+            let text = if text.trim().is_empty() {
+                "<no output>".to_string()
+            } else {
+                text
+            };
+            self.log(
+                if ok { LogLevel::Ok } else { LogLevel::Error },
+                format!("Benchmark result (ok={ok}):\n{text}"),
+            );
+            if let Some(bm) = self.benchmark.take() {
+                let _ = bm.handle.join();
+            }
+        }
+    }
+
+    // ----- GGUF inspector ---------------------------------------------------
+    fn inspector_open(&mut self) {
+        if let Some(files) = rfd::FileDialog::new()
+            .add_filter("GGUF model", &["gguf"])
+            .pick_files()
+        {
+            if let Some(path) = files.into_iter().next() {
+                self.inspector_path = Some(path);
+                self.inspector_refresh();
+            }
+        }
+    }
+
+    fn inspector_refresh(&mut self) {
+        self.inspector = self.inspector_path.as_deref().and_then(InspectorData::open);
+    }
+
+    fn selected_jobs(&self) -> usize {
+        let target = self.settings.target;
+        self.jobs
+            .iter()
+            .filter(|j| j.analysis.can_target(target))
+            .count()
+    }
+
+    fn download_banner(&self, ui: &mut Ui) {
+        let Some(download) = self.download.clone() else {
+            return;
+        };
+        ui.add_space(10.0);
+        egui::Frame::new()
+            .fill(PANEL_2)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                let name = download
+                    .file
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(download.file.as_str());
+                let kind = if download.projector { " · projector" } else { "" };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}{kind}", shorten(name, 62)))
+                            .size(11.0)
+                            .monospace()
+                            .color(STEEL_LIGHT),
+                    )
+                    .on_hover_text(format!("{}/{}", download.repo, download.file));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let (status, color) = if download.path.is_some() {
+                            ("Complete", ACCENT)
+                        } else if download.error.is_some() {
+                            ("Failed", ERROR)
+                        } else {
+                            ("Downloading", MUTED)
+                        };
+                        ui.label(RichText::new(status).size(10.0).color(color));
+                    });
+                });
+                let frac = if download.total > 0 {
+                    (download.done as f64 / download.total as f64).clamp(0.0, 1.0) as f32
+                } else {
+                    0.0
+                };
+                let remaining = download.total.saturating_sub(download.done);
+                let eta = if download.speed >= 1.0 && remaining > 0 {
+                    Some(Duration::from_secs_f64(remaining as f64 / download.speed))
+                } else {
+                    None
+                };
+                ui.add_sized(
+                    [ui.available_width(), 18.0],
+                    ProgressBar::new(frac)
+                        .fill(ACCENT)
+                        .animate(download.path.is_none() && download.error.is_none())
+                        .text(format!(
+                            "{} / {} · {:.1}%",
+                            human_bytes(download.done),
+                            if download.total > 0 {
+                                human_bytes(download.total)
+                            } else {
+                                "?".to_string()
+                            },
+                            frac * 100.0
+                        )),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(human_speed(download.speed))
+                            .size(9.5)
+                            .monospace()
+                            .color(MUTED),
+                    );
+                    if let Some(eta) = eta {
+                        ui.label(
+                            RichText::new(format!("· {} left", human_duration(eta)))
+                                .size(9.5)
+                                .color(MUTED),
+                        );
+                    }
+                    if download.path.is_none()
+                        && download.error.is_none()
+                        && ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Cancel").size(9.5).color(MUTED),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                    {
+                        self.hf_cancel.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(path) = &download.path {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Open folder").size(9.5).color(ACCENT),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            open_folder(path);
+                        }
+                    }
+                });
+                if download.quantized {
+                    ui.label(
+                        RichText::new(
+                            "Already quantized · requantizing will not restore the original weights.",
+                        )
+                        .size(9.5)
+                        .color(WARN),
+                    );
+                }
+                if let Some(error) = &download.error {
+                    ui.label(RichText::new(error).size(9.5).color(ERROR));
+                }
+            });
+    }
+
+    // ----- Convert views ---------------------------------------------------
+    fn queue_counts(&self) -> (usize, usize, usize, usize) {
+        let ready = self.selected_jobs();
+        let running = self
+            .jobs
+            .iter()
+            .filter(|j| matches!(j.status, JobStatus::Running(_)))
+            .count();
+        let done = self
+            .jobs
+            .iter()
+            .filter(|j| matches!(j.status, JobStatus::Done { .. }))
+            .count();
+        let failed = self
+            .jobs
+            .iter()
+            .filter(|j| matches!(j.status, JobStatus::Failed(_)))
+            .count();
+        (ready, running, done, failed)
+    }
+
+    fn convert_header(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Queue").size(26.0).strong().color(TEXT));
+                let (ready, running, done, failed) = self.queue_counts();
+                ui.label(
+                    RichText::new(format!(
+                        "{} files · {} ready · {} running · {} done · {} failed",
+                        self.jobs.len(),
+                        ready,
+                        running,
+                        done,
+                        failed
+                    ))
+                    .size(10.5)
+                    .color(MUTED),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let add =
+                    egui::Button::new(RichText::new("Add files").size(12.0).strong().color(INK))
+                        .fill(ACCENT)
+                        .stroke(Stroke::new(1.0, ACCENT))
+                        .corner_radius(CornerRadius::same(6))
+                        .min_size(Vec2::new(108.0, 32.0));
+                if ui.add(add).clicked() {
+                    self.browse();
+                }
+                let benchmarkable = self.benchmark.is_none() && self.done_job_output().is_some();
+                if ui
+                    .add_enabled(
+                        benchmarkable,
+                        egui::Button::new(RichText::new("Benchmark").size(10.5))
+                            .fill(PANEL_2)
+                            .stroke(Stroke::new(1.0, BORDER))
+                            .corner_radius(CornerRadius::same(6)),
+                    )
+                    .on_hover_text(
+                        "Run llama-bench -m <model> -ngl 99 on the largest finished model",
+                    )
+                    .clicked()
+                {
+                    self.start_benchmark();
+                }
+                let running = self.is_running();
+                let count = self.selected_jobs();
+                let enabled = !running && count > 0;
+                let label = if running {
+                    "Converting…".to_string()
+                } else if count == 0 {
+                    "Start conversion".to_string()
+                } else if count == 1 {
+                    "Convert 1 file".to_string()
+                } else {
+                    format!("Convert {count} files")
+                };
+                let button =
+                    egui::Button::new(RichText::new(label).size(12.5).strong().color(if enabled {
+                        INK
+                    } else {
+                        MUTED
+                    }))
+                    .fill(if enabled { ACCENT } else { PANEL_3 })
+                    .stroke(Stroke::new(1.0, if enabled { ACCENT } else { BORDER }))
+                    .corner_radius(CornerRadius::same(4))
+                    .min_size(Vec2::new(ui.available_width(), 38.0));
+                if ui.add_enabled(enabled, button).clicked() {
+                    self.start(WorkKind::Convert);
+                }
+                if ui
+                    .add_enabled(
+                        !self.is_running(),
+                        egui::Button::new(RichText::new("Clear all").size(10.5).color(MUTED))
+                            .frame(false),
+                    )
+                    .clicked()
+                {
+                    self.jobs.clear();
+                    self.selected_job = None;
+                }
+            });
+        });
+        ui.add_space(4.0);
+    }
+
+    fn benchmark_banner(&self, ui: &mut Ui) {
+        if let Some(bm) = &self.benchmark {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new(format!(
+                        "Benchmarking llama-bench -m {}",
+                        shorten(&file_name_of(&bm.model), 48)
+                    ))
+                    .size(10.5)
+                    .color(STEEL_LIGHT),
+                );
+            });
+            ui.add_space(4.0);
+        }
+    }
+
+    fn batch_bar(&mut self, ui: &mut Ui) {
+        if let Some(batch) = &self.batch {
+            let active_fraction = self
+                .jobs
+                .iter()
+                .find(|j| Some(j.id) == batch.active)
+                .and_then(|j| match &j.status {
+                    JobStatus::Running(state) => Some(state.fraction()),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+            let overall = ((batch.completed as f32 + active_fraction) / batch.total.max(1) as f32)
+                .clamp(0.0, 1.0);
+            egui::Frame::new()
+                .fill(PANEL_2)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(14, 12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Batch · {} of {}",
+                                batch.completed.min(batch.total),
+                                batch.total
+                            ))
+                            .size(11.0)
+                            .strong()
+                            .color(STEEL_LIGHT),
+                        );
+                        ui.label(
+                            RichText::new(human_duration(batch.elapsed()))
+                                .size(10.5)
+                                .monospace()
+                                .color(MUTED),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let stopping = self
+                                .cancel
+                                .as_ref()
+                                .is_some_and(|c| c.load(Ordering::Relaxed));
+                            if ui
+                                .add_enabled(
+                                    !stopping,
+                                    egui::Button::new(
+                                        RichText::new(if stopping {
+                                            "Stopping…"
+                                        } else {
+                                            "Stop"
+                                        })
+                                        .size(10.5),
+                                    )
+                                    .fill(PANEL)
+                                    .stroke(Stroke::new(1.0, BORDER))
+                                    .corner_radius(CornerRadius::same(6)),
+                                )
+                                .clicked()
+                            {
+                                if let Some(cancel) = &self.cancel {
+                                    cancel.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    ui.add(
+                        ProgressBar::new(overall)
+                            .fill(ACCENT)
+                            .animate(true)
+                            .text(format!("{:.0}%", overall * 100.0)),
+                    );
+                });
+            ui.add_space(10.0);
+        }
+    }
+
+    fn queue_scroll(&mut self, ui: &mut Ui) {
+        let running = self.is_running();
+        let mut remove: Option<u64> = None;
+        let mut open: Option<PathBuf> = None;
+        let mut toggle: Option<u64> = None;
+        ScrollArea::vertical()
+            .id_salt("queue_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for job in &self.jobs {
+                    let selected = self.selected_job == Some(job.id);
+                    job_card(
+                        ui,
+                        job,
+                        running,
+                        selected,
+                        &mut remove,
+                        &mut open,
+                        &mut toggle,
+                    );
+                    ui.add_space(8.0);
+                }
+            });
+        if let Some(id) = remove {
+            self.jobs.retain(|j| j.id != id);
+        }
+        if let Some(path) = open {
+            open_folder(&path);
+        }
+        if let Some(id) = toggle {
+            self.selected_job = match self.selected_job {
+                Some(current) if current == id => None,
+                _ => Some(id),
+            };
+        }
+        self.selected_job = self
+            .selected_job
+            .filter(|id| self.jobs.iter().any(|j| j.id == *id));
+    }
+
+    fn details_panel(&mut self, ui: &mut Ui) {
+        ui.label(
+            RichText::new("Details")
+                .size(13.0)
+                .strong()
+                .color(STEEL_LIGHT),
+        );
+        ui.add_space(6.0);
+        let Some(id) = self.selected_job else {
+            let (_ready, _running, _done, _failed) = self.queue_counts();
+            ui.label(
+                RichText::new("Select a job above for details, or start the batch.")
+                    .size(9.5)
+                    .color(MUTED),
+            );
+            return;
+        };
+        let Some(job) = self.jobs.iter().find(|j| j.id == id).cloned() else {
+            return;
+        };
+        if let Some(fit) = &job.analysis.fit {
+            let (label, color, hint) = fit_badge(fit);
+            ui.add(egui::Label::new(RichText::new(label).color(color)));
+            ui.label(
+                RichText::new(format!(
+                    "weights {} · kv {} · overhead {} · total {}",
+                    human_bytes(fit.weights_bytes),
+                    human_bytes(fit.kv_cache_bytes),
+                    human_bytes(fit.overhead_bytes),
+                    human_bytes(fit.total_bytes)
+                ))
+                .size(9.5)
+                .color(MUTED),
+            );
+            ui.add(egui::Label::new(RichText::new(hint).size(9.0).color(MUTED)).wrap());
+        }
+        ui.label(RichText::new(job.file_name()).size(11.0).color(TEXT));
+        ui.label(
+            RichText::new(format!(
+                "{} · {}",
+                human_bytes(job.analysis.file_len),
+                job.analysis.kind_label()
+            ))
+            .size(9.5)
+            .color(MUTED),
+        );
+        ui.label(
+            RichText::new(format!(
+                "→ {}",
+                shorten(
+                    &file_name_of(&job.planned_output(&self.settings.output_mode)),
+                    34
+                )
+            ))
+            .size(9.5)
+            .color(STEEL_LIGHT),
+        );
+        if let Some(output) = job.done_output() {
+            if ui.button(RichText::new("Open folder").size(10.5)).clicked() {
+                open_folder(&output);
+            }
+        }
+        if !self.is_running()
+            && ui
+                .add_enabled(
+                    true,
+                    egui::Button::new(RichText::new("Remove").size(10.5).color(MUTED)),
+                )
+                .clicked()
+        {
+            self.jobs.retain(|j| j.id != job.id);
+            self.selected_job = None;
+        }
+    }
+
+    fn drop_more_bar(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Drop more GGUF files here")
+                    .size(10.5)
+                    .color(MUTED),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new("Browse").size(10.0).color(STEEL_LIGHT),
+                    ))
+                    .clicked()
+                {
+                    self.browse();
+                }
+            });
+        });
+    }
+
+    fn empty_queue(&mut self, ui: &mut Ui) {
+        egui::Frame::new()
+            .fill(Color32::from_rgba_unmultiplied(22, 25, 28, 168))
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(32, 56))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("DROP ZONE")
+                            .size(9.5)
+                            .strong()
+                            .color(STEEL_LIGHT),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Drop GGUF files here")
+                            .size(18.0)
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.add_space(5.0);
+                    ui.label(
+                        RichText::new(
+                            "One or more .gguf files. Nothing is changed until you start.",
+                        )
+                        .size(11.5)
+                        .color(MUTED),
+                    );
+                    ui.add_space(16.0);
+                    ui.label(
+                        RichText::new("Ctrl+O add files · Ctrl+S start · Ctrl+L log · F1 help")
+                            .size(10.5)
+                            .color(STEEL_LIGHT),
+                    );
+                    ui.add_space(16.0);
+                    let browse = egui::Button::new(RichText::new("Browse files").size(11.5))
+                        .fill(PANEL_2)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(CornerRadius::same(4))
+                        .min_size(Vec2::new(120.0, 32.0));
+                    if ui.add(browse).clicked() {
+                        self.browse();
+                    }
+                });
+            });
+    }
+
+    fn convert_page(&mut self, ui: &mut Ui) {
+        self.convert_header(ui);
+        self.benchmark_banner(ui);
+        self.batch_bar(ui);
+        ui.add_space(12.0);
+        if self.jobs.is_empty() {
+            self.empty_queue(ui);
+            return;
+        }
+        ui.horizontal(|ui| {
+            let details_width = if self.selected_job.is_some() {
+                320.0
+            } else {
+                0.0
+            };
+            let queue_width = (ui.available_width() - details_width - 16.0).max(300.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(queue_width, ui.available_height()),
+                Layout::top_down(Align::LEFT),
+                |ui| self.queue_scroll(ui),
+            );
+            if details_width > 10.0 {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(details_width, ui.available_height()),
+                    Layout::top_down(Align::LEFT),
+                    |ui| self.details_panel(ui),
+                );
+            }
+        });
+        self.drop_more_bar(ui);
+    }
+
+    fn settings_rail(&mut self, ui: &mut Ui) {
+        egui::Panel::right("settings_rail")
+            .exact_size(380.0)
+            .resizable(true)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(Margin::symmetric(0, 0))
+                    .stroke(Stroke::new(1.0, BORDER)),
+            )
+            .show(ui, |ui| {
+                egui::Frame::new()
+                    .inner_margin(Margin::symmetric(20, 16))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Output format").size(10.5).color(MUTED));
+                            help_dot(
+                                ui,
+                                "Choose the output precision. Q4_K_M is the balanced default; F16/BF16 are best before requantizing.",
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Non so coda scegliere")
+                                                .size(9.5)
+                                                .color(STEEL_LIGHT),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .on_hover_text(
+                                        "Uses detected RAM/VRAM to suggest a format. You can always change it.",
+                                    )
+                                    .clicked()
+                                {
+                                    self.suggest_target();
+                                }
+                            });
+                        });
+                        ui.add_space(1.0);
+                        ui.label(
+                            RichText::new(self.settings.target.short())
+                                .size(26.0)
+                                .strong()
+                                .color(TEXT),
+                        )
+                        .on_hover_text(target_caption(self.settings.target));
+                        ui.add_space(6.0);
+                        self.format_panel(ui);
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        let max_height = (ui.available_height() - 145.0).max(46.0);
+                        ScrollArea::vertical()
+                            .id_salt("settings_scroll")
+                            .max_height(max_height)
+                            .max_width(ui.available_width())
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                self.destination_panel(ui);
+                            });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        self.verification_panel(ui);
+                    });
+            });
+    }
+
+    fn format_panel(&mut self, ui: &mut Ui) {
+        let running = self.is_running();
+        let mut available: Vec<Target> = Target::ALL
+            .iter()
+            .copied()
+            .filter(|target| {
+                *target != Target::Reblock
+                    || self.jobs.iter().any(|j| j.analysis.can_target(*target))
+            })
+            .collect();
+        if available.is_empty() {
+            available.push(Target::Q4KM);
+        }
+        if !available.contains(&self.settings.target) {
+            self.settings.target = available[0];
+        }
+        ui.add_enabled_ui(!running, |ui| {
+            let standard: Vec<Target> = available
+                .iter()
+                .copied()
+                .filter(|target| !target.is_ternary())
+                .collect();
+            let ternary: Vec<Target> = available
+                .iter()
+                .copied()
+                .filter(|target| target.is_ternary())
+                .collect();
+            target_grid(ui, &standard, &mut self.settings.target);
+            if !ternary.is_empty() {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Ternary").size(11.0).strong().color(TEXT));
+                    ui.label(
+                        RichText::new("only for ternary models")
+                            .size(10.0)
+                            .color(WARN),
+                    );
+                });
+                ui.add_space(2.0);
+                target_grid(ui, &ternary, &mut self.settings.target);
+            }
+            for job in &mut self.jobs {
+                if job.analysis.can_target(self.settings.target) {
+                    job.target = self.settings.target;
+                }
+            }
+        });
+    }
+
+    fn destination_panel(&mut self, ui: &mut Ui) {
+        let running = self.is_running();
+        ui.add_enabled_ui(!running, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Destination").size(10.5).color(MUTED));
+                help_dot(
+                    ui,
+                    "Write next to the source or choose a folder. Existing files are protected unless Overwrite is enabled.",
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.checkbox(&mut self.settings.overwrite, "Overwrite")
+                        .on_hover_text("Replace output files that already exist.");
+                });
+            });
+            let custom = matches!(self.settings.output_mode, OutputMode::Custom(_));
+            let label = match &self.settings.output_mode {
+                OutputMode::NextToInput => "Next to source file".to_string(),
+                OutputMode::Custom(dir) => shorten(&dir.display().to_string(), 30),
+            };
+            let button = egui::Button::new(RichText::new(label).size(10.5).color(STEEL_LIGHT))
+                .fill(PANEL_2)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(CornerRadius::same(4))
+                .min_size(Vec2::new(ui.available_width(), 32.0));
+            if ui.add(button).clicked() {
+                if let Some(picked) = rfd::FileDialog::new().pick_folder() {
+                    self.last_output_dir = Some(picked.clone());
+                    self.settings.output_mode = OutputMode::Custom(picked);
+                }
+            }
+            if custom
+                && ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Use source folder").size(9.5).color(MUTED),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+            {
+                self.settings.output_mode = OutputMode::NextToInput;
+            }
+        });
+    }
+
+    fn verification_panel(&mut self, ui: &mut Ui) {
+        let running = self.is_running();
+        ui.add_enabled_ui(!running, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Verification").size(10.5).color(MUTED));
+                help_dot(
+                    ui,
+                    "Structure checks the header, offsets and size. Full decodes every tensor again and is slower.",
+                );
+            });
+            ui.add_space(4.0);
+            let gap = 4.0;
+            let width = ((ui.available_width() - gap * 2.0) / 3.0).max(54.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (mode, label, hint) in [
+                    (
+                        VerifyMode::None,
+                        "Off",
+                        "Write the file without re-reading it.",
+                    ),
+                    (
+                        VerifyMode::Structure,
+                        "Structure",
+                        "Check header, offsets, alignment and size. Recommended.",
+                    ),
+                    (
+                        VerifyMode::Full,
+                        "Full",
+                        "Decode every tensor again. Slowest and most thorough.",
+                    ),
+                ] {
+                    let selected = self.settings.verify == mode;
+                    let button =
+                        egui::Button::new(RichText::new(label).size(10.0).color(if selected {
+                            INK
+                        } else {
+                            STEEL_LIGHT
+                        }))
+                        .fill(if selected { ACCENT } else { PANEL_2 })
+                        .stroke(Stroke::new(1.0, if selected { ACCENT } else { BORDER }))
+                        .corner_radius(CornerRadius::same(4))
+                        .min_size(Vec2::new(width, 30.0));
+                    if ui.add(button).on_hover_text(hint).clicked() {
+                        self.settings.verify = mode;
+                    }
+                }
+            });
+        });
+    }
+
+    fn suggest_target(&mut self) {
+        let hardware = rustblock_core::detect_hardware();
+        if hardware.vram_bytes.is_none() {
+            self.log(
+                LogLevel::Warn,
+                "No NVIDIA GPU detected; the suggestion uses system RAM. Open Help (F1) for the fit estimate."
+                    .to_string(),
+            );
+        }
+        let largest = self.jobs.iter().max_by_key(|job| job.analysis.file_len);
+        if let Some(job) = largest {
+            if job.analysis.kind == FileKind::Pq2 {
+                self.settings.target = Target::Reblock;
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "{} is PQ2_0: the lossless Q2_0 reblock is the safe choice.",
+                        job.file_name()
+                    ),
+                );
+                return;
+            }
+            if hardware.ram_bytes.is_some() || hardware.vram_bytes.is_some() {
+                match plan_budget(
+                    &job.input,
+                    BudgetRequest {
+                        budget_bytes: None,
+                        context: 4096,
+                        overhead_bytes: 512 * 1024 * 1024,
+                        hardware: Some(hardware),
+                    },
+                ) {
+                    Ok(plan) => {
+                        self.settings.target = plan.selected;
+                        self.log(
+                            LogLevel::Info,
+                            format!(
+                                "{}: suggested {} (~{} at 4096 tokens; {}).",
+                                job.file_name(),
+                                plan.selected.short(),
+                                human_bytes(plan.selected_total_bytes),
+                                plan.reason
+                            ),
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        self.log(
+                            LogLevel::Warn,
+                            format!("Could not estimate {}: {error}", job.file_name()),
+                        );
+                    }
+                }
+            }
+        }
+        let target = rustblock_core::suggest_target(hardware.ram_bytes.or(hardware.vram_bytes));
+        self.settings.target = target;
+        self.log(
+            LogLevel::Info,
+            format!(
+                "Detected {} RAM / {} VRAM; suggested {}.",
+                hardware
+                    .ram_bytes
+                    .map(human_bytes)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                hardware
+                    .vram_bytes
+                    .map(human_bytes)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                target.short()
+            ),
+        );
+    }
+
+    // ----- Hugging Face --------------------------------------------------
     fn start_search(&mut self) {
         if self.hf_busy() {
             return;
@@ -1016,957 +2053,7 @@ impl RustBlockApp {
         models.iter().find(|m| m.id == repo).cloned()
     }
 
-    fn selected_jobs(&self) -> usize {
-        let target = self.settings.target;
-        self.jobs
-            .iter()
-            .filter(|j| j.analysis.can_target(target))
-            .count()
-    }
-
-    // ----- UI -----------------------------------------------------------
-    /// The square mark is the app backdrop: large, centred and faint, painted
-    /// behind the content of the active view (never in the title bar).
-    fn paint_backdrop(&self, ui: &Ui) {
-        let Some(texture) = self.mark.as_ref() else {
-            return;
-        };
-        let area = ui.max_rect();
-        let rect = backdrop_rect(area);
-        ui.painter().with_clip_rect(area).image(
-            texture.id(),
-            rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            Color32::from_rgba_unmultiplied(255, 255, 255, 26),
-        );
-    }
-
-    fn top_chrome(&mut self, ui: &mut Ui) {
-        let mark = self.mark.clone();
-        let wordmark = self.wordmark.clone();
-        egui::Panel::top("chrome")
-            .exact_size(56.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(PANEL)
-                    .inner_margin(Margin::symmetric(14, 8))
-                    .stroke(Stroke::new(1.0, BORDER)),
-            )
-            .show(ui, |ui| {
-                let controls_width = 196.0;
-                // Keep the title bar flat: the mark lives behind the content.
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    self.brand(ui, mark.as_ref(), wordmark.as_ref());
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    self.nav_tab(ui, Tab::Convert, "Convert");
-                    ui.add_space(2.0);
-                    self.nav_tab(ui, Tab::Discover, "Discover");
-                    let drag_width = (ui.available_width() - controls_width).max(0.0);
-                    if drag_width > 1.0 {
-                        let (_, response) = ui.allocate_exact_size(
-                            Vec2::new(drag_width, 30.0),
-                            Sense::click_and_drag(),
-                        );
-                        if response.drag_started() {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        }
-                        if response.double_clicked() {
-                            toggle_maximized(ui.ctx());
-                        }
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if window_button(ui, "×", "Close", true) {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        if window_button(ui, "—", "Minimize", false) {
-                            ui.ctx()
-                                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                        }
-                        ui.add_space(6.0);
-                        if ui
-                            .button(RichText::new("Log").size(10.0).color(MUTED))
-                            .on_hover_text("Activity log · Ctrl+L")
-                            .clicked()
-                        {
-                            self.show_log = !self.show_log;
-                        }
-                        if ui
-                            .button(RichText::new("?").size(12.0).color(MUTED))
-                            .on_hover_text("Help · F1")
-                            .clicked()
-                        {
-                            self.show_help = true;
-                        }
-                    });
-                });
-            });
-    }
-
-    fn brand(
-        &mut self,
-        ui: &mut Ui,
-        mark: Option<&egui::TextureHandle>,
-        wordmark: Option<&egui::TextureHandle>,
-    ) {
-        theme::paint_logo(ui, 24.0, mark);
-        ui.add_space(8.0);
-        let Some(texture) = wordmark else {
-            return;
-        };
-        let height = 18.0;
-        let size = texture.size_vec2();
-        let width = height * (size.x / size.y).max(0.1);
-        let (rect, response) =
-            ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
-        theme::paint_wordmark(ui.painter(), rect, Some(texture), Color32::WHITE);
-        if response.drag_started() {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
-        if response.double_clicked() {
-            toggle_maximized(ui.ctx());
-        }
-        let _ = response.on_hover_text("Native GGUF toolkit");
-    }
-
-    fn nav_tab(&mut self, ui: &mut Ui, tab: Tab, label: &str) {
-        let active = self.tab == tab;
-        let response = ui.add_sized(
-            [92.0, 30.0],
-            egui::Button::new(
-                RichText::new(label)
-                    .size(12.5)
-                    .color(if active { TEXT } else { MUTED })
-                    .strong(),
-            )
-            .fill(if active {
-                PANEL_3
-            } else {
-                Color32::TRANSPARENT
-            })
-            .stroke(Stroke::new(
-                1.0,
-                if active { BORDER } else { Color32::TRANSPARENT },
-            ))
-            .corner_radius(CornerRadius::same(6)),
-        );
-        if response.clicked() {
-            self.tab = tab;
-        }
-    }
-
-    fn convert_page(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new("Convert").size(26.0).strong().color(TEXT));
-                let ready = self.selected_jobs();
-                ui.label(
-                    RichText::new(format!(
-                        "{}  ·  {} ready for {}",
-                        if self.jobs.len() == 1 {
-                            "1 file".to_string()
-                        } else {
-                            format!("{} files", self.jobs.len())
-                        },
-                        ready,
-                        self.settings.target.short()
-                    ))
-                    .size(11.5)
-                    .color(MUTED),
-                );
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let add =
-                    egui::Button::new(RichText::new("Add files").size(12.0).strong().color(INK))
-                        .fill(ACCENT)
-                        .stroke(Stroke::new(1.0, ACCENT))
-                        .corner_radius(CornerRadius::same(6))
-                        .min_size(Vec2::new(108.0, 32.0));
-                if ui.add(add).clicked() {
-                    self.browse();
-                }
-            });
-        });
-        self.download_banner(ui);
-        ui.add_space(16.0);
-        ScrollArea::vertical()
-            .id_salt("queue_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if self.jobs.is_empty() {
-                    self.empty_queue(ui);
-                } else {
-                    self.queue_panel(ui);
-                }
-            });
-    }
-
-    fn empty_queue(&mut self, ui: &mut Ui) {
-        egui::Frame::new()
-            .fill(Color32::from_rgba_unmultiplied(22, 25, 28, 168))
-            .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(32, 56))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new("DROP ZONE")
-                            .size(9.5)
-                            .strong()
-                            .color(STEEL_LIGHT),
-                    );
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Drop GGUF files here")
-                            .size(18.0)
-                            .strong()
-                            .color(TEXT),
-                    );
-                    ui.add_space(5.0);
-                    ui.label(
-                        RichText::new(
-                            "One or more .gguf files. Nothing is changed until you start.",
-                        )
-                        .size(11.5)
-                        .color(MUTED),
-                    );
-                    ui.add_space(16.0);
-                    let browse = egui::Button::new(RichText::new("Browse files").size(11.5))
-                        .fill(PANEL_2)
-                        .stroke(Stroke::new(1.0, BORDER))
-                        .corner_radius(CornerRadius::same(4))
-                        .min_size(Vec2::new(120.0, 32.0));
-                    if ui.add(browse).clicked() {
-                        self.browse();
-                    }
-                });
-            });
-    }
-
-    fn settings_rail(&mut self, ui: &mut Ui) {
-        egui::Panel::right("settings_rail")
-            .exact_size(380.0)
-            .resizable(true)
-            .frame(
-                egui::Frame::new()
-                    .fill(PANEL)
-                    .inner_margin(Margin::symmetric(0, 0))
-                    .stroke(Stroke::new(1.0, BORDER)),
-            )
-            .show(ui, |ui| {
-                egui::Frame::new()
-                    .inner_margin(Margin::symmetric(20, 16))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Output format").size(10.5).color(MUTED));
-                            help_dot(
-                                ui,
-                                "Choose the output precision. Q4_K_M is the balanced default; F16/BF16 are best before requantizing.",
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Non so cosa scegliere")
-                                                .size(9.5)
-                                                .color(STEEL_LIGHT),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .on_hover_text(
-                                        "Uses detected RAM/VRAM to suggest a format. You can always change it.",
-                                    )
-                                    .clicked()
-                                {
-                                    self.suggest_target();
-                                }
-                            });
-                        });
-                        ui.add_space(1.0);
-                        ui.label(
-                            RichText::new(self.settings.target.short())
-                                .size(26.0)
-                                .strong()
-                                .color(TEXT),
-                        )
-                        .on_hover_text(target_caption(self.settings.target));
-                        ui.add_space(6.0);
-                        self.format_panel(ui);
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-                        let max_height = (ui.available_height() - 145.0).max(46.0);
-                        ScrollArea::vertical()
-                            .id_salt("settings_scroll")
-                            .max_height(max_height)
-                            .max_width(ui.available_width())
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                self.destination_panel(ui);
-                            });
-                        ui.add_space(4.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-                        self.verification_panel(ui);
-                        ui.add_space(4.0);
-                        self.start_controls(ui);
-                    });
-            });
-    }
-
-    fn hf_inspector_rail(&mut self, ui: &mut Ui) {
-        let scroll_top = std::mem::take(&mut self.hf_scroll_top);
-        egui::Panel::right("hf_inspector_rail")
-            .exact_size(380.0)
-            .resizable(true)
-            .frame(
-                egui::Frame::new()
-                    .fill(PANEL)
-                    .inner_margin(Margin::symmetric(0, 0))
-                    .stroke(Stroke::new(1.0, BORDER)),
-            )
-            .show(ui, |ui| {
-                egui::Frame::new()
-                    .inner_margin(Margin::symmetric(20, 18))
-                    .show(ui, |ui| {
-                        let max_height = (ui.available_height() - 78.0).max(120.0);
-                        let mut scroll = ScrollArea::vertical()
-                            .id_salt("hf_details_scroll")
-                            .max_height(max_height)
-                            .max_width(ui.available_width())
-                            .auto_shrink([false, false]);
-                        if scroll_top {
-                            scroll = scroll.vertical_scroll_offset(0.0);
-                        }
-                        scroll.show(ui, |ui| {
-                            self.hf_details_panel(ui);
-                        });
-                        ui.add_space(6.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-                        self.hf_destination(ui);
-                    });
-            });
-    }
-
-    fn queue_panel(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Queue").size(15.0).strong().color(TEXT));
-            ui.label(
-                RichText::new(self.jobs.len().to_string())
-                    .size(9.5)
-                    .monospace()
-                    .color(STEEL_LIGHT),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        !self.is_running(),
-                        egui::Button::new(RichText::new("Clear all").size(10.5).color(MUTED))
-                            .frame(false),
-                    )
-                    .clicked()
-                {
-                    self.jobs.clear();
-                }
-            });
-        });
-        ui.add_space(9.0);
-        if let Some(batch) = &self.batch {
-            let active_fraction = self
-                .jobs
-                .iter()
-                .find(|j| Some(j.id) == batch.active)
-                .and_then(|j| match &j.status {
-                    JobStatus::Running(state) => Some(state.fraction()),
-                    _ => None,
-                })
-                .unwrap_or(0.0);
-            let overall = ((batch.completed as f32 + active_fraction) / batch.total.max(1) as f32)
-                .clamp(0.0, 1.0);
-            egui::Frame::new()
-                .fill(PANEL_2)
-                .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(14, 12))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "Batch · {} of {}",
-                                batch.completed.min(batch.total),
-                                batch.total
-                            ))
-                            .size(11.0)
-                            .strong()
-                            .color(STEEL_LIGHT),
-                        );
-                        ui.label(
-                            RichText::new(human_duration(batch.elapsed()))
-                                .size(10.5)
-                                .monospace()
-                                .color(MUTED),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let stopping = self
-                                .cancel
-                                .as_ref()
-                                .is_some_and(|c| c.load(Ordering::Relaxed));
-                            if ui
-                                .add_enabled(
-                                    !stopping,
-                                    egui::Button::new(
-                                        RichText::new(if stopping {
-                                            "Stopping…"
-                                        } else {
-                                            "Stop"
-                                        })
-                                        .size(10.5),
-                                    )
-                                    .fill(PANEL)
-                                    .stroke(Stroke::new(1.0, BORDER))
-                                    .corner_radius(CornerRadius::same(6)),
-                                )
-                                .clicked()
-                            {
-                                if let Some(cancel) = &self.cancel {
-                                    cancel.store(true, Ordering::Relaxed);
-                                }
-                            }
-                        });
-                    });
-                    ui.add_space(6.0);
-                    ui.add(
-                        ProgressBar::new(overall)
-                            .fill(ACCENT)
-                            .animate(true)
-                            .text(format!("{:.0}%", overall * 100.0)),
-                    );
-                });
-            ui.add_space(10.0);
-        }
-        let running = self.is_running();
-        let mut remove = None;
-        let mut open = None;
-        for job in &self.jobs {
-            job_card(ui, job, running, &mut remove, &mut open);
-            ui.add_space(8.0);
-        }
-        egui::Frame::new()
-            .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(14, 12))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Drop more GGUF files here")
-                            .size(10.5)
-                            .color(MUTED),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Browse").size(10.0).color(STEEL_LIGHT),
-                                )
-                                .frame(false),
-                            )
-                            .clicked()
-                        {
-                            self.browse();
-                        }
-                    });
-                });
-            });
-        if let Some(id) = remove {
-            self.jobs.retain(|j| j.id != id);
-        }
-        if let Some(path) = open {
-            open_folder(&path);
-        }
-    }
-
-    fn format_panel(&mut self, ui: &mut Ui) {
-        let running = self.is_running();
-        let mut available: Vec<Target> = Target::ALL
-            .iter()
-            .copied()
-            .filter(|target| {
-                *target != Target::Reblock
-                    || self.jobs.iter().any(|j| j.analysis.can_target(*target))
-            })
-            .collect();
-        if available.is_empty() {
-            available.push(Target::Q4KM);
-        }
-        if !available.contains(&self.settings.target) {
-            self.settings.target = available[0];
-        }
-        ui.add_enabled_ui(!running, |ui| {
-            let standard: Vec<Target> = available
-                .iter()
-                .copied()
-                .filter(|target| !target.is_ternary())
-                .collect();
-            let ternary: Vec<Target> = available
-                .iter()
-                .copied()
-                .filter(|target| target.is_ternary())
-                .collect();
-            target_grid(ui, &standard, &mut self.settings.target);
-            if !ternary.is_empty() {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Ternary").size(11.0).strong().color(TEXT));
-                    ui.label(
-                        RichText::new("only for ternary models")
-                            .size(10.0)
-                            .color(WARN),
-                    );
-                });
-                ui.add_space(2.0);
-                target_grid(ui, &ternary, &mut self.settings.target);
-            }
-            for job in &mut self.jobs {
-                if job.analysis.can_target(self.settings.target) {
-                    job.target = self.settings.target;
-                }
-            }
-        });
-    }
-
-    fn destination_panel(&mut self, ui: &mut Ui) {
-        let running = self.is_running();
-        ui.add_enabled_ui(!running, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Destination").size(10.5).color(MUTED));
-                help_dot(
-                    ui,
-                    "Write next to the source or choose a folder. Existing files are protected unless Overwrite is enabled.",
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.checkbox(&mut self.settings.overwrite, "Overwrite")
-                        .on_hover_text("Replace output files that already exist.");
-                });
-            });
-            let custom = matches!(self.settings.output_mode, OutputMode::Custom(_));
-            let label = match &self.settings.output_mode {
-                OutputMode::NextToInput => "Next to source file".to_string(),
-                OutputMode::Custom(dir) => shorten(&dir.display().to_string(), 30),
-            };
-            let button = egui::Button::new(RichText::new(label).size(10.5).color(STEEL_LIGHT))
-                .fill(PANEL_2)
-                .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(CornerRadius::same(4))
-                .min_size(Vec2::new(ui.available_width(), 32.0));
-            if ui.add(button).clicked() {
-                if let Some(picked) = rfd::FileDialog::new().pick_folder() {
-                    self.last_output_dir = Some(picked.clone());
-                    self.settings.output_mode = OutputMode::Custom(picked);
-                }
-            }
-            if custom
-                && ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("Use source folder").size(9.5).color(MUTED),
-                        )
-                        .frame(false),
-                    )
-                    .clicked()
-            {
-                self.settings.output_mode = OutputMode::NextToInput;
-            }
-
-        });
-    }
-
-    fn verification_panel(&mut self, ui: &mut Ui) {
-        let running = self.is_running();
-        ui.add_enabled_ui(!running, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Verification").size(10.5).color(MUTED));
-                help_dot(
-                    ui,
-                    "Structure checks the header, offsets and size. Full decodes every tensor again and is slower.",
-                );
-            });
-            ui.add_space(4.0);
-            let gap = 4.0;
-            let width = ((ui.available_width() - gap * 2.0) / 3.0).max(54.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                for (mode, label, hint) in [
-                    (
-                        VerifyMode::None,
-                        "Off",
-                        "Write the file without re-reading it.",
-                    ),
-                    (
-                        VerifyMode::Structure,
-                        "Structure",
-                        "Check header, offsets, alignment and size. Recommended.",
-                    ),
-                    (
-                        VerifyMode::Full,
-                        "Full",
-                        "Decode every tensor again. Slowest and most thorough.",
-                    ),
-                ] {
-                    let selected = self.settings.verify == mode;
-                    let button =
-                        egui::Button::new(RichText::new(label).size(10.0).color(if selected {
-                            INK
-                        } else {
-                            STEEL_LIGHT
-                        }))
-                        .fill(if selected { ACCENT } else { PANEL_2 })
-                        .stroke(Stroke::new(1.0, if selected { ACCENT } else { BORDER }))
-                        .corner_radius(CornerRadius::same(4))
-                        .min_size(Vec2::new(width, 30.0));
-                    if ui.add(button).on_hover_text(hint).clicked() {
-                        self.settings.verify = mode;
-                    }
-                }
-            });
-        });
-    }
-
-    fn start_controls(&mut self, ui: &mut Ui) {
-        let count = self.selected_jobs();
-        let running = self.is_running();
-        let enabled = !running && count > 0;
-        if !self.jobs.is_empty() {
-            if count == 0 {
-                ui.label(
-                    RichText::new(format!("No file can use {}.", self.settings.target.short()))
-                        .size(10.5)
-                        .color(WARN),
-                );
-            } else if count < self.jobs.len() {
-                ui.label(
-                    RichText::new(format!("{count} of {} files ready.", self.jobs.len()))
-                        .size(10.5)
-                        .color(MUTED),
-                );
-            }
-        }
-        ui.add_space(4.0);
-        let label = if running {
-            "Converting…".to_string()
-        } else if count == 0 {
-            "Start conversion".to_string()
-        } else if count == 1 {
-            "Convert 1 file".to_string()
-        } else {
-            format!("Convert {count} files")
-        };
-        let button =
-            egui::Button::new(RichText::new(label).size(12.5).strong().color(if enabled {
-                INK
-            } else {
-                MUTED
-            }))
-            .fill(if enabled { ACCENT } else { PANEL_3 })
-            .stroke(Stroke::new(1.0, if enabled { ACCENT } else { BORDER }))
-            .corner_radius(CornerRadius::same(4))
-            .min_size(Vec2::new(ui.available_width(), 38.0));
-        if ui.add_enabled(enabled, button).clicked() {
-            self.start(WorkKind::Convert);
-        }
-    }
-
-    fn suggest_target(&mut self) {
-        let hardware = rustblock_core::detect_hardware();
-        if hardware.vram_bytes.is_none() {
-            self.log(
-                LogLevel::Warn,
-                "No NVIDIA GPU detected; the suggestion uses system RAM. Open Help (F1) for the fit estimate."
-                    .to_string(),
-            );
-        }
-        let largest = self.jobs.iter().max_by_key(|job| job.analysis.file_len);
-        if let Some(job) = largest {
-            if job.analysis.kind == FileKind::Pq2 {
-                self.settings.target = Target::Reblock;
-                self.log(
-                    LogLevel::Info,
-                    format!(
-                        "{} is PQ2_0: the lossless Q2_0 reblock is the safe choice.",
-                        job.file_name()
-                    ),
-                );
-                return;
-            }
-            if hardware.ram_bytes.is_some() || hardware.vram_bytes.is_some() {
-                match plan_budget(
-                    &job.input,
-                    BudgetRequest {
-                        budget_bytes: None,
-                        context: 4096,
-                        overhead_bytes: 512 * 1024 * 1024,
-                        hardware: Some(hardware),
-                    },
-                ) {
-                    Ok(plan) => {
-                        self.settings.target = plan.selected;
-                        self.log(
-                            LogLevel::Info,
-                            format!(
-                                "{}: suggested {} (~{} at 4096 tokens; {}).",
-                                job.file_name(),
-                                plan.selected.short(),
-                                human_bytes(plan.selected_total_bytes),
-                                plan.reason
-                            ),
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        self.log(
-                            LogLevel::Warn,
-                            format!("Could not estimate {}: {error}", job.file_name()),
-                        );
-                    }
-                }
-            }
-        }
-        let target = rustblock_core::suggest_target(hardware.ram_bytes.or(hardware.vram_bytes));
-        self.settings.target = target;
-        self.log(
-            LogLevel::Info,
-            format!(
-                "Detected {} RAM / {} VRAM; suggested {}.",
-                hardware
-                    .ram_bytes
-                    .map(human_bytes)
-                    .unwrap_or_else(|| "unknown".to_string()),
-                hardware
-                    .vram_bytes
-                    .map(human_bytes)
-                    .unwrap_or_else(|| "unknown".to_string()),
-                target.short()
-            ),
-        );
-    }
-
-    fn log_panel(&mut self, ui: &mut Ui) {
-        egui::Panel::bottom("log_panel")
-            .exact_size(188.0)
-            .resizable(true)
-            .frame(
-                egui::Frame::new()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0, BORDER))
-                    .inner_margin(Margin::symmetric(16, 10)),
-            )
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("ACTIVITY LOG")
-                            .size(9.5)
-                            .strong()
-                            .color(STEEL_LIGHT),
-                    );
-                    ui.add_sized(
-                        [140.0, 26.0],
-                        TextEdit::singleline(&mut self.log_filter)
-                            .hint_text("Filter")
-                            .font(FontId::proportional(9.5)),
-                    );
-                    if ui
-                        .button(RichText::new("Clear").size(9.5).color(MUTED))
-                        .clicked()
-                    {
-                        self.logs.clear();
-                    }
-                    if ui
-                        .button(RichText::new("Close").size(9.5).color(MUTED))
-                        .clicked()
-                    {
-                        self.show_log = false;
-                    }
-                });
-                ui.separator();
-                let filter = self.log_filter.to_ascii_lowercase();
-                ScrollArea::vertical()
-                    .id_salt("log_scroll")
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (level, text) in self.logs.iter().filter(|(_, text)| {
-                            filter.is_empty() || text.to_ascii_lowercase().contains(&filter)
-                        }) {
-                            let color = match level {
-                                LogLevel::Info => MUTED,
-                                LogLevel::Ok => ACCENT,
-                                LogLevel::Warn => WARN,
-                                LogLevel::Error => ERROR,
-                            };
-                            ui.label(RichText::new(text).size(10.0).monospace().color(color));
-                        }
-                    });
-            });
-    }
-
-    fn help_modal(&mut self, ctx: &egui::Context) {
-        if !self.show_help {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new("RustBlock help")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.set_max_width(520.0);
-                ui.label(RichText::new("What the buttons do").size(15.0).strong().color(TEXT));
-                ui.add_space(6.0);
-                for (title, text) in [
-                    ("Reblock (Q2_0)", "Lossless conversion of Prism PQ2_0 files to the upstream Q2_0 layout. Use it when the badge says PQ2_0."),
-                    ("Q4_K_M", "The usual balanced choice for a float model that must fit on a normal desktop. Q5_K_M keeps more quality; Q3_K_M saves more space."),
-                    ("F16 / BF16", "Uncompressed formats. They are large, but they are the safest source if you plan to quantize again later."),
-                    ("Structure / Full verification", "Structure checks the header and offsets. Full decodes every tensor again and is slower."),
-                    ("Fit badge", "An estimate at 4096 tokens: weights plus KV cache plus a fixed runtime overhead. It is a warning, not a guarantee."),
-                    ("GPU not detected", "If VRAM is unknown, the fit badge uses system RAM and marks VRAM as not detected. RustBlock never assumes a GPU; install a supported NVIDIA driver or check the GPU manually. The estimate is a warning, not a guarantee."),
-                ] {
-                    ui.label(RichText::new(title).size(11.0).strong().color(STEEL_LIGHT));
-                    ui.add(egui::Label::new(RichText::new(text).size(10.5).color(MUTED)).wrap());
-                    ui.add_space(5.0);
-                }
-                ui.separator();
-                ui.label(RichText::new("Shortcuts").size(11.0).strong().color(STEEL_LIGHT));
-                ui.label(RichText::new("Ctrl+O add files · Ctrl+S start · Ctrl+L log · F1 help").size(10.5).monospace().color(MUTED));
-            });
-        if !open {
-            self.show_help = false;
-        }
-    }
-
-    fn download_banner(&mut self, ui: &mut Ui) {
-        let Some(download) = self.download.clone() else {
-            return;
-        };
-        ui.add_space(10.0);
-        egui::Frame::new()
-            .fill(PANEL_2)
-            .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(4))
-            .inner_margin(Margin::symmetric(12, 10))
-            .show(ui, |ui| {
-                let name = download
-                    .file
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(download.file.as_str());
-                let kind = if download.projector { " · projector" } else { "" };
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("{}{kind}", shorten(name, 62)))
-                            .size(11.0)
-                            .monospace()
-                            .color(STEEL_LIGHT),
-                    )
-                    .on_hover_text(format!("{}/{}", download.repo, download.file));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (status, color) = if download.path.is_some() {
-                            ("Complete", ACCENT)
-                        } else if download.error.is_some() {
-                            ("Failed", ERROR)
-                        } else {
-                            ("Downloading", MUTED)
-                        };
-                        ui.label(RichText::new(status).size(10.0).color(color));
-                    });
-                });
-                let frac = if download.total > 0 {
-                    (download.done as f64 / download.total as f64).clamp(0.0, 1.0) as f32
-                } else {
-                    0.0
-                };
-                let remaining = download.total.saturating_sub(download.done);
-                let eta = if download.speed >= 1.0 && remaining > 0 {
-                    Some(Duration::from_secs_f64(remaining as f64 / download.speed))
-                } else {
-                    None
-                };
-                ui.add_sized(
-                    [ui.available_width(), 18.0],
-                    ProgressBar::new(frac)
-                        .fill(ACCENT)
-                        .animate(download.path.is_none() && download.error.is_none())
-                        .text(format!(
-                            "{} / {} · {:.1}%",
-                            human_bytes(download.done),
-                            if download.total > 0 {
-                                human_bytes(download.total)
-                            } else {
-                                "?".to_string()
-                            },
-                            frac * 100.0
-                        )),
-                );
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(human_speed(download.speed))
-                            .size(9.5)
-                            .monospace()
-                            .color(MUTED),
-                    );
-                    if let Some(eta) = eta {
-                        ui.label(
-                            RichText::new(format!("· {} left", human_duration(eta)))
-                                .size(9.5)
-                                .color(MUTED),
-                        );
-                    }
-                    if download.path.is_none()
-                        && download.error.is_none()
-                        && ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Cancel").size(9.5).color(MUTED),
-                                )
-                                .frame(false),
-                            )
-                            .clicked()
-                    {
-                        self.hf_cancel.store(true, Ordering::Relaxed);
-                    }
-                    if let Some(path) = &download.path {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Open folder").size(9.5).color(ACCENT),
-                                )
-                                .frame(false),
-                            )
-                            .clicked()
-                        {
-                            open_folder(path);
-                        }
-                    }
-                });
-                if download.quantized {
-                    ui.label(
-                        RichText::new(
-                            "Already quantized · requantizing will not restore the original weights.",
-                        )
-                        .size(9.5)
-                        .color(WARN),
-                    );
-                }
-                if let Some(error) = &download.error {
-                    ui.label(RichText::new(error).size(9.5).color(ERROR));
-                }
-            });
-    }
-
+    // ----- Discover views --------------------------------------------------
     fn discover_page(&mut self, ui: &mut Ui) {
         if !self.discover_loaded && matches!(self.hf_state, HfState::Idle) {
             self.discover_loaded = true;
@@ -2160,6 +2247,13 @@ impl RustBlockApp {
             ui.add(
                 egui::Label::new(RichText::new(&model.name).size(18.0).strong().color(TEXT)).wrap(),
             );
+            if let Some(license) = &model.license {
+                ui.label(
+                    RichText::new(format!("License: {license}"))
+                        .size(10.0)
+                        .color(STEEL_LIGHT),
+                );
+            }
         } else {
             ui.add(egui::Label::new(RichText::new(&repo).size(16.0).strong().color(TEXT)).wrap());
         }
@@ -2345,6 +2439,560 @@ impl RustBlockApp {
         });
     }
 
+    // ----- GGUF inspector view ------------------------------------------------
+    fn inspector_page(&mut self, ui: &mut Ui) {
+        ui.label(
+            RichText::new("GGUF INSPECTOR")
+                .size(26.0)
+                .strong()
+                .color(TEXT),
+        );
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new(
+                    RichText::new("Add file").size(12.0).strong().color(INK),
+                ))
+                .clicked()
+            {
+                self.inspector_open();
+            }
+            if self.inspector_path.is_some() {
+                if ui
+                    .add(egui::Button::new(
+                        RichText::new("Inspect another")
+                            .size(10.5)
+                            .color(STEEL_LIGHT),
+                    ))
+                    .clicked()
+                {
+                    self.inspector_open();
+                }
+                if let Some(path) = &self.inspector_path {
+                    if ui
+                        .add(egui::Button::new(
+                            RichText::new("Open folder").size(10.5).color(STEEL_LIGHT),
+                        ))
+                        .clicked()
+                    {
+                        open_folder(path);
+                    }
+                }
+            }
+        });
+        ui.add_space(10.0);
+        if self.inspector.is_none() {
+            match &self.inspector_path {
+                None => {
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("No file selected").size(14.0).color(MUTED));
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(
+                                "Open a GGUF file to see its facts, metadata and tensor types.",
+                            )
+                            .size(10.5)
+                            .color(MUTED),
+                        );
+                    });
+                }
+                Some(path) => {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Cannot read {} — it may not be a valid GGUF.",
+                                shorten(&file_name_of(path), 64)
+                            ))
+                            .size(10.5)
+                            .color(ERROR),
+                        );
+                    });
+                }
+            }
+            return;
+        }
+        let Some(data) = self.inspector.clone() else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            egui::Frame::new()
+                .fill(PANEL_2)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(16, 12))
+                .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(shorten(&file_name_of(&data.path), 56)).size(13.0).strong().color(TEXT));
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · GGUF v{} · alignment {} B · {} tensors · data at {}",
+                                human_bytes(data.file_len),
+                                data.version,
+                                data.alignment,
+                                data.tensors,
+                                human_bytes(data.data_start)
+                            ))
+                            .size(10.0)
+                            .color(MUTED),
+                        );
+                        ui.label(
+                            RichText::new(format!("file_type {:?}", data.file_type))
+                                .size(9.5)
+                                .color(MUTED),
+                        );
+                        if data.ptq1 > 0 {
+                            ui.label(
+                                RichText::new("Contains PTQ1_0 (Prism) — this build cannot convert it losslessly.")
+                                    .size(9.5)
+                                    .color(WARN),
+                            );
+                        }
+                        if data.pq2 > 0 {
+                            ui.label(
+                                RichText::new(format!("{} PQ2_0 (Prism ternary) tensors.", data.pq2))
+                                    .size(9.5)
+                                    .color(INFO),
+                            );
+                        }
+                        if let Some(fit) = &data.fit {
+                            let (label, color, _hint) = fit_badge(fit);
+                            ui.label(RichText::new(label).strong().color(color));
+                        }
+                    });
+                });
+        });
+        ui.add_space(10.0);
+
+        // Metadata.
+        ui.label(
+            RichText::new("Metadata")
+                .size(12.0)
+                .strong()
+                .color(STEEL_LIGHT),
+        );
+        if data.metadata.is_empty() {
+            ui.label(RichText::new("no metadata entries").size(9.5).color(MUTED));
+        } else {
+            for (key, value) in &data.metadata {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(key).size(9.5).color(STEEL_LIGHT));
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(
+                        RichText::new(value.as_str())
+                            .size(9.5)
+                            .monospace()
+                            .color(STEEL),
+                    );
+                });
+            }
+        }
+        ui.add_space(10.0);
+
+        // Tensor histogram: type, count, disk bytes and a bar.
+        ui.label(
+            RichText::new("Tensor types")
+                .size(12.0)
+                .strong()
+                .color(STEEL_LIGHT),
+        );
+        let max_count = data
+            .histogram
+            .iter()
+            .map(|(_, count, _)| *count)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        for (name, count, bytes) in &data.histogram {
+            let frac = *count as f64 / max_count as f64;
+            let bar_len = (frac * 20.0).round() as usize;
+            let mut bar = "█".repeat(bar_len);
+            bar.push_str(&"░".repeat(20 - bar_len));
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(name)
+                        .size(9.5)
+                        .monospace()
+                        .color(STEEL_LIGHT)
+                        .strong(),
+                );
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    RichText::new(format!("{count:>5} · {:>7}", human_bytes(*bytes)))
+                        .size(9.0)
+                        .monospace()
+                        .color(MUTED),
+                );
+                ui.label(RichText::new(bar).size(9.5).monospace().color(STEEL));
+            });
+        }
+        if data.histogram.is_empty() {
+            ui.label(RichText::new("no tensors").size(9.5).color(MUTED));
+        }
+        ui.add_space(10.0);
+
+        // Memory estimate.
+        ui.label(
+            RichText::new("Memory (4096 tokens)")
+                .size(12.0)
+                .strong()
+                .color(STEEL_LIGHT),
+        );
+        ui.label(
+            RichText::new(format!("payload {}", human_bytes(data.weights_bytes)))
+                .size(9.5)
+                .color(MUTED),
+        );
+        if let Some(fit) = &data.fit {
+            ui.label(
+                RichText::new(format!(
+                    "weights {} · kv {} · overhead {} · total {}",
+                    human_bytes(fit.weights_bytes),
+                    human_bytes(fit.kv_cache_bytes),
+                    human_bytes(fit.overhead_bytes),
+                    human_bytes(fit.total_bytes)
+                ))
+                .size(9.5)
+                .color(MUTED),
+            );
+            let (label, color, _hint) = fit_badge(fit);
+            ui.label(RichText::new(label).strong().color(color));
+        }
+    }
+
+    // ----- Log panel ------------------------------------------------------------
+    fn log_panel(&mut self, ui: &mut Ui) {
+        egui::Panel::bottom("log_panel")
+            .exact_size(208.0)
+            .resizable(true)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .inner_margin(Margin::symmetric(16, 10)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("ACTIVITY LOG")
+                            .size(9.5)
+                            .strong()
+                            .color(STEEL_LIGHT),
+                    );
+                    ui.add_space(8.0);
+                    for level in [
+                        LogLevel::Info,
+                        LogLevel::Ok,
+                        LogLevel::Warn,
+                        LogLevel::Error,
+                    ] {
+                        let active = self.log_levels[level.index()];
+                        let color = level.color();
+                        let response = ui.add(
+                            egui::Button::new(
+                                RichText::new(level.short()).size(8.5).color(if active {
+                                    INK
+                                } else {
+                                    color
+                                }),
+                            )
+                            .fill(if active { color } else { Color32::TRANSPARENT })
+                            .stroke(Stroke::new(1.0, if active { color } else { BORDER }))
+                            .corner_radius(CornerRadius::same(4)),
+                        );
+                        if response.clicked() {
+                            self.log_levels[level.index()] = !active;
+                        }
+                    }
+                    let visible = self
+                        .logs
+                        .iter()
+                        .filter(|entry| {
+                            log_entry_visible(entry, &self.log_filter, &self.log_levels)
+                        })
+                        .count();
+                    ui.label(
+                        RichText::new(format!("{visible}/{}", self.logs.len()))
+                            .size(9.0)
+                            .color(STEEL_LIGHT),
+                    );
+                    ui.add_sized(
+                        [140.0, 26.0],
+                        TextEdit::singleline(&mut self.log_filter)
+                            .hint_text("Filter")
+                            .font(FontId::proportional(9.5)),
+                    );
+                    if ui
+                        .button(RichText::new("Clear").size(9.5).color(MUTED))
+                        .clicked()
+                    {
+                        self.logs.clear();
+                    }
+                    if ui
+                        .button(RichText::new("Close").size(9.5).color(MUTED))
+                        .clicked()
+                    {
+                        self.show_log = false;
+                    }
+                });
+                ui.separator();
+                let filter = self.log_filter.to_ascii_lowercase();
+                ScrollArea::vertical()
+                    .id_salt("log_scroll")
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for entry in self
+                            .logs
+                            .iter()
+                            .filter(|entry| log_entry_visible(entry, &filter, &self.log_levels))
+                        {
+                            let level = entry.level;
+                            ui.label(
+                                RichText::new(entry.text.as_str())
+                                    .size(10.0)
+                                    .monospace()
+                                    .color(level.color()),
+                            );
+                        }
+                    });
+            });
+    }
+
+    // ----- Help modal ------------------------------------------------------------
+    fn help_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("RustBlock help")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.label(RichText::new("What the buttons do").size(15.0).strong().color(TEXT));
+                ui.add_space(6.0);
+                for (title, text) in [
+                    ("Reblock (Q2_0)", "Lossless conversion of Prism PQ2_0 files to the upstream Q2_0 layout. Use it when the badge says PQ2_0."),
+                    ("Q4_K_M", "The usual balanced choice for a float model that must fit on a normal desktop. Q5_K_M keeps more quality; Q3_K_M saves more space."),
+                    ("F16 / BF16", "Uncompressed formats. They are large, but they are the safest source if you plan to quantize again later."),
+                    ("Structure / Full verification", "Structure checks the header and offsets. Full decodes every tensor again and is slower."),
+                    ("Fit badge", "An estimate at 4096 tokens: weights plus KV cache plus a fixed runtime overhead. It is a warning, not a guarantee."),
+                    ("GPU not detected", "If VRAM is unknown, the fit badge uses system RAM and marks VRAM as not detected. RustBlock never assumes a GPU; install a supported NVIDIA driver or check the GPU manually. The estimate is a warning, not a guarantee."),
+                    ("Benchmark", "Run llama-bench -m <model> -ngl 99 on the largest finished model. Compare tokens/s with other files; install llama.cpp tools to enable it."),
+                    ("GGUF inspector", "Inspect a local GGUF: file facts, metadata and the tensor type histogram with byte sizes. Files visualized this way are the same ones the Hugging Face Hub shows on model pages."),
+                    ("Discover license", "Licenses from the Hub are shown on model cards when the API exposes them. RustBlock never modifies licenses."),
+                    ("Log level filters", "The activity log colors levels; use the I/O/⚠/✗ buttons to filter by level and the field to filter by text."),
+                    ("Job details", "Select a job in the queue: fit details, output path and file facts. Details update automatically as the batch runs."),
+                ] {
+                    ui.label(RichText::new(title).size(11.0).strong().color(STEEL_LIGHT));
+                    ui.add(egui::Label::new(RichText::new(text).size(10.5).color(MUTED)).wrap());
+                    ui.add_space(5.0);
+                }
+                ui.separator();
+                ui.label(RichText::new("Shortcuts").size(11.0).strong().color(STEEL_LIGHT));
+                ui.label(RichText::new("Ctrl+O add files · Ctrl+S start · Ctrl+L log · F1 help").size(10.5).monospace().color(MUTED));
+            });
+        if !open {
+            self.show_help = false;
+        }
+    }
+
+    fn run_logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let (open, save, help, log) = ctx.input_mut(|input| {
+            (
+                input.consume_key(egui::Modifiers::CTRL, egui::Key::O),
+                input.consume_key(egui::Modifiers::CTRL, egui::Key::S),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::F1),
+                input.consume_key(egui::Modifiers::CTRL, egui::Key::L),
+            )
+        });
+        if open {
+            self.browse();
+        }
+        if save && !self.is_running() {
+            self.start(WorkKind::Convert);
+        }
+        if help {
+            self.show_help = !self.show_help;
+        }
+        if log {
+            self.show_log = !self.show_log;
+        }
+        if self.is_running() && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        self.handle_dropped(ctx);
+        self.poll_worker(ctx);
+        self.poll_hf();
+        self.poll_benchmark();
+        if self.rx.is_some() || self.hf_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    fn render_ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.top_chrome(ui);
+        if self.show_log {
+            self.log_panel(ui);
+        }
+        match self.tab {
+            Tab::Convert => self.settings_rail(ui),
+            Tab::Discover => self.hf_inspector_rail(ui),
+            Tab::Inspector => {}
+        }
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(BG)
+                    .inner_margin(Margin::symmetric(22, 16)),
+            )
+            .show(ui, |ui| {
+                self.paint_backdrop(ui);
+                match self.tab {
+                    Tab::Convert => self.convert_page(ui),
+                    Tab::Discover => self.discover_page(ui),
+                    Tab::Inspector => self.inspector_page(ui),
+                }
+            });
+        self.drag_overlay(ui.ctx());
+        self.requantize_modal(ui.ctx());
+        self.help_modal(ui.ctx());
+        resize_edges(ui);
+        paint_window_border(ui.ctx());
+    }
+
+    fn top_chrome(&mut self, ui: &mut Ui) {
+        let mark = self.mark.clone();
+        let wordmark = self.wordmark.clone();
+        egui::Panel::top("chrome")
+            .exact_size(56.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(Margin::symmetric(14, 8))
+                    .stroke(Stroke::new(1.0, BORDER)),
+            )
+            .show(ui, |ui| {
+                let controls_width = 196.0;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    self.brand(ui, mark.as_ref(), wordmark.as_ref());
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    self.nav_tab(ui, Tab::Convert, "Convert");
+                    ui.add_space(2.0);
+                    self.nav_tab(ui, Tab::Discover, "Discover");
+                    ui.add_space(2.0);
+                    self.nav_tab(ui, Tab::Inspector, "Inspector");
+                    let drag_width = (ui.available_width() - controls_width).max(0.0);
+                    if drag_width > 1.0 {
+                        let (_, response) = ui.allocate_exact_size(
+                            Vec2::new(drag_width, 30.0),
+                            Sense::click_and_drag(),
+                        );
+                        if response.drag_started() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        if response.double_clicked() {
+                            toggle_maximized(ui.ctx());
+                        }
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if window_button(ui, "×", "Close", true) {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if window_button(ui, "—", "Minimize", false) {
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                        ui.add_space(6.0);
+                        if ui
+                            .button(RichText::new("Log").size(10.0).color(MUTED))
+                            .on_hover_text("Activity log · Ctrl+L")
+                            .clicked()
+                        {
+                            self.show_log = !self.show_log;
+                        }
+                        if ui
+                            .button(RichText::new("?").size(12.0).color(MUTED))
+                            .on_hover_text("Help · F1")
+                            .clicked()
+                        {
+                            self.show_help = true;
+                        }
+                    });
+                });
+            });
+    }
+
+    fn brand(
+        &mut self,
+        ui: &mut Ui,
+        mark: Option<&egui::TextureHandle>,
+        wordmark: Option<&egui::TextureHandle>,
+    ) {
+        theme::paint_logo(ui, 24.0, mark);
+        ui.add_space(8.0);
+        let Some(texture) = wordmark else {
+            return;
+        };
+        let height = 18.0;
+        let size = texture.size_vec2();
+        let width = height * (size.x / size.y).max(0.1);
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(width, height), Sense::click_and_drag());
+        theme::paint_wordmark(ui.painter(), rect, Some(texture), Color32::WHITE);
+        if response.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if response.double_clicked() {
+            toggle_maximized(ui.ctx());
+        }
+        let _ = response.on_hover_text("Native GGUF toolkit");
+    }
+
+    fn nav_tab(&mut self, ui: &mut Ui, tab: Tab, label: &str) {
+        let active = self.tab == tab;
+        let response = ui.add_sized(
+            [88.0, 30.0],
+            egui::Button::new(
+                RichText::new(label)
+                    .size(12.5)
+                    .color(if active { TEXT } else { MUTED })
+                    .strong(),
+            )
+            .fill(if active {
+                PANEL_3
+            } else {
+                Color32::TRANSPARENT
+            })
+            .stroke(Stroke::new(
+                1.0,
+                if active { BORDER } else { Color32::TRANSPARENT },
+            ))
+            .corner_radius(CornerRadius::same(6)),
+        );
+        if response.clicked() {
+            self.tab = tab;
+        }
+    }
+
+    fn paint_backdrop(&self, ui: &Ui) {
+        let Some(texture) = self.mark.as_ref() else {
+            return;
+        };
+        let area = ui.max_rect();
+        let rect = backdrop_rect(area);
+        ui.painter().with_clip_rect(area).image(
+            texture.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+        );
+    }
+
     fn drag_overlay(&self, ctx: &egui::Context) {
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
         if !hovering {
@@ -2378,74 +3026,341 @@ impl RustBlockApp {
             TEXT,
         );
     }
+
+    fn hf_inspector_rail(&mut self, ui: &mut Ui) {
+        let scroll_top = std::mem::take(&mut self.hf_scroll_top);
+        egui::Panel::right("hf_inspector_rail")
+            .exact_size(380.0)
+            .resizable(true)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(Margin::symmetric(0, 0))
+                    .stroke(Stroke::new(1.0, BORDER)),
+            )
+            .show(ui, |ui| {
+                egui::Frame::new()
+                    .inner_margin(Margin::symmetric(20, 18))
+                    .show(ui, |ui| {
+                        let max_height = (ui.available_height() - 78.0).max(120.0);
+                        let mut scroll = ScrollArea::vertical()
+                            .id_salt("hf_details_scroll")
+                            .max_height(max_height)
+                            .max_width(ui.available_width())
+                            .auto_shrink([false, false]);
+                        if scroll_top {
+                            scroll = scroll.vertical_scroll_offset(0.0);
+                        }
+                        scroll.show(ui, |ui| {
+                            self.hf_details_panel(ui);
+                        });
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        self.hf_destination(ui);
+                    });
+            });
+    }
 }
 
 impl eframe::App for RustBlockApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let (open, save, help, log) = ctx.input_mut(|input| {
-            (
-                input.consume_key(egui::Modifiers::CTRL, egui::Key::O),
-                input.consume_key(egui::Modifiers::CTRL, egui::Key::S),
-                input.consume_key(egui::Modifiers::NONE, egui::Key::F1),
-                input.consume_key(egui::Modifiers::CTRL, egui::Key::L),
-            )
-        });
-        if open {
-            self.browse();
-        }
-        if save && !self.is_running() {
-            self.start(WorkKind::Convert);
-        }
-        if help {
-            self.show_help = !self.show_help;
-        }
-        if log {
-            self.show_log = !self.show_log;
-        }
-        if self.is_running() && ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        }
-        self.handle_dropped(ctx);
-        self.poll_worker(ctx);
-        self.poll_hf();
-        if self.rx.is_some() || self.hf_rx.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        RustBlockApp::run_logic(self, ctx, frame);
     }
 
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        self.top_chrome(ui);
-        if self.show_log {
-            self.log_panel(ui);
-        }
-        match self.tab {
-            Tab::Convert => self.settings_rail(ui),
-            Tab::Discover => self.hf_inspector_rail(ui),
-        }
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(BG)
-                    .inner_margin(Margin::symmetric(22, 16)),
-            )
-            .show(ui, |ui| {
-                self.paint_backdrop(ui);
-                match self.tab {
-                    Tab::Convert => self.convert_page(ui),
-                    Tab::Discover => self.discover_page(ui),
-                }
-            });
-        self.drag_overlay(ui.ctx());
-        self.requantize_modal(ui.ctx());
-        self.help_modal(ui.ctx());
-        resize_edges(ui);
-        paint_window_border(ui.ctx());
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        RustBlockApp::render_ui(self, ui, frame);
     }
 }
 
-fn toggle_maximized(ctx: &egui::Context) {
-    let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+// ----- free helpers --------------------------------------------------------
+
+fn job_card(
+    ui: &mut Ui,
+    job: &Job,
+    running: bool,
+    selected: bool,
+    remove: &mut Option<u64>,
+    open: &mut Option<PathBuf>,
+    toggle: &mut Option<u64>,
+) {
+    egui::Frame::new()
+        .fill(if selected { PANEL_2 } else { PANEL })
+        .stroke(Stroke::new(1.0, if selected { STEEL } else { BORDER }))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(14, 12))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.vertical(|ui| {
+                // Row 1: name (selectable) + status + actions.
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(
+                            selected,
+                            RichText::new(job.file_name())
+                                .size(13.0)
+                                .strong()
+                                .color(TEXT),
+                        )
+                        .clicked()
+                    {
+                        *toggle = Some(job.id);
+                    }
+                    if let Some(fit) = &job.analysis.fit {
+                        let (label, color, hint) = fit_badge(fit);
+                        ui.label(RichText::new(label).size(9.0).strong().color(color))
+                            .on_hover_text(&hint);
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                !running,
+                                egui::Button::new(RichText::new("Remove").size(9.5).color(MUTED))
+                                    .frame(false),
+                            )
+                            .clicked()
+                        {
+                            *remove = Some(job.id);
+                        }
+                        ui.label(
+                            RichText::new(status_label(job))
+                                .size(9.5)
+                                .color(status_color(job)),
+                        );
+                    });
+                });
+                // Row 2: facts.
+                ui.add(egui::Label::new(
+                    RichText::new(format!(
+                        "{} · {} · {}",
+                        human_bytes(job.analysis.file_len),
+                        job.analysis.kind_label(),
+                        job.target.short()
+                    ))
+                    .size(10.0)
+                    .color(MUTED),
+                ))
+                .on_hover_text(format!(
+                    "GGUF v{} · alignment {} B · {} tensors · {}",
+                    job.analysis.version,
+                    job.analysis.alignment,
+                    job.analysis.tensors,
+                    job.analysis.type_summary()
+                ));
+                if let Some(output) = done_output_name(job) {
+                    ui.add(egui::Label::new(
+                        RichText::new(format!("→ {output}"))
+                            .size(9.5)
+                            .color(STEEL_LIGHT),
+                    ));
+                }
+                // Row 3: progress / result / error.
+                match &job.status {
+                    JobStatus::Running(state) => {
+                        let phase = match state.phase {
+                            Phase::Converting => "Converting",
+                            Phase::Verifying => "Verifying",
+                        };
+                        ui.add(
+                            ProgressBar::new(state.fraction())
+                                .fill(ACCENT)
+                                .animate(true)
+                                .desired_width(240.0)
+                                .text(format!("{phase} · {:.0}%", state.fraction() * 100.0)),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{}/s", human_speed(state.speed)))
+                                    .size(9.0)
+                                    .color(MUTED),
+                            );
+                            if let Some(eta) = state.eta() {
+                                ui.label(
+                                    RichText::new(format!("{} left", human_duration(eta)))
+                                        .size(9.0)
+                                        .color(MUTED),
+                                );
+                            }
+                        });
+                    }
+                    JobStatus::Done { report, target } => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} → {} · {} · {}",
+                                    human_bytes(report.old_file_size),
+                                    human_bytes(report.new_file_size),
+                                    target.short(),
+                                    human_duration(report.elapsed)
+                                ))
+                                .size(10.0)
+                                .color(STEEL_LIGHT),
+                            );
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Open folder").size(9.5).color(ACCENT),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                *open = Some(report.output.clone());
+                            }
+                        });
+                    }
+                    JobStatus::Verified { outcome, elapsed } => {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {} tensors · {} · {}",
+                                outcome.label,
+                                outcome.tensors,
+                                match outcome.kind {
+                                    VerifyKind::Exact => "exact",
+                                    VerifyKind::Structure => "structure",
+                                },
+                                human_duration(*elapsed)
+                            ))
+                            .size(9.5)
+                            .color(STEEL_LIGHT),
+                        );
+                    }
+                    JobStatus::Failed(error) => {
+                        ui.add(
+                            egui::Label::new(RichText::new(error).size(10.0).color(ERROR)).wrap(),
+                        );
+                    }
+                    JobStatus::Ready => {}
+                }
+            });
+        });
+}
+
+fn status_label(job: &Job) -> String {
+    match &job.status {
+        JobStatus::Ready => {
+            if job.analysis.error.is_some() {
+                "INVALID".to_string()
+            } else if job.analysis.ptq1 > 0 {
+                "UNSUPPORTED".to_string()
+            } else if job.analysis.supported {
+                "READY".to_string()
+            } else {
+                "UNSUPPORTED".to_string()
+            }
+        }
+        JobStatus::Running(state) => match state.phase {
+            Phase::Converting => "CONVERTING".to_string(),
+            Phase::Verifying => "VERIFYING".to_string(),
+        },
+        JobStatus::Done { .. } => "DONE".to_string(),
+        JobStatus::Verified { .. } => "VERIFIED".to_string(),
+        JobStatus::Failed(_) => "ERROR".to_string(),
+    }
+}
+
+fn status_color(job: &Job) -> Color32 {
+    match &job.status {
+        JobStatus::Ready => match job.analysis.kind {
+            FileKind::Pq2 => INFO,
+            FileKind::Q2 | FileKind::Float | FileKind::Quantized | FileKind::Mixed => MUTED,
+            FileKind::Ptq1 => WARN,
+            FileKind::Invalid | FileKind::Other => ERROR,
+        },
+        JobStatus::Running(_) | JobStatus::Done { .. } | JobStatus::Verified { .. } => ACCENT,
+        JobStatus::Failed(_) => ERROR,
+    }
+}
+
+fn fit_badge(fit: &FitEstimate) -> (String, Color32, String) {
+    let mut hint = format!(
+        "Estimated at {} tokens: {} weights + {} KV cache + {} overhead.",
+        fit.context,
+        human_bytes(fit.weights_bytes),
+        human_bytes(fit.kv_cache_bytes),
+        human_bytes(fit.overhead_bytes)
+    );
+    hint.push_str(&format!(
+        "\nRAM: {}.",
+        fit_verdict_text(fit.hardware.ram_bytes, fit.fits_ram)
+    ));
+    hint.push_str(&format!(
+        "\nVRAM: {}.",
+        fit_verdict_text(fit.hardware.vram_bytes, fit.fits_vram)
+    ));
+    let (label, color) = if fit.fits_vram == Some(true) {
+        fit_label("VRAM", fit.hardware.vram_bytes, fit.total_bytes)
+    } else if fit.fits_ram == Some(true) {
+        fit_label("RAM", fit.hardware.ram_bytes, fit.total_bytes)
+    } else if fit.fits_ram == Some(false) && fit.fits_vram == Some(false) {
+        ("No fit".to_string(), ERROR)
+    } else if fit.fits_ram == Some(false) {
+        ("No RAM fit".to_string(), ERROR)
+    } else if fit.fits_vram == Some(false) {
+        ("No VRAM fit".to_string(), ERROR)
+    } else {
+        ("Fit unknown".to_string(), MUTED)
+    };
+    (label, color, hint)
+}
+
+fn fit_label(device: &str, available: Option<u64>, total: u64) -> (String, Color32) {
+    let Some(available) = available else {
+        return (format!("Fits {device}"), OK);
+    };
+    if available > 0 && total.saturating_mul(100) > available.saturating_mul(88) {
+        (format!("Tight {device}"), WARN)
+    } else {
+        (format!("Fits {device}"), OK)
+    }
+}
+
+fn fit_verdict_text(available: Option<u64>, fits: Option<bool>) -> String {
+    match (available, fits) {
+        (Some(bytes), Some(true)) => format!("fits in {}", human_bytes(bytes)),
+        (Some(bytes), Some(false)) => format!("does not fit in {}", human_bytes(bytes)),
+        (Some(bytes), None) => format!("{} detected; verdict unavailable", human_bytes(bytes)),
+        (None, _) => "not detected".to_string(),
+    }
+}
+
+/// Fit verdict available before a download. Only the published weight size is
+/// known, so the KV cache is excluded and the tooltip says so instead of
+/// pretending the number is a full estimate.
+fn size_fit_badge(weights: u64, hardware: rustblock_core::Hardware) -> (String, Color32, String) {
+    let total = weights.saturating_add(512 * 1024 * 1024);
+    let hint = format!(
+        "Download estimate: {} weights + {} runtime overhead. The KV cache needs the model header, so it is not included before download.",
+        human_bytes(weights),
+        human_bytes(512 * 1024 * 1024)
+    );
+    let fits_ram = hardware
+        .ram_bytes
+        .map(|available| rustblock_core::hardware_fits(total, available));
+    let fits_vram = hardware
+        .vram_bytes
+        .map(|available| rustblock_core::hardware_fits(total, available));
+    let (label, color) = if fits_vram == Some(true) {
+        fit_label("VRAM", hardware.vram_bytes, total)
+    } else if fits_ram == Some(true) {
+        fit_label("RAM", hardware.ram_bytes, total)
+    } else if fits_ram == Some(false) && fits_vram == Some(false) {
+        ("No fit".to_string(), ERROR)
+    } else if fits_ram == Some(false) {
+        ("No RAM fit".to_string(), ERROR)
+    } else if fits_vram == Some(false) {
+        ("No VRAM fit".to_string(), ERROR)
+    } else {
+        ("Fit unknown".to_string(), MUTED)
+    };
+    (label, color, hint)
+}
+
+/// Hardware detection is slow on Windows (PowerShell and `nvidia-smi`), so the
+/// Discover list reuses one detection per process.
+fn detected_hardware() -> rustblock_core::Hardware {
+    static HARDWARE: std::sync::OnceLock<rustblock_core::Hardware> = std::sync::OnceLock::new();
+    *HARDWARE.get_or_init(rustblock_core::detect_hardware)
 }
 
 fn window_button(ui: &mut Ui, glyph: &str, tooltip: &str, danger: bool) -> bool {
@@ -2479,7 +3394,84 @@ fn help_dot(ui: &mut Ui, help: &str) {
         .on_hover_text(help);
 }
 
-fn resize_edges(ui: &mut Ui) {
+fn backdrop_rect(area: egui::Rect) -> egui::Rect {
+    let limit = area.width().min(area.height()).max(1.0);
+    let size = (limit * 0.82).clamp(64.0, limit);
+    egui::Rect::from_center_size(area.center(), Vec2::splat(size))
+}
+
+fn paint_window_border(ctx: &egui::Context) {
+    let Some(screen) = ctx.input(|input| input.raw.screen_rect) else {
+        return;
+    };
+    let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("window-frame")));
+    painter.rect_stroke(
+        screen.shrink(0.5),
+        CornerRadius::same(0),
+        Stroke::new(1.0, BORDER),
+        StrokeKind::Inside,
+    );
+}
+
+fn open_folder(path: &Path) {
+    let target = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer").arg(target).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(target).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = target;
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => path_key(a) == path_key(b),
+    }
+}
+
+fn format_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn short_date(date: &str) -> String {
+    if date.len() >= 10 {
+        date[..10].to_string()
+    } else if date.is_empty() {
+        "unknown".to_string()
+    } else {
+        date.to_string()
+    }
+}
+
+fn toggle_maximized(ctx: &egui::Context) {
+    let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+}
+
+fn resize_edges(ui: &Ui) {
     use egui::viewport::ResizeDirection;
 
     let Some(screen) = ui.ctx().input(|input| input.raw.screen_rect) else {
@@ -2556,27 +3548,6 @@ fn resize_edges(ui: &mut Ui) {
     }
 }
 
-/// Geometry of the app backdrop: a square centred in the content area, never
-/// larger than the area it decorates.
-fn backdrop_rect(area: egui::Rect) -> egui::Rect {
-    let limit = area.width().min(area.height()).max(1.0);
-    let size = (limit * 0.82).clamp(64.0, limit);
-    egui::Rect::from_center_size(area.center(), Vec2::splat(size))
-}
-
-fn paint_window_border(ctx: &egui::Context) {
-    let Some(screen) = ctx.input(|input| input.raw.screen_rect) else {
-        return;
-    };
-    let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("window-frame")));
-    painter.rect_stroke(
-        screen.shrink(0.5),
-        CornerRadius::same(0),
-        Stroke::new(1.0, BORDER),
-        StrokeKind::Inside,
-    );
-}
-
 fn hf_result_row(ui: &mut Ui, model: &HfModel, selected: bool) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 64.0), Sense::click());
@@ -2633,295 +3604,19 @@ fn hf_result_row(ui: &mut Ui, model: &HfModel, selected: bool) -> bool {
         FontId::proportional(10.5),
         MUTED,
     );
+    if let Some(license) = &model.license {
+        ui.painter().text(
+            egui::pos2(rect.right() - 16.0, rect.center().y + 16.0),
+            Align2::RIGHT_CENTER,
+            format!("License: {license}"),
+            FontId::proportional(9.5),
+            STEEL_LIGHT,
+        );
+    }
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     response.clicked()
-}
-
-fn target_grid(ui: &mut Ui, targets: &[Target], selected: &mut Target) {
-    let gap = 4.0;
-    let width = ((ui.available_width() - gap * 5.0) / 6.0).max(48.0);
-    for chunk in targets.chunks(6) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            for target in chunk {
-                let is_selected = *selected == *target;
-                let button = egui::Button::new(
-                    RichText::new(target.short())
-                        .size(10.5)
-                        .strong()
-                        .color(if is_selected { INK } else { STEEL_LIGHT }),
-                )
-                .fill(if is_selected { ACCENT } else { PANEL_2 })
-                .stroke(Stroke::new(1.0, if is_selected { ACCENT } else { BORDER }))
-                .corner_radius(CornerRadius::same(6))
-                .min_size(Vec2::new(width, 30.0));
-                if ui.add(button).on_hover_text(target.description()).clicked() {
-                    *selected = *target;
-                }
-            }
-        });
-    }
-}
-
-/// 512 MiB of runtime overhead, the same constant the full estimate uses.
-const DOWNLOAD_OVERHEAD_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Hardware detection is slow on Windows (PowerShell and `nvidia-smi`), so the
-/// Discover list reuses one detection per process.
-fn detected_hardware() -> rustblock_core::Hardware {
-    static HARDWARE: std::sync::OnceLock<rustblock_core::Hardware> = std::sync::OnceLock::new();
-    *HARDWARE.get_or_init(rustblock_core::detect_hardware)
-}
-
-/// Fit verdict available before a download. Only the published weight size is
-/// known, so the KV cache is excluded and the tooltip says so instead of
-/// pretending the number is a full estimate.
-fn size_fit_badge(weights: u64, hardware: rustblock_core::Hardware) -> (String, Color32, String) {
-    let total = weights.saturating_add(DOWNLOAD_OVERHEAD_BYTES);
-    let hint = format!(
-        "Download estimate: {} weights + {} runtime overhead. The KV cache needs the model header, so it is not included before download.",
-        human_bytes(weights),
-        human_bytes(DOWNLOAD_OVERHEAD_BYTES)
-    );
-    let fits_ram = hardware
-        .ram_bytes
-        .map(|available| rustblock_core::hardware_fits(total, available));
-    let fits_vram = hardware
-        .vram_bytes
-        .map(|available| rustblock_core::hardware_fits(total, available));
-    let (label, color) = if fits_vram == Some(true) {
-        fit_label("VRAM", hardware.vram_bytes, total)
-    } else if fits_ram == Some(true) {
-        fit_label("RAM", hardware.ram_bytes, total)
-    } else if fits_ram == Some(false) && fits_vram == Some(false) {
-        ("No fit".to_string(), ERROR)
-    } else if fits_ram == Some(false) {
-        ("No RAM fit".to_string(), ERROR)
-    } else if fits_vram == Some(false) {
-        ("No VRAM fit".to_string(), ERROR)
-    } else {
-        ("Fit unknown".to_string(), MUTED)
-    };
-    (label, color, hint)
-}
-
-fn fit_badge(fit: &FitEstimate) -> (String, Color32, String) {
-    let mut hint = format!(
-        "Estimated at {} tokens: {} weights + {} KV cache + {} overhead.",
-        fit.context,
-        human_bytes(fit.weights_bytes),
-        human_bytes(fit.kv_cache_bytes),
-        human_bytes(fit.overhead_bytes)
-    );
-    hint.push_str(&format!(
-        "\nRAM: {}.",
-        fit_verdict_text(fit.hardware.ram_bytes, fit.fits_ram)
-    ));
-    hint.push_str(&format!(
-        "\nVRAM: {}.",
-        fit_verdict_text(fit.hardware.vram_bytes, fit.fits_vram)
-    ));
-    let (label, color) = if fit.fits_vram == Some(true) {
-        fit_label("VRAM", fit.hardware.vram_bytes, fit.total_bytes)
-    } else if fit.fits_ram == Some(true) {
-        fit_label("RAM", fit.hardware.ram_bytes, fit.total_bytes)
-    } else if fit.fits_ram == Some(false) && fit.fits_vram == Some(false) {
-        ("No fit".to_string(), ERROR)
-    } else if fit.fits_ram == Some(false) {
-        ("No RAM fit".to_string(), ERROR)
-    } else if fit.fits_vram == Some(false) {
-        ("No VRAM fit".to_string(), ERROR)
-    } else {
-        ("Fit unknown".to_string(), MUTED)
-    };
-    (label, color, hint)
-}
-
-fn fit_label(device: &str, available: Option<u64>, total: u64) -> (String, Color32) {
-    let Some(available) = available else {
-        return (format!("Fits {device}"), OK);
-    };
-    if available > 0 && total.saturating_mul(100) > available.saturating_mul(88) {
-        (format!("Tight {device}"), WARN)
-    } else {
-        (format!("Fits {device}"), OK)
-    }
-}
-
-fn fit_verdict_text(available: Option<u64>, fits: Option<bool>) -> String {
-    match (available, fits) {
-        (Some(bytes), Some(true)) => format!("fits in {}", human_bytes(bytes)),
-        (Some(bytes), Some(false)) => format!("does not fit in {}", human_bytes(bytes)),
-        (Some(bytes), None) => format!("{} detected; verdict unavailable", human_bytes(bytes)),
-        (None, _) => "not detected".to_string(),
-    }
-}
-
-fn job_card(
-    ui: &mut Ui,
-    job: &Job,
-    running: bool,
-    remove: &mut Option<u64>,
-    open: &mut Option<PathBuf>,
-) {
-    let color = status_color(job);
-    egui::Frame::new()
-        .fill(PANEL)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(14, 12))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(job.file_name())
-                            .size(13.0)
-                            .strong()
-                            .color(TEXT),
-                    );
-                    ui.label(
-                        RichText::new(format!(
-                            "{} · {}",
-                            human_bytes(job.analysis.file_len),
-                            job.analysis.kind_label()
-                        ))
-                        .size(10.5)
-                        .color(MUTED),
-                    )
-                    .on_hover_text(format!(
-                        "GGUF v{} · alignment {} B · {} tensors · {}",
-                        job.analysis.version,
-                        job.analysis.alignment,
-                        job.analysis.tensors,
-                        job.analysis.type_summary()
-                    ));
-                    if let Some(fit) = &job.analysis.fit {
-                        let (label, color, hint) = fit_badge(fit);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.label(
-                                RichText::new(format!("fit ~ {}", human_bytes(fit.total_bytes)))
-                                    .size(9.5)
-                                    .color(MUTED),
-                            )
-                            .on_hover_text(&hint);
-                            ui.label(RichText::new(label).size(9.0).strong().color(color))
-                                .on_hover_text(&hint);
-                        });
-                    }
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            !running,
-                            egui::Button::new(RichText::new("Remove").size(9.5).color(MUTED))
-                                .frame(false),
-                        )
-                        .clicked()
-                    {
-                        *remove = Some(job.id);
-                    }
-                    ui.label(RichText::new(status_label(job)).size(9.5).color(color));
-                });
-            });
-            if job.target != Target::Reblock
-                && job.analysis.error.is_none()
-                && (job.analysis.is_quantized() || looks_quantized_name(&job.file_name()))
-            {
-                ui.label(
-                    RichText::new("Already quantized · use an F16/BF16 model for best quality.")
-                        .size(9.5)
-                        .color(WARN),
-                );
-            }
-            if job.analysis.error.is_none() && !job.analysis.supported {
-                ui.label(
-                    RichText::new("Contains an unsupported tensor type.")
-                        .size(9.5)
-                        .color(WARN),
-                );
-            }
-            match &job.status {
-                JobStatus::Running(state) => {
-                    ui.add_space(5.0);
-                    let phase = match state.phase {
-                        Phase::Converting => "Converting",
-                        Phase::Verifying => "Verifying",
-                    };
-                    ui.add(
-                        ProgressBar::new(state.fraction())
-                            .fill(ACCENT)
-                            .animate(true)
-                            .text(format!("{} · {:.0}%", phase, state.fraction() * 100.0)),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{}/s", human_bytes(state.speed as u64)))
-                                .size(9.0)
-                                .monospace()
-                                .color(MUTED),
-                        );
-                        if let Some(eta) = state.eta() {
-                            ui.label(
-                                RichText::new(format!("{} left", human_duration(eta)))
-                                    .size(9.0)
-                                    .color(MUTED),
-                            );
-                        }
-                    });
-                }
-                JobStatus::Done { report, target } => {
-                    ui.add_space(2.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} → {} · {} · {}",
-                                human_bytes(report.old_file_size),
-                                human_bytes(report.new_file_size),
-                                target.short(),
-                                human_duration(report.elapsed)
-                            ))
-                            .size(10.0)
-                            .color(STEEL_LIGHT),
-                        );
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Open folder").size(10.0).color(ACCENT),
-                                )
-                                .frame(false),
-                            )
-                            .clicked()
-                        {
-                            *open = Some(report.output.clone());
-                        }
-                    });
-                }
-                JobStatus::Verified { outcome, elapsed } => {
-                    ui.label(
-                        RichText::new(format!(
-                            "{} · {} tensors · {} · {}",
-                            outcome.label,
-                            outcome.tensors,
-                            match outcome.kind {
-                                VerifyKind::Exact => "exact",
-                                VerifyKind::Structure => "structure",
-                            },
-                            human_duration(*elapsed)
-                        ))
-                        .size(9.5)
-                        .color(STEEL_LIGHT),
-                    );
-                }
-                JobStatus::Failed(error) => {
-                    ui.label(RichText::new(error).size(10.0).color(ERROR));
-                }
-                JobStatus::Ready => {}
-            }
-        });
 }
 
 fn hf_file_row(
@@ -2996,6 +3691,32 @@ fn hf_file_row(
     ui.separator();
 }
 
+fn target_grid(ui: &mut Ui, targets: &[Target], selected: &mut Target) {
+    let gap = 4.0;
+    let width = ((ui.available_width() - gap * 5.0) / 6.0).max(48.0);
+    for chunk in targets.chunks(6) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for target in chunk {
+                let is_selected = *selected == *target;
+                let button = egui::Button::new(
+                    RichText::new(target.short())
+                        .size(10.5)
+                        .strong()
+                        .color(if is_selected { INK } else { STEEL_LIGHT }),
+                )
+                .fill(if is_selected { ACCENT } else { PANEL_2 })
+                .stroke(Stroke::new(1.0, if is_selected { ACCENT } else { BORDER }))
+                .corner_radius(CornerRadius::same(6))
+                .min_size(Vec2::new(width, 30.0));
+                if ui.add(button).on_hover_text(target.description()).clicked() {
+                    *selected = *target;
+                }
+            }
+        });
+    }
+}
+
 fn target_caption(target: Target) -> &'static str {
     match target {
         Target::Reblock => "Lossless PQ2_0 rewrite",
@@ -3019,95 +3740,6 @@ fn target_caption(target: Target) -> &'static str {
         Target::Mxfp4 => "4-bit block float",
         Target::Nvfp4 => "NVIDIA 4-bit float",
         Target::Q1_0 => "1-bit · experimental",
-    }
-}
-
-fn status_color(job: &Job) -> Color32 {
-    match &job.status {
-        JobStatus::Ready => match job.analysis.kind {
-            FileKind::Pq2 => INFO,
-            FileKind::Q2 | FileKind::Float | FileKind::Quantized | FileKind::Mixed => MUTED,
-            FileKind::Ptq1 => WARN,
-            FileKind::Invalid | FileKind::Other => ERROR,
-        },
-        JobStatus::Running(_) | JobStatus::Done { .. } | JobStatus::Verified { .. } => ACCENT,
-        JobStatus::Failed(_) => ERROR,
-    }
-}
-
-fn status_label(job: &Job) -> String {
-    match &job.status {
-        JobStatus::Ready => {
-            if job.analysis.error.is_some() {
-                "INVALID".to_string()
-            } else if job.analysis.ptq1 > 0 {
-                "UNSUPPORTED".to_string()
-            } else if job.analysis.supported {
-                "READY".to_string()
-            } else {
-                "UNSUPPORTED".to_string()
-            }
-        }
-        JobStatus::Running(state) => match state.phase {
-            Phase::Converting => "CONVERTING".to_string(),
-            Phase::Verifying => "VERIFYING".to_string(),
-        },
-        JobStatus::Done { .. } => "DONE".to_string(),
-        JobStatus::Verified { .. } => "VERIFIED".to_string(),
-        JobStatus::Failed(_) => "ERROR".to_string(),
-    }
-}
-
-fn format_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-fn short_date(date: &str) -> String {
-    if date.len() >= 10 {
-        date[..10].to_string()
-    } else if date.is_empty() {
-        "unknown".to_string()
-    } else {
-        date.to_string()
-    }
-}
-
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => path_key(a) == path_key(b),
-    }
-}
-
-fn open_folder(path: &Path) {
-    let target = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.to_path_buf())
-    };
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("explorer").arg(target).spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(target).spawn();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(target).spawn();
-    }
-    #[cfg(not(any(windows, unix)))]
-    {
-        let _ = target;
     }
 }
 
@@ -3166,49 +3798,6 @@ mod backdrop_tests {
             backdrop.top() >= 56.0,
             "the backdrop must sit below the title bar, got {backdrop:?}"
         );
-    }
-
-    /// Drives the real view code for every surface that was restyled
-    /// (title bar, queue, settings rail, Discover, log) without a window.
-    #[test]
-    fn every_surface_renders_without_panicking() {
-        let ctx = egui::Context::default();
-        let mut app = RustBlockApp::with_context(&ctx);
-        app.discover_loaded = true;
-        let raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                Vec2::new(1120.0, 680.0),
-            )),
-            ..Default::default()
-        };
-        for tab in [Tab::Convert, Tab::Discover] {
-            app.tab = tab;
-            app.show_log = true;
-            let _ = ctx.run_ui(raw.clone(), |ui| {
-                app.top_chrome(ui);
-                if app.show_log {
-                    app.log_panel(ui);
-                }
-                match app.tab {
-                    Tab::Convert => app.settings_rail(ui),
-                    Tab::Discover => app.hf_inspector_rail(ui),
-                }
-                egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::new()
-                            .fill(BG)
-                            .inner_margin(Margin::symmetric(22, 16)),
-                    )
-                    .show(ui, |ui| {
-                        app.paint_backdrop(ui);
-                        match app.tab {
-                            Tab::Convert => app.convert_page(ui),
-                            Tab::Discover => app.discover_page(ui),
-                        }
-                    });
-            });
-        }
     }
 
     #[test]
@@ -3285,5 +3874,79 @@ mod fit_badge_tests {
             "No fit"
         );
         assert_eq!(fit_badge(&estimate(8 * gib, None, None)).0, "Fit unknown");
+    }
+}
+
+#[test]
+fn log_level_filter_matches_only_selected_levels() {
+    let entry = LogEntry {
+        level: LogLevel::Warn,
+        text: "something happened".into(),
+    };
+    assert!(log_entry_visible(&entry, "", &[true; 4]));
+    assert!(!log_entry_visible(&entry, "", &[true, true, false, true]));
+    assert!(!log_entry_visible(&entry, "absent", &[true; 4]));
+    assert!(log_entry_visible(
+        &entry,
+        "some",
+        &[false, false, true, false]
+    ));
+}
+
+#[test]
+fn every_surface_renders_without_panicking() {
+    let ctx = egui::Context::default();
+    let mut app = RustBlockApp::with_context(&ctx);
+    app.discover_loaded = true;
+    app.inspector = Some(InspectorData {
+        path: "test.gguf".into(),
+        version: 3,
+        file_len: 1024,
+        alignment: 32,
+        data_start: 512,
+        tensors: 2,
+        pq2: 0,
+        ptq1: 0,
+        file_type: Some(1),
+        metadata: vec![("general.name".to_string(), "test".to_string())],
+        histogram: vec![("F16".to_string(), 2, 64), ("Q4_K_M".to_string(), 3, 48)],
+        weights_bytes: 112,
+        fit: None,
+    });
+    let raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            Vec2::new(1120.0, 680.0),
+        )),
+        ..Default::default()
+    };
+    for tab in [Tab::Convert, Tab::Discover, Tab::Inspector] {
+        app.tab = tab;
+        app.show_log = true;
+        let _ = ctx.run_ui(raw.clone(), |ui| {
+            app.top_chrome(ui);
+            if app.show_log {
+                app.log_panel(ui);
+            }
+            match app.tab {
+                Tab::Convert => app.settings_rail(ui),
+                Tab::Discover => app.hf_inspector_rail(ui),
+                Tab::Inspector => {}
+            }
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(BG)
+                        .inner_margin(Margin::symmetric(22, 16)),
+                )
+                .show(ui, |ui| {
+                    app.paint_backdrop(ui);
+                    match app.tab {
+                        Tab::Convert => app.convert_page(ui),
+                        Tab::Discover => app.discover_page(ui),
+                        Tab::Inspector => app.inspector_page(ui),
+                    }
+                });
+        });
     }
 }

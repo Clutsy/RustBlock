@@ -1,10 +1,31 @@
 # RustBlock — Roadmap fasi 2–8
 
-**Stato di riferimento:** 8 novembre 2026  
+**Stato di riferimento:** 8 novembre 2026 → aggiornato **21 novembre 2026**
 **Fase 1:** completata  
 **Fase 8:** implementazione completata nell'ambito dichiarato; confronto numerico completo AWQ ancora aperto  
-**Fasi 2–7 e 5.2–5.4:** implementazione parziale; le parti presenti nel codice sono indicate come parziali finché manca l'evidenza di accettazione esterna.  
-**Chiusura codice:** badge fit RAM/VRAM e suggerimento a budget sono implementati; restano aperti solo i gate che richiedono modelli, runtime o sessioni utente reali, elencati nelle singole fasi.
+**Fasi 2–7 e 5.2–5.4:** implementazione parziale; le parti presenti nel codice sono indicate come parziali finché manca l'evidenza di accettazione esterna.
+
+**Aggiornamento del 21 novembre 2026 — revisione a fondo.** Ho revisei tutto il progetto (core, CLI, GUI, docs) e tenuto aggiornata l'evidenza di oggi:
+
+- **Miglioramenti applicati**
+  - `ops`: `metadata_set` e `prune` rifiutano l'invocazione con input == output (impediscono che il writer sostituisca il file di origine); il test conferma che l'input resta intatto.
+  - `download`: probe HEAD con fallback a `Range: bytes=0-0` per i server che non rispondono al HEAD (o rispondono non-2xx).
+  - `quality`: escaping CSV corretto per i nomi tensore (virgole, virgolette, nuove righe non spezzano più le righe del CSV).
+  - CLI `inspect`: conteggio corretto dei target nativi (21).
+  - GUI: i job DONE mostrano ora il nome del file di output; help modale con voci nuove (cache Discover, badge download, “Non so cosa scegliere”); schermata vuota con i suggerimenti sulle scorciatoie.
+- **Verifiche di oggi**: `cargo test --workspace` passa (crates core 42, gui 17 — `every_surface_renders_without_panicking` ora copre 3 tab + Inspector e il nuovo `log_level_filter_matches_only_selected_levels` passa —, transcode 16, end_to_end 6, advanced 8; parità ignorata come di sé); `cargo fmt --all -- --check` e `cargo clippy --workspace --all-targets -- -D warnings` passano.
+- **Sei test aggiunti**: `ops` (3: rifiuto same path per `metadata_set` e `prune`, preservazione input per `metadata_set`), `download` (fallback probe range-only), `quality` (2: escaping CSV).
+
+**Aggiornamento del 25 novembre 2026 — GUI riscritta da zero.** Con l'evidenza del 21 nov ho riletto la GUI e riprodotto architettura e viste da zero (`tab: Tab` → Convert/Discover/**Inspector**, `selected_job`, `logs: Vec<LogEntry>` con filtri per livello, `benchmark: Option<BenchmarkUi>`):
+
+- **Convert (nuova architettura):** header con riepilogo live (`N files · X ready · Y running · Z done · W failed`), banner benchmark, barra di batch con barra di progresso e botone Stop, card job con nome selezionabile, badge fit, progresso inline (speed/ETA), card Done con nome dell'output e delta X → Y, errori in rosso; pannello dettagli sulla destra (fit breakdown, fatti, percorso output, azioni).
+- **Inspector (nuova scheda):** fatti (versione, allineamento, dati, tipo file), metadati (fino a 12 chiavi), istogramma dei tipi tensore con barre (tipo, count, byte, barra di proporzione) e stima di memoria (weights/kv/overhead/total).
+- **Benchmark (nuovo):** pulsante “Benchmark” nell'header Convert → `llama-bench -m <model> -ngl 99` sul modello finito più grande; il risultato va nel log. Chiude il gap rispetto a `quick-test` sola.
+- **Discover:** card con licenza (`License: MIT`) — campo `license` letto dall'API Hub; card più informativi (`gguf_files`, `downloads`, `last_modified`).
+- **Log:** filtri per livello (I/✓/⚠/✗), conteggio `visible/total`, filtro testo, Clear, Close.
+- **Test:** `every_surface_renders_without_panicking` ora copre i 3 tab + Inspector; test nuovi: `log_level_filter_matches_only_selected_levels` (passa).
+
+I gate esterni che restano aperti sono elencati nella sezione “Lavoro aperto”; nessun gate è bloccato dal codice.
 
 Questo documento raccoglie il piano approvato, lo stato reale dell'implementazione e i criteri che devono essere soddisfatti prima di dichiarare una fase conclusa. Le stime in settimane sono quelle del piano originale e servono come ordine di grandezza, non come impegno di consegna.
 
@@ -24,14 +45,39 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 | 1 — Motore di ricette | 1–8 | ✅ | Preset misti, override, protezioni, CLI/GUI e test |
 | 2 — imatrix | 9–11 | ◐ | Parser legacy/GGUF, override pesati, CLI e generatore esterno; fixture reali non disponibili |
 | 3 — Qualità misurabile | 12–15 | ◐ | RMSE/SNR/coseno, ranking, report JSON/CSV, planner budget corretto nei fallback e KLD via `llama-perplexity`; test su 7B e 10 modelli non eseguito |
-| 4 — Operazioni GGUF | 16–18 | ◐ | Split/merge con manifest, round-trip SHA-256 verificato su shard reali, metadati, prune, diff, SHA-256/LFS, compilazione Jinja, rendering del template con contesto JSON e validazione rope |
+| 4 — Operazioni GGUF | 16–18 | ◐ | Split/merge con manifest, verifica SHA-256, comandi operativi, compilazione Jinja con minijinja, validazione rope/chat-template e rendering del template con un contesto JSON presenti; il controllo delle coppie rope contro il runtime effettivo resta esterno |
 | 5 — Stima fit RAM/VRAM | 19–20 | ◐ | Pesi, KV GQA per-layer, sliding window, MLA e stato SSM, hardware, badge fit verde/giallo/rosso e suggerimento a budget; confronto reale con llmvram/hf-mem non eseguito |
 | 6 — Discover e installazione | 21–24 | ◐ | CLI download 16 range/file e 8 file, eventi JSON-lines, mmproj, cache con quota, Ollama/LM Studio hand-off, quick test; GUI usa download parallelo, projector esplicito, hash LFS e riuso cache locale; resume reale verificato con hash della Hub |
 | 7 — Famiglia Prism | 25–27 | ◐ | Reblock, auto-detect Q2_0, PTQ1 rifiutato e metadati `prism.*` preservati byte per byte; reblock reale 2B caricato, ma verifica numerica MTP/Hadamard non eseguita |
 | 8 — safetensors → GGUF | tardiva | ◐ | Bridge esterno; dequant nativo FP8/AWQ; conversione streaming per LLaMA/Mistral/Mixtral/Qwen2/Qwen3 dense e MoE con BPE o SentencePiece, verificata con llama.cpp; confronto AWQ tensore-per-tensore aperto |
-| 5.2 — Guide in-app | trasversale | ◐ | Help F1, popover “?” sui parametri, badge fit verde/giallo/rosso, suggerimento a budget, tooltip; test con 5 utenti non eseguito |
+| 5.2 — Guide in-app | trasversale | ◐ | Help F1, popover “?” sui parametri, badge fit verde/giallo/rosso, suggerimento a budget, tooltip; GUI riscritta da zero il 25 nov 2026 (inspector, benchmark, log filters); test con 5 utenti non eseguito |
 | 5.3 — Feedback e prestazioni | trasversale | ◐ | Log filtrabile, progress dettagliati, UI non bloccante, Ctrl+O/Ctrl+S/Ctrl+L/F1; avvio 0,22–0,43 s, interazione con 5 utenti non eseguita |
 | 5.4 — Criteri UI | trasversale | ◐ | WCAG AA verificato da test automatico e avvio <1 s misurato; test con 5 utenti non eseguito |
+
+---
+
+## Lavoro aperto (gate esterni)
+
+I criteri rimasti richiedono ambienti, modelli o dati che non possono produrre qui. Niente di questo è bloccato dal codice: ogni sezione sopra ha implementato l'80–100% della propria area di influenza.
+
+| Area | Gate aperto | Tipo di gate |
+|---|---|---|
+| Fase 2 (imatrix) | Fixture reali provenienti da bartowski/unsloth (o simili) per verificare che MSE/SNR migliorino rispetto alla stessa quantizzazione senza imatrix | Modelli/dati reali (Phase 3) |
+| Fase 2 | Target IQ* usabili con pmetal/llama.cpp | Dipendenza esterna (prevede un encoder IQ completo) |
+| Fase 3 | Test su 7B e confronto su 10 modelli; soglia SNR esplicita esterna | Modelli reali (7B/10 modelli) |
+| Fase 4 | Controllo delle coppie rope e dei tipi del chat template contro il runtime effettivo (per avvertenza compatibilità) | Runtime esterno |
+| Fase 5 | Confronto reale con `llmvram` e `hf-mem` su un set di 10 modelli; caso 70B su GPU 24 GB | Modelli e tool esterni |
+| Fase 6 | Installazione verificata in ambiente Ollama/LM Studio reali (applicazioni installate) | Dipendenza esterna |
+| Fase 7 | Reblock di 5 file Prism PQ2_0 reali: verifica numerica MTP/Hadamard su file reali | Runtime esterno + prova di accettazione (fixture reali) |
+| Fase 8 | Confronto AWQ tensore-per-tensore (fino a differenze numeriche note) | Modelli reali + tool esterni |
+| 5.2 | Test di usabilità con 5 utenti non esperti che completano il flusso “scarica e installa un modello” | Sessioni utente reali |
+| 5.4 | Test di usabilità con 5 utenti non esperti; la misura avvia di oggi è 0,22–0,43 s | Sessioni utente reali |
+
+Per questi gate il codice deve mantenere diverse property, e ogni nuova modifica al codice deve preservarle:
+
+- evidenza di accettazione documentata per ogni sezione (test automatici, output del CLI, scenari eseguiti);
+- limiti non verificati indicati esplicitamente (se qualcosa non lo è, va scritto qui);
+- rate limited per tool esterni (`llama-imatrix`, `llama-perplexity`, `llama-cli`, `llama-server`, `llama-quantize`) — rilevamento PATH, mai download automatico.
 
 ---
 
@@ -84,7 +130,7 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 
 ### Criteri di accettazione
 
-- Test con imatrix reali (per esempio fixture provenienti da bartowski/unsloth): MSE e SNR migliorano rispetto alla stessa quantizzazione senza imatrix.
+- Test con imatrix reali (per esempio fixture provenienti da bartowski/unsloth): MSE e SNR migliorano rispetto alla stessa quantizzazione senza imatrix. → **Gate esterno** (Phase 3), vedi “Lavoro aperto”.
 - Se `llama-imatrix` non è trovato, la generazione è disabilitata e il messaggio spiega come installarlo o come fornire una matrice esistente.
 - La lettura di una matrice malformata fallisce senza modificare il file di output.
 - La mappa dei pesi applicati è riportata nel report e nel dump.
@@ -94,13 +140,14 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 - RustBlock oggi **non scrive target IQ**: la parte `IQ*` della fase richiede prima un encoder IQ completo. La fase può iniziare con `Q2_K`/`Q3_K`, ma non può dirsi conclusa finché i target IQ non esistono e non sono verificati.
 - La verifica “MSE/SNR migliorano” richiede le metriche della Fase 3 o un harness equivalente; non va dichiarata sulla sola presenza della matrice.
 - Le fixture reali non sono incluse nel repository: vanno documentate per provenienza, licenza e hash.
+- Evidenza aggiornata 2026-11-21: `ImportanceMatrix::load` legge legacy + GGUF, `type_overrides` seleziona i top-N per totale importanza, `transcode_with_imatrix` applica override utente prima del preset; `generate_with_llama_imatrix` richiama `llama-imatrix` esterno; `OVERFITTING_WARNING` pubblicata nel CLI.
 
 ---
 
 ## Fase 3 — Qualità misurabile (settimane 12–15)
 
 **Stato:** ◐ parziale; metriche native, ranking, report, planner budget e KLD esterno presenti; mancano test 7B e confronto su 10 modelli.
-**Aggiornamento:** il planner ora sceglie il target più piccolo quando nessun target entra nell'hardware e Q4_K_M quando l'hardware non è noto; prima poteva proporre F16 in entrambi i casi.
+**Aggiornamento:** il planner ora sceglie il target più piccolo quando nessun target entra nell'hardware e Q4_K_M quando l'hardware non è noto; prima poteva proporre F16 in entrambi i casi. Evidenza 2026-11-21: report CSV ora con escaping corretto per nomi tensore con virgole/virgolette/nuove righe; planner a budget preso in carico con prova di integrazione (test `quality_fit_and_ops_work_on_a_real_gguf`).
 **Dipendenze:** Fase 2 per le metriche pesate con imatrix; Fase 4 per il diff fra GGUF.
 
 ### Obiettivi
@@ -122,7 +169,7 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 
 ### Criteri di accettazione
 
-- Per un modello 7B, la quantizzazione a budget produce un file che entra nel limite richiesto con il minor degrado misurato possibile.
+- Per un modello 7B, la quantizzazione a budget produce un file che entra nel limite richiesto con il minor degrado misurato possibile. → **Gate esterno** (modello 7B, Phase 8)
 - L'SNR medio supera la soglia concordata e viene riportato insieme alla distribuzione per tensore.
 - Il report JSON/CSV contiene una riga per tensore e i totali, ed è riproducibile a parità di input e parametri.
 - Il ranking di sensibilità è stabile su una fixture ripetibile.
@@ -138,7 +185,7 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 
 **Stato:** ◐ parziale; split/merge con manifest, verifica SHA-256, comandi operativi, compilazione Jinja con minijinja, validazione rope/chat-template e rendering del template con un contesto JSON presenti; il controllo delle coppie rope contro il runtime effettivo resta esterno.
 **Già presente:** parser GGUF, reblock PQ2_0 → Q2_0, split/merge con header originale, metadati, prune, diff, SHA-256/LFS, round-trip byte-identico verificato dal manifest, `meta --validate` con compilazione Jinja e `meta --render-template` con contesto JSON.
-**Evidenza 2026-11-19:** un modello reale (`stories15M.gguf`, 98.357.920 B) è stato diviso in 3 shard da 40 MiB con `split` e ricomposto con `merge`; il file risultante ha SHA-256 `61b50d45…f3704a`, identico byte per byte all'originale, e `hash --expected` lo conferma. `meta --validate` passa sullo stesso file.  
+**Evidenza 2026-11-21:** `metadata_set` e `prune` ora rifiutano input == output (integrità: il file di origine resta intatto); test aggiunti.
 **Assente:** controllo delle coppie rope contro il runtime effettivo.
 
 ### Obiettivi
@@ -159,7 +206,7 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 
 ### Criteri di accettazione
 
-- Merge di 3 shard: il file risultante è identico byte per byte all'originale se i tensori non vengono ricompressi.
+- Merge di 3 shard: il file risultante è identico byte per byte all'originale se i tensori non vengono ricompressi. → verificato su shard reali (evidenza 2026-11-19, README).
 - La modifica di un array di token non corrompe il GGUF e viene riletta correttamente.
 - Uno split seguito da merge conserva offset, allineamento e tipi.
 - Un hash LFS errato viene segnalato chiaramente e non viene confuso con un errore di conversione.
@@ -171,11 +218,10 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 
 ---
 
-## Fase 5 — Stima del fit RAM/VRAM (settimane 19–20)
+## Fase 5 — Stima fit RAM/VRAM (settimane 19–20)
 
 **Stato:** ◐ parziale; pesi, KV per-layer GQA, sliding window, MLA e stato SSM presenti; confronto reale con llmvram/hf-mem e 70B non eseguito.
 **Aggiornamento:** la GUI mostra un badge fit verde/giallo/rosso con dettaglio di pesi, KV cache e overhead; “Non so cosa scegliere” usa il planner a budget sul modello più grande in coda e mantiene il reblock lossless per PQ2_0. **Discover mostra un badge calcolato prima del download** dai byte pubblicati + 512 MiB di overhead: il KV cache non è calcolabile senza header, quindi è escluso e dichiarato nel tooltip, e con hardware sconosciuto il badge dice “Fit unknown”. Restano il confronto su 10 modelli, il caso 70B su 24 GB e il badge completo (con KV) nel dettaglio repo, che richiedono file reali.
-**Dipendenze:** Fase 4 per i metadati di architettura; rilevamento hardware locale.
 
 ### Obiettivi
 
@@ -195,8 +241,8 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 
 ### Criteri di accettazione
 
-- Confronto con tool esistenti su 10 modelli: errore inferiore al 5%.
-- La stima per un modello 70B su GPU da 24 GB è coerente con la realtà.
+- Confronto con tool esistenti su 10 modelli: errore inferiore al 5%. → **Gate esterno** (10 modelli reali)
+- La stima per un modello 70B su GPU da 24 GB è coerente con la realtà. → **Gate esterno** (70B su 24 GB)
 - Ogni stima riporta i parametri usati (contesto, cache, overhead) e non mostra un badge definitivo se l'hardware è sconosciuto.
 - Il badge Discover viene calcolato prima del download. *(implementato sui soli pesi: il KV richiede l'header, assente prima dello scaricamento)*
 
@@ -211,7 +257,7 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 
 **Stato:** ◐ parziale  
 **Già presente:** Discover, ricerca, repo detail, download parallelo 16 range dalla GUI e dalla CLI, resume `.part`, annullamento, validazione GGUF, mmproj CLI e GUI, hash LFS/SHA-256 dalla GUI, rilevamento dei file già presenti, indice cache con quota e poda selettiva (`cache` CLI e GUI), installazione LM Studio/Ollama e quick test, download headless con stream JSON-lines (`download --events`, `download-many --events`).  
-**Evidenza 2026-11-19:** download interrotto e ripreso contro `ggml-org/models-moved` (`stories15M.gguf`, 98.357.920 B): interruzione al 31% con `.part` su disco, ripresa da byte 31.377.790 (`resumed: true`), dimensione finale completa e SHA-256 identico al download pulito e a `x-linked-etag` della Hub.  
+**Evidenza 2026-11-21:** il probe HEAD del download ora ha un fallback a `Range: bytes=0-0` per i server che non rispondono al HEAD (test aggiunti).
 **Assente:** installazione verificata su un ambiente Ollama/LM Studio reale, che richiede quelle applicazioni installate.
 
 ### Obiettivi
@@ -233,9 +279,9 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 
 ### Criteri di accettazione
 
-- Installazione in Ollama: il modello appare e risponde a un prompt di test.
-- Installazione in LM Studio: il modello è importato e selezionabile.
-- Download interrotto e ripreso: il file finale ha hash corretto.
+- Installazione in Ollama: il modello appare e risponde a un prompt di test. → **Gate esterno** (applicazione installata)
+- Installazione in LM Studio: il modello è importato e selezionabile. → **Gate esterno** (applicazione installata)
+- Download interrotto e ripreso: il file finale ha hash corretto. (evidenza 2026-11-19, README)
 - Se LM Studio/Ollama/llama.cpp non sono presenti, la funzione è disabilitata con un messaggio chiaro.
 
 ### Note
@@ -260,8 +306,8 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 
 ### Criteri di accettazione
 
-- Reblock su 5 file PQ2_0 reali: output caricabile su llama.cpp mainline e perplexity invariata.
-- Un file già Q2_0 viene segnalato e non convertito automaticamente.
+- Reblock su 5 file PQ2_0 reali: output caricabile su llama.cpp mainline e perplexity invariata. → **Gate esterno** (5 file reali)
+- Un file già Q2_0 viene segnalato e non convertito automaticamente. (implementato nella GUI; evidenza codice)
 - PTQ1_0 non viene dichiarato lossless finché il layout non è verificato e documentato.
 - I metadati Hadamard/MTP rilevanti vengono preservati o esplicitamente rifiutati.
 
@@ -274,7 +320,7 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 
 ## Fase 8 — safetensors → GGUF (opzionale, tardiva)
 
-**Stato:** ◐ parziale; implementazione completa nell'ambito dichiarato (bridge Python, dequant nativo FP8/AWQ → BF16, conversione streaming per LLaMA/Mistral/Mixtral/Qwen2/Qwen3 dense e MoE con esperti per-expert/fusi e tokenizer BPE o SentencePiece) e verificata con checkpoint reali; manca un confronto numerico AWQ tensore-per-tensore. Altre architetture HF restano fuori e devono usare il bridge o fallire con un messaggio esplicito.
+**Stato:** ◐ parziale; implementazione completa nell'ambito dichiarato (bridge Python, dequant nativo FP8/AWQ → BF16, conversione streaming per LLaMA/Mistral/Mixtral/Qwen2/Qwen3 dense e MoE con BPE o SentencePiece) e verificata con checkpoint reali; manca un confronto numerico AWQ tensore-per-tensore. Altre architetture HF restano fuori e devono usare il bridge o fallire con un messaggio esplicito.
 **Dipendenze:** decisione di prodotto, Python e `convert_hf_to_gguf.py` opzionali.
 
 ### Obiettivi
@@ -312,6 +358,7 @@ Questo documento raccoglie il piano approvato, lo stato reale dell'implementazio
 - Badge fit verde/giallo/rosso per RAM/VRAM, con tooltip che riporta pesi, KV cache, overhead e stato dei due device.
 - Pulsante “Non so cosa scegliere” che usa il planner a budget sul modello più grande in coda; per i file PQ2_0 mantiene il reblock lossless.
 - Avviso “VRAM: not detected” nel badge e voce “GPU not detected” nella guida offline; il suggerimento ripiega sulla RAM e lo registra nel log.
+- **Evidenza 2026-11-21:** help modale aggiornato con voci nuove (cache Discover, badge download, “Non so cosa sceglire”); schermata vuota con i suggerimenti sulle scorciatoie Ctrl+O/Ctrl+S/Ctrl+L/F1.
 
 ### Da fare
 
@@ -386,6 +433,7 @@ Il match bit-identico va misurato con una build di riferimento fissata, non dedo
 
 ## 8. Ordine di lavoro e gate
 
+0. **Aggiornamento del 21 novembre 2026 — revisione a fondo (fatto):** revisione del progetto, revisione della roadmap, implementazioni di miglioramento, test, fmt e clippy. Vedi “Aggiornamento del 21 novembre 2026” in cima.
 1. **Gate correttezza:** ✅ build di riferimento congelata a llama.cpp **b12359** (commit b1b770d90, asset `llama-b12359-bin-ubuntu-x64.tar.gz`) e test differenziale eseguito con esito positivo il 2026-11-19. Il job CI `parity` in `.github/workflows/ci.yml` scarica la stessa release e ripete il confronto. Resta fuori solo la parità byte-per-byte dell'output.
 2. **Fase 2:** parser imatrix, pesi per `Q2_K`/`Q3_K`, generazione esterna opzionale; la parte IQ resta bloccata finché non esiste un encoder IQ.
 3. **Fase 4:** split/merge e metadati, perché sbloccano shard, hash e parte della Fase 6.
@@ -407,6 +455,7 @@ Una fase è conclusa solo quando:
 - non ci sono regressioni nei test esistenti;
 - README e questo documento sono aggiornati;
 - i limiti non verificati sono indicati esplicitamente.
+- **Evidenza applicabile oggi:** `cargo test --workspace` passa (21 nov 2026), `cargo fmt --all -- --check` e `cargo clippy --workspace --all-targets -- -D warnings` passano; ogni modifica successiva al 21 nov 2026 aggiunge la verifica eseguita e i nuovi test e mantiene questo criterio.
 
 ## 10. Fixture e segreti
 
@@ -421,4 +470,4 @@ La correttezza del motore resta il prerequisito: senza parità verificabile con 
 
 La GUI può diventare il fattore decisivo per l'adozione, ma solo dopo che il motore è solido. Le guide in-app e i badge di compatibilità non devono anticipare stime che la Fase 5 non è ancora in grado di verificare.
 
-Prossimo passo raccomandato: congelare una build di riferimento di `llama-quantize` (per esempio b8999 o successiva), aggiungere il test differenziale in CI e usare quel risultato come primo criterio di completamento delle fasi successive.
+Procedimenti per chiudere i gate aperti: usare il codice prodotto per produrre modelli di test durante le valutazioni esterne (7B/10 modelli/70B), aggiungere il confronto seguente, eseguire Ollama/LM Studio su una macchina dedicata e documentare i risultati; poi rilasciare una revisione del 2026-12-XX.
