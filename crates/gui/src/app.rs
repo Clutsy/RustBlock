@@ -22,10 +22,11 @@ use std::time::{Duration, Instant};
 
 use iced::{Subscription, Task};
 
+use crate::deploy::{self, DeployEvent, DeployUi, Runtime};
 use crate::hf::{self, HfEvent, HfFile, HfModel, HfSort};
 use crate::model::{
-    analyze, human_bytes, human_duration, looks_quantized_name, output_path, path_key, FileKind,
-    InspectorData, Job, JobStatus, OutputMode, RunState, Settings,
+    analyze, human_bytes, human_duration, looks_quantized_name, output_path, path_key,
+    DownloadState, FileKind, InspectorData, Job, JobStatus, OutputMode, RunState, Settings, Source,
 };
 use crate::theme::{self, ERROR, MUTED, OK, WARN};
 use crate::worker::{self, Event, WorkItem, WorkKind};
@@ -120,8 +121,12 @@ impl Batch {
 
 #[derive(Debug, Clone)]
 pub struct DownloadUi {
+    pub id: u64,
+    pub source: Source,
     pub repo: String,
     pub file: String,
+    pub revision: String,
+    pub expected_sha: Option<String>,
     pub done: u64,
     pub total: u64,
     pub speed: f64,
@@ -129,6 +134,21 @@ pub struct DownloadUi {
     pub projector: bool,
     pub path: Option<PathBuf>,
     pub error: Option<String>,
+    pub state: DownloadState,
+}
+
+impl DownloadUi {
+    pub fn fraction(&self) -> f32 {
+        if self.total > 0 {
+            (self.done as f64 / self.total as f64).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        }
+    }
+
+    pub fn file_name(&self) -> String {
+        hf::file_name(&self.file).to_string()
+    }
 }
 
 #[derive(Debug)]
@@ -164,6 +184,15 @@ pub enum Message {
     TabSelected(Tab),
     ToggleLog,
     ToggleHelp,
+    ToggleSettings,
+    SetSource(Source),
+    SetAutoAdd(bool),
+    SetConfirmRequantize(bool),
+    HfEndpointChanged(String),
+    PickLmStudioDir,
+    PickJanDir,
+    PickPrismDir,
+    ResetSettings,
     Browse,
     FilesDropped(PathBuf),
     ClearQueue,
@@ -182,6 +211,9 @@ pub enum Message {
     Benchmark,
     InspectorOpen,
     InspectorRefresh,
+    InspectorPathChanged(String),
+    InspectorLoad,
+    InspectPath(PathBuf),
     OpenPath(PathBuf),
     SearchChanged(String),
     SearchSubmit,
@@ -190,12 +222,18 @@ pub enum Message {
     OpenRepo(String),
     AddCached(PathBuf),
     Download(HfFile),
-    CancelDownload,
+    CancelDownload(u64),
+    DismissDownload(u64),
+    ClearFinishedDownloads,
     FileFilterChanged(String),
     PickDownloadDir,
     OpenUrl(String),
-    DismissDownload,
     ClearPartials,
+    Deploy(PathBuf),
+    DeployTo(Runtime),
+    DeployCancel,
+    DeployClose,
+    ConfirmClose(bool),
     LogFilterChanged(String),
     ToggleLevel(usize),
     ClearLog,
@@ -234,8 +272,18 @@ pub struct RustBlock {
     pub hf_details_error: Option<String>,
     pub hf_file_filter: String,
     pub discover_loaded: bool,
-    pub download: Option<DownloadUi>,
+    pub downloads: Vec<DownloadUi>,
+    pub next_download_id: u64,
+    pub dl_rx: Option<Receiver<HfEvent>>,
+    pub dl_worker: Option<JoinHandle<()>>,
+    pub dl_cancel: Arc<AtomicBool>,
     pub confirm_requantize: Option<WorkKind>,
+    pub show_settings: bool,
+    pub confirm_close: bool,
+    pub inspector_error: Option<String>,
+    pub inspector_input: String,
+    pub deploy: Option<DeployUi>,
+    pub maximized: bool,
     pub window: Option<iced::window::Id>,
     pub hardware: Hardware,
     pub logo: iced::widget::image::Handle,
@@ -327,15 +375,14 @@ impl RustBlock {
 
     /// State used by tests and by nothing else; no arguments are read.
     pub fn empty() -> Self {
+        let settings = Settings::load();
+        hf::set_endpoint(&settings.hf_endpoint);
         let mut app = Self {
             tab: Tab::Convert,
             jobs: Vec::new(),
             next_id: 1,
             selected_job: None,
-            settings: Settings {
-                target: Target::Q4KM,
-                ..Settings::default()
-            },
+            settings,
             rx: None,
             worker: None,
             cancel: None,
@@ -347,8 +394,12 @@ impl RustBlock {
             log_filter: String::new(),
             log_levels: [true, true, true, true],
             show_help: false,
+            show_settings: false,
+            confirm_close: false,
             inspector_path: None,
             inspector: None,
+            inspector_error: None,
+            inspector_input: String::new(),
             hf_query: String::new(),
             hf_sort: HfSort::Downloads,
             hf_state: HfState::Idle,
@@ -363,8 +414,14 @@ impl RustBlock {
             hf_details_error: None,
             hf_file_filter: String::new(),
             discover_loaded: false,
-            download: None,
+            downloads: Vec::new(),
+            next_download_id: 1,
+            dl_rx: None,
+            dl_worker: None,
+            dl_cancel: Arc::new(AtomicBool::new(false)),
             confirm_requantize: None,
+            deploy: None,
+            maximized: false,
             window: None,
             hardware: rustblock_core::detect_hardware(),
             logo: theme::logo_handle(),
@@ -388,8 +445,23 @@ impl RustBlock {
         self.hf_rx.is_some()
     }
 
+    pub fn downloads_busy(&self) -> bool {
+        self.dl_worker.is_some()
+    }
+
+    pub fn active_downloads(&self) -> usize {
+        self.downloads
+            .iter()
+            .filter(|download| !download.state.is_finished())
+            .count()
+    }
+
     pub fn busy(&self) -> bool {
-        self.is_running() || self.hf_busy() || self.benchmark.is_some()
+        self.is_running()
+            || self.hf_busy()
+            || self.downloads_busy()
+            || self.benchmark.is_some()
+            || self.deploy.as_ref().is_some_and(|deploy| deploy.busy)
     }
 
     pub fn job_name(&self, id: u64) -> String {
@@ -462,7 +534,9 @@ impl RustBlock {
             Message::Tick => {
                 self.poll_worker();
                 self.poll_hf();
+                self.poll_downloads();
                 self.poll_benchmark();
+                self.poll_deploy();
             }
             Message::WindowOpened(id) => {
                 if self.window.is_none() {
@@ -475,16 +549,12 @@ impl RustBlock {
                 }
             }
             Message::Resize(direction) => {
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("resize.log")
-                    .and_then(|mut f| std::io::Write::write_all(&mut f, b"resize\n"));
                 if let Some(id) = self.window {
                     return iced::window::drag_resize(id, direction);
                 }
             }
             Message::ToggleMaximize => {
+                self.maximized = !self.maximized;
                 if let Some(id) = self.window {
                     return iced::window::toggle_maximize(id);
                 }
@@ -495,8 +565,18 @@ impl RustBlock {
                 }
             }
             Message::CloseWindow => {
-                if let Some(id) = self.window {
+                if self.busy() {
+                    self.confirm_close = true;
+                } else if let Some(id) = self.window {
                     return iced::window::close(id);
+                }
+            }
+            Message::ConfirmClose(quit) => {
+                self.confirm_close = false;
+                if quit {
+                    if let Some(id) = self.window {
+                        return iced::window::close(id);
+                    }
                 }
             }
             Message::TabSelected(tab) => {
@@ -508,6 +588,55 @@ impl RustBlock {
             }
             Message::ToggleLog => self.show_log = !self.show_log,
             Message::ToggleHelp => self.show_help = !self.show_help,
+            Message::ToggleSettings => self.show_settings = !self.show_settings,
+            Message::SetSource(source) => {
+                if self.settings.source != source {
+                    self.settings.source = source;
+                    self.settings.save();
+                    self.hf_state = HfState::Idle;
+                    self.selected_repo = None;
+                    self.hf_files.clear();
+                    self.hf_details_error = None;
+                    self.pending_details = None;
+                    self.discover_loaded = false;
+                }
+            }
+            Message::SetAutoAdd(value) => {
+                self.settings.auto_add_downloads = value;
+                self.settings.save();
+            }
+            Message::SetConfirmRequantize(value) => {
+                self.settings.confirm_requantize = value;
+                self.settings.save();
+            }
+            Message::HfEndpointChanged(value) => {
+                self.settings.hf_endpoint = value;
+                self.settings.save();
+                hf::set_endpoint(&self.settings.hf_endpoint);
+            }
+            Message::PickLmStudioDir => {
+                if let Some(path) = pick_folder("LM Studio models") {
+                    self.settings.lmstudio_dir = path;
+                    self.settings.save();
+                }
+            }
+            Message::PickJanDir => {
+                if let Some(path) = pick_folder("Jan data folder") {
+                    self.settings.jan_dir = path;
+                    self.settings.save();
+                }
+            }
+            Message::PickPrismDir => {
+                if let Some(path) = pick_folder("Prism models") {
+                    self.settings.prism_dir = path;
+                    self.settings.save();
+                }
+            }
+            Message::ResetSettings => {
+                self.settings = Settings::default();
+                self.settings.save();
+                hf::set_endpoint(&self.settings.hf_endpoint);
+            }
             Message::Browse => self.browse(),
             Message::FilesDropped(path) => self.add_paths(vec![path]),
             Message::ClearQueue => {
@@ -564,7 +693,7 @@ impl RustBlock {
             }
             Message::PickOutputDir => {
                 if !self.is_running() {
-                    if let Some(picked) = rfd::FileDialog::new().pick_folder() {
+                    if let Some(picked) = pick_folder("Output folder") {
                         self.last_output_dir = Some(picked.clone());
                         self.settings.output_mode = OutputMode::Custom(picked);
                     }
@@ -579,6 +708,34 @@ impl RustBlock {
             Message::Benchmark => self.start_benchmark(),
             Message::InspectorOpen => self.inspector_open(),
             Message::InspectorRefresh => self.inspector_refresh(),
+            Message::InspectorPathChanged(value) => self.inspector_input = value,
+            Message::InspectorLoad => {
+                let text = self.inspector_input.trim().to_string();
+                if !text.is_empty() {
+                    self.inspector_path = Some(PathBuf::from(text));
+                    self.inspector_refresh();
+                }
+            }
+            Message::InspectPath(path) => {
+                self.inspector_path = Some(path);
+                self.tab = Tab::Inspector;
+                self.inspector_refresh();
+            }
+            Message::Deploy(path) => self.deploy = Some(DeployUi::new(path)),
+            Message::DeployTo(runtime) => self.deploy_to(runtime),
+            Message::DeployCancel => {
+                if let Some(deploy) = &self.deploy {
+                    deploy.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            Message::DeployClose => {
+                if let Some(mut deploy) = self.deploy.take() {
+                    deploy.cancel.store(true, Ordering::Relaxed);
+                    if let Some(worker) = deploy.worker.take() {
+                        let _ = worker.join();
+                    }
+                }
+            }
             Message::OpenPath(path) => open_folder(&path),
             Message::SearchChanged(query) => self.hf_query = query,
             Message::SearchSubmit => self.start_search(),
@@ -609,15 +766,41 @@ impl RustBlock {
                 };
                 self.start_download(repo, file);
             }
-            Message::CancelDownload => self.hf_cancel.store(true, Ordering::Relaxed),
+            Message::CancelDownload(id) => {
+                if let Some(download) = self.downloads.iter_mut().find(|download| download.id == id)
+                {
+                    match download.state {
+                        DownloadState::Running => {
+                            self.dl_cancel.store(true, Ordering::Relaxed);
+                        }
+                        DownloadState::Queued => {
+                            download.state = DownloadState::Cancelled;
+                            download.error = Some("Cancelled before starting.".to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Message::ClearFinishedDownloads => {
+                self.downloads
+                    .retain(|download| !download.state.is_finished());
+            }
             Message::FileFilterChanged(value) => self.hf_file_filter = value,
             Message::PickDownloadDir => {
-                if let Some(picked) = rfd::FileDialog::new().pick_folder() {
+                if let Some(picked) = pick_folder("Output folder") {
                     self.settings.download_dir = picked;
                 }
             }
             Message::OpenUrl(url) => open_url(&url),
-            Message::DismissDownload => self.download = None,
+            Message::DismissDownload(id) => {
+                if !self
+                    .downloads
+                    .iter()
+                    .any(|download| download.id == id && download.state == DownloadState::Running)
+                {
+                    self.downloads.retain(|download| download.id != id);
+                }
+            }
             Message::ClearPartials => {
                 let removed =
                     crate::model::clear_partial_files(&self.settings.download_dir).unwrap_or(0);
@@ -741,7 +924,7 @@ impl RustBlock {
     }
 
     fn browse(&mut self) {
-        if let Some(files) = rfd::FileDialog::new()
+        if let Some(files) = file_dialog()
             .add_filter("GGUF model", &["gguf"])
             .pick_files()
         {
@@ -1125,19 +1308,106 @@ impl RustBlock {
     }
 
     fn inspector_open(&mut self) {
-        if let Some(files) = rfd::FileDialog::new()
+        if let Some(path) = file_dialog()
             .add_filter("GGUF model", &["gguf"])
-            .pick_files()
+            .pick_file()
         {
-            if let Some(path) = files.into_iter().next() {
-                self.inspector_path = Some(path);
-                self.inspector_refresh();
-            }
+            self.inspector_path = Some(path);
+            self.inspector_refresh();
         }
     }
 
     fn inspector_refresh(&mut self) {
-        self.inspector = self.inspector_path.as_deref().and_then(InspectorData::open);
+        self.inspector = None;
+        self.inspector_error = None;
+        let Some(path) = self.inspector_path.as_deref() else {
+            return;
+        };
+        self.inspector_input = path.display().to_string();
+        match InspectorData::open(path) {
+            Some(data) => self.inspector = Some(data),
+            None => {
+                self.inspector_error = Some(format!(
+                    "Cannot read {}: not a valid GGUF, or a tensor type this build cannot decode.",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    fn deploy_to(&mut self, runtime: Runtime) {
+        let Some(deploy) = &mut self.deploy else {
+            return;
+        };
+        if deploy.busy {
+            return;
+        }
+        let model = deploy.model.clone();
+        let settings = self.settings.clone();
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        deploy.runtime = Some(runtime);
+        deploy.busy = true;
+        deploy.done = 0;
+        deploy.total = 0;
+        deploy.message = None;
+        deploy.folder = None;
+        deploy.rx = Some(rx);
+        deploy.cancel = cancel.clone();
+        deploy.worker = Some(deploy::spawn(runtime, model.clone(), settings, tx, cancel));
+        self.log(
+            LogLevel::Info,
+            format!("Deploying {} to {}.", file_name_of(&model), runtime.label()),
+        );
+    }
+
+    fn poll_deploy(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(deploy) = &self.deploy {
+            if let Some(rx) = &deploy.rx {
+                loop {
+                    match rx.try_recv() {
+                        Ok(event) => events.push(event),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for event in events {
+            if let Some(deploy) = &mut self.deploy {
+                match event {
+                    DeployEvent::Progress { done, total } => {
+                        deploy.done = done;
+                        deploy.total = total;
+                    }
+                    DeployEvent::Done { folder, message } => {
+                        deploy.busy = false;
+                        deploy.message = Some(message.clone());
+                        deploy.folder = Some(folder);
+                        self.log(LogLevel::Ok, message);
+                    }
+                    DeployEvent::Failed(error) => {
+                        deploy.busy = false;
+                        deploy.message = Some(error.clone());
+                        self.log(LogLevel::Error, error);
+                    }
+                }
+            }
+        }
+        if disconnected {
+            if let Some(deploy) = &mut self.deploy {
+                deploy.rx = None;
+                deploy.busy = false;
+                if let Some(worker) = deploy.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+        }
     }
 
     fn suggest_target(&mut self) {
@@ -1227,6 +1497,23 @@ impl RustBlock {
             return;
         }
         let query = self.hf_query.trim().to_string();
+        if self.settings.source == Source::ModelScope {
+            let Some(repo) = hf::parse_modelscope(&query) else {
+                let error = "Paste a ModelScope model link (modelscope.cn/models/owner/name) or an owner/name id."
+                    .to_string();
+                self.hf_state = HfState::Error(error.clone());
+                self.log(LogLevel::Error, error);
+                return;
+            };
+            self.open_link_ms(repo);
+            return;
+        }
+        if query.contains("modelscope.cn") || query.contains("modelscope.ai") {
+            let error = "That is a ModelScope link. Switch Source to ModelScope first.".to_string();
+            self.hf_state = HfState::Error(error.clone());
+            self.log(LogLevel::Error, error);
+            return;
+        }
         if let Some(link) = hf::parse_link(&query) {
             let lower = query.to_ascii_lowercase();
             let points_at_file = lower.contains("/blob/") || lower.contains("/resolve/");
@@ -1306,9 +1593,37 @@ impl RustBlock {
         }));
     }
 
+    fn open_link_ms(&mut self, repo: String) {
+        if self.hf_busy() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.hf_query = repo.clone();
+        self.hf_state = HfState::Searching;
+        self.selected_repo = Some(repo.clone());
+        self.selected_sha = "master".to_string();
+        self.hf_details_loading = false;
+        self.hf_details_error = None;
+        self.pending_details = None;
+        self.hf_files.clear();
+        self.hf_file_filter.clear();
+        self.hf_rx = Some(rx);
+        self.hf_cancel = Arc::new(AtomicBool::new(false));
+        self.log(LogLevel::Info, format!("Opening ModelScope model {repo}."));
+        self.hf_worker = Some(thread::spawn(move || {
+            let _ = tx.send(HfEvent::SearchStarted);
+            let model = hf::fetch_model_ms(&repo);
+            let _ = tx.send(HfEvent::SearchResults(vec![model]));
+        }));
+    }
+
     /// Select a repository from the results and load its file list.
     fn open_repo(&mut self, repo: String) {
         if self.hf_busy() {
+            return;
+        }
+        if self.settings.source == Source::ModelScope {
+            self.start_details(repo, "master".to_string());
             return;
         }
         let revision = match &self.hf_state {
@@ -1335,9 +1650,14 @@ impl RustBlock {
         let (tx, rx) = mpsc::channel();
         self.hf_rx = Some(rx);
         self.hf_cancel = Arc::new(AtomicBool::new(false));
+        let source = self.settings.source;
         self.hf_worker = Some(thread::spawn(move || {
             let _ = tx.send(HfEvent::DetailsStarted(repo.clone()));
-            match hf::list_files(&repo, &revision) {
+            let result = match source {
+                Source::HuggingFace => hf::list_files(&repo, &revision),
+                Source::ModelScope => hf::list_files_ms(&repo),
+            };
+            match result {
                 Ok(files) => {
                     let _ = tx.send(HfEvent::DetailsLoaded { repo, files });
                 }
@@ -1349,14 +1669,11 @@ impl RustBlock {
     }
 
     fn start_download(&mut self, repo: String, file: HfFile) {
-        let projector = file.projector;
-        self.begin_download(repo, file, projector);
+        self.begin_download(repo, file);
     }
 
-    fn begin_download(&mut self, repo: String, file: HfFile, projector: bool) {
-        if self.hf_busy() {
-            return;
-        }
+    fn begin_download(&mut self, repo: String, file: HfFile) {
+        let projector = file.projector;
         if !projector {
             if let Err(reason) = hf::file_support(&file.path) {
                 self.log(
@@ -1372,12 +1689,20 @@ impl RustBlock {
             );
             return;
         }
-        let dest = self.settings.download_dir.clone();
-        let revision = self.selected_sha.clone();
-        let (tx, rx) = mpsc::channel();
-        self.download = Some(DownloadUi {
+        let source = self.settings.source;
+        let revision = match source {
+            Source::HuggingFace => self.selected_sha.clone(),
+            Source::ModelScope => "master".to_string(),
+        };
+        let id = self.next_download_id;
+        self.next_download_id += 1;
+        self.downloads.push(DownloadUi {
+            id,
+            source,
             repo: repo.clone(),
             file: file.path.clone(),
+            revision,
+            expected_sha: file.sha256.clone(),
             done: 0,
             total: file.size,
             speed: 0.0,
@@ -1385,42 +1710,184 @@ impl RustBlock {
             projector,
             path: None,
             error: None,
+            state: DownloadState::Queued,
         });
-        self.hf_rx = Some(rx);
-        self.hf_cancel = Arc::new(AtomicBool::new(false));
-        let cancel = self.hf_cancel.clone();
-        self.hf_worker = Some(thread::spawn(move || {
-            let result = if projector {
-                hf::download_projector(
-                    &repo,
-                    &revision,
-                    &file.path,
-                    &dest,
-                    file.sha256.as_deref(),
-                    &cancel,
-                    &tx,
-                )
-            } else {
-                hf::download_parallel(
-                    &repo,
-                    &revision,
-                    &file.path,
-                    &dest,
-                    file.sha256.as_deref(),
-                    &cancel,
-                    &tx,
-                )
-            };
+        self.log(
+            LogLevel::Info,
+            format!(
+                "Queued {} from {} ({} in the download list).",
+                file.path,
+                source.label(),
+                self.downloads.len()
+            ),
+        );
+        self.start_next_download();
+    }
+
+    fn start_next_download(&mut self) {
+        if self.dl_worker.is_some() {
+            return;
+        }
+        let Some(index) = self
+            .downloads
+            .iter()
+            .position(|download| download.state == DownloadState::Queued)
+        else {
+            return;
+        };
+        let dest = self.settings.download_dir.clone();
+        let (source, repo, file, revision, sha) = {
+            let item = &mut self.downloads[index];
+            item.state = DownloadState::Running;
+            item.done = 0;
+            item.speed = 0.0;
+            item.error = None;
+            (
+                item.source,
+                item.repo.clone(),
+                item.file.clone(),
+                item.revision.clone(),
+                item.expected_sha.clone(),
+            )
+        };
+        let (tx, rx) = mpsc::channel();
+        self.dl_rx = Some(rx);
+        self.dl_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.dl_cancel.clone();
+        let display = format!("{repo}/{file}");
+        self.log(LogLevel::Info, format!("Downloading {display}."));
+        self.dl_worker = Some(thread::spawn(move || {
+            let result = hf::download_from(
+                source,
+                &repo,
+                &revision,
+                &file,
+                &dest,
+                sha.as_deref(),
+                &cancel,
+                &tx,
+            );
             if let Err(error) = result {
                 if error != "download cancelled" {
-                    let _ = tx.send(HfEvent::DownloadFailed {
-                        repo,
-                        file: file.path,
-                        error,
-                    });
+                    let _ = tx.send(HfEvent::DownloadFailed { repo, file, error });
                 }
             }
         }));
+    }
+
+    fn active_download_mut(&mut self) -> Option<&mut DownloadUi> {
+        self.downloads
+            .iter_mut()
+            .find(|download| download.state == DownloadState::Running)
+    }
+
+    fn poll_downloads(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &self.dl_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for event in events {
+            match event {
+                HfEvent::DownloadStarted { total, .. } => {
+                    if let Some(download) = self.active_download_mut() {
+                        download.total = total;
+                    }
+                }
+                HfEvent::DownloadProgress { done, total, speed } => {
+                    if let Some(download) = self.active_download_mut() {
+                        download.done = done;
+                        download.total = total;
+                        download.speed = if download.speed <= 0.0 {
+                            speed
+                        } else {
+                            download.speed * 0.75 + speed * 0.25
+                        };
+                    }
+                }
+                HfEvent::Downloaded {
+                    repo,
+                    file,
+                    path,
+                    projector,
+                } => {
+                    let quantized = self
+                        .active_download_mut()
+                        .map(|download| {
+                            download.path = Some(path.clone());
+                            download.done = download.total;
+                            download.state = DownloadState::Done;
+                            download.quantized
+                        })
+                        .unwrap_or(false);
+                    if projector {
+                        self.log(
+                            LogLevel::Ok,
+                            format!(
+                                "Downloaded projector {repo}/{file} to {}. Keep it next to the model for the runtime.",
+                                path.display()
+                            ),
+                        );
+                    } else {
+                        self.log(
+                            LogLevel::Ok,
+                            format!("Downloaded {repo}/{file} to {}.", path.display()),
+                        );
+                        if quantized {
+                            self.log(
+                                LogLevel::Warn,
+                                format!(
+                                    "{file} is already quantized. Converting it again cannot recover the original precision; use a virgin F16/BF16 model if available."
+                                ),
+                            );
+                        }
+                        if self.settings.auto_add_downloads {
+                            self.add_paths(vec![path]);
+                        } else {
+                            self.log(
+                                LogLevel::Info,
+                                "Auto-add is off: add the model from the download list when you are ready."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                HfEvent::DownloadFailed { repo, file, error } => {
+                    if let Some(download) = self.active_download_mut() {
+                        download.state = DownloadState::Failed;
+                        download.error = Some(error.clone());
+                    }
+                    self.log(
+                        LogLevel::Error,
+                        format!("Download failed for {repo}/{file}: {error}"),
+                    );
+                }
+                HfEvent::DownloadCancelled => {
+                    if let Some(download) = self.active_download_mut() {
+                        download.state = DownloadState::Cancelled;
+                        download.error = Some("Download cancelled.".to_string());
+                    }
+                    self.log(LogLevel::Warn, "Download cancelled.".to_string());
+                }
+                _ => {}
+            }
+        }
+        if disconnected {
+            self.dl_rx = None;
+            if let Some(handle) = self.dl_worker.take() {
+                let _ = handle.join();
+            }
+            self.start_next_download();
+        }
     }
 
     fn poll_hf(&mut self) {
@@ -1444,7 +1911,11 @@ impl RustBlock {
                 HfEvent::SearchResults(results) => {
                     self.log(
                         LogLevel::Info,
-                        format!("Hugging Face: {} GGUF repositories found.", results.len()),
+                        format!(
+                            "{}: {} GGUF repositories found.",
+                            self.settings.source.label(),
+                            results.len()
+                        ),
                     );
                     self.pending_details = results
                         .first()
@@ -1474,77 +1945,7 @@ impl RustBlock {
                     self.hf_details_loading = false;
                     self.log(LogLevel::Error, error);
                 }
-                HfEvent::DownloadStarted { repo, file, total } => {
-                    if let Some(download) = &mut self.download {
-                        if download.repo == repo && download.file == file {
-                            download.total = total;
-                        }
-                    }
-                }
-                HfEvent::DownloadProgress { done, total, speed } => {
-                    if let Some(download) = &mut self.download {
-                        download.done = done;
-                        download.total = total;
-                        download.speed = if download.speed <= 0.0 {
-                            speed
-                        } else {
-                            download.speed * 0.75 + speed * 0.25
-                        };
-                    }
-                }
-                HfEvent::Downloaded {
-                    repo,
-                    file,
-                    path,
-                    projector,
-                } => {
-                    if let Some(download) = &mut self.download {
-                        download.path = Some(path.clone());
-                        download.done = download.total;
-                    }
-                    if projector {
-                        self.log(
-                            LogLevel::Ok,
-                            format!(
-                                "Downloaded projector {repo}/{file} to {}. Keep it next to the model for the runtime.",
-                                path.display()
-                            ),
-                        );
-                    } else {
-                        self.log(
-                            LogLevel::Ok,
-                            format!("Downloaded {repo}/{file} to {}.", path.display()),
-                        );
-                        if self
-                            .download
-                            .as_ref()
-                            .is_some_and(|download| download.quantized)
-                        {
-                            self.log(
-                                LogLevel::Warn,
-                                format!(
-                                    "{file} is already quantized. Converting it again cannot recover the original precision; use a virgin F16/BF16 model if available."
-                                ),
-                            );
-                        }
-                        self.add_paths(vec![path]);
-                    }
-                }
-                HfEvent::DownloadFailed { repo, file, error } => {
-                    if let Some(download) = &mut self.download {
-                        download.error = Some(error.clone());
-                    }
-                    self.log(
-                        LogLevel::Error,
-                        format!("Download failed for {repo}/{file}: {error}"),
-                    );
-                }
-                HfEvent::DownloadCancelled => {
-                    if let Some(download) = &mut self.download {
-                        download.error = Some("Download cancelled.".to_string());
-                    }
-                    self.log(LogLevel::Warn, "Download cancelled.".to_string());
-                }
+                _ => {}
             }
         }
         if disconnected {
@@ -1563,6 +1964,77 @@ impl RustBlock {
 }
 
 // ----- Small helpers ------------------------------------------------------
+
+/// Native dialogs must be owned by the app window. Without a parent the
+/// dialog can open behind the frameless window and look like a freeze.
+#[cfg(windows)]
+fn file_dialog() -> rfd::FileDialog {
+    let dialog = rfd::FileDialog::new();
+    match foreground_window() {
+        Some(parent) => dialog.set_parent(&parent),
+        None => dialog,
+    }
+}
+
+#[cfg(not(windows))]
+fn file_dialog() -> rfd::FileDialog {
+    rfd::FileDialog::new()
+}
+
+#[cfg(windows)]
+fn pick_folder(_title: &str) -> Option<PathBuf> {
+    file_dialog().pick_folder()
+}
+
+#[cfg(not(windows))]
+fn pick_folder(_title: &str) -> Option<PathBuf> {
+    file_dialog().pick_folder()
+}
+
+#[cfg(windows)]
+fn foreground_window() -> Option<ForegroundWindow> {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetForegroundWindow() -> isize;
+    }
+    let handle = unsafe { GetForegroundWindow() };
+    (handle != 0).then_some(ForegroundWindow(handle))
+}
+
+#[cfg(windows)]
+struct ForegroundWindow(isize);
+
+#[cfg(windows)]
+impl raw_window_handle::HasWindowHandle for ForegroundWindow {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        let handle = raw_window_handle::Win32WindowHandle::new(
+            std::num::NonZeroIsize::new(self.0)
+                .ok_or(raw_window_handle::HandleError::Unavailable)?,
+        );
+        Ok(unsafe {
+            raw_window_handle::WindowHandle::borrow_raw(raw_window_handle::RawWindowHandle::Win32(
+                handle,
+            ))
+        })
+    }
+}
+
+#[cfg(windows)]
+impl raw_window_handle::HasDisplayHandle for ForegroundWindow {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Ok(unsafe {
+            raw_window_handle::DisplayHandle::borrow_raw(
+                raw_window_handle::RawDisplayHandle::Windows(
+                    raw_window_handle::WindowsDisplayHandle::new(),
+                ),
+            )
+        })
+    }
+}
 
 pub fn open_folder(path: &Path) {
     let target = if path.is_dir() {

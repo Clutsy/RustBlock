@@ -2,7 +2,7 @@
 
 <p align="center"><img src="docs/assets/rustblock-wordmark.png" width="420" alt="RustBlock wordmark"></p>
 
-**The native Swiss Army knife for GGUF models.** Reblock Prism ternary files, convert floats, quantize, verify and download from Hugging Face — from one steel-and-blocks desktop app. No Python, Node.js or terminal knowledge required.
+**The native Swiss Army knife for GGUF models.** Reblock Prism ternary files, convert floats, quantize, verify and download from Hugging Face or ModelScope — from one steel-and-blocks desktop app. No Python, Node.js or terminal knowledge required.
 
 RustBlock opens the source **read-only**, writes to a temporary file in the destination folder, verifies the result, and only then renames it into place. There is no telemetry and no upload of model data.
 
@@ -59,18 +59,21 @@ Both use the same 2-bit ternary codec. RustBlock splits each 128-value block int
 - **Convert** view: drag & drop one or many `.gguf` files, or browse with the native file picker.
 - Choose any of the 22 targets with hover descriptions. Every format is visible at once in a three-column grid — no collapsed “More formats” drawer. Float, legacy block, uniform and mixed K-quant, FP4 and 1-bit are grouped in the normal grid; **TQ1_0/TQ2_0 have their own ternary section** with a separate warning because ternary is a different use case, not a normal requant.
 - Compact queue with live speed/ETA, per-file progress, **stop after the current file** and per-file removal.
-- **Fit at a glance.** Each queued file shows a green/yellow/red RAM/VRAM verdict at 4096 tokens; hover for weights, KV cache and overhead. **Non so cosa scegliere** runs the budget planner on the largest queued model and keeps lossless Reblock for PQ2_0.
+- **Fit at a glance.** Each queued file shows a green/yellow/red RAM/VRAM verdict at 4096 tokens; hover for weights, KV cache and overhead. **Suggest a format** runs the budget planner on the largest queued model and keeps lossless Reblock for PQ2_0.
 - Output next to each input or in a custom folder, with overwrite protection and duplicate-path checks.
 - Choose `Off`, `Structure` or `Full` verification per batch; `Structure` is the default. The CLI exposes the same `--verify none|structure|full` levels for scripted checks.
-- **Discover** view: opens on the most downloaded GGUF repositories, then search Hugging Face, paste a full `huggingface.co/author/model` link, sort by downloads, likes or update time, and open a repository to see its downloadable GGUF files and sizes. Every file row shows a fit verdict computed **before the download** from the published weight size plus 512 MiB of runtime overhead; the tooltip states that the KV cache is not included because it needs the model header.
-- Downloads use a transfer panel in the Discover rail with byte counts, percentage, smoothed speed, cancellation and resumable `.part` files; finished downloads are added to Convert automatically and **Clean partials** removes interrupted `.part` files.
+- **Discover** view: opens on the most downloaded GGUF repositories, then search Hugging Face, paste a full `huggingface.co/author/model` link, sort by downloads, likes or update time, and open a repository to see its downloadable GGUF files and sizes. A source switch adds **ModelScope**: it has no public search endpoint, so paste a `modelscope.cn/models/owner/name` link (or `owner/name`) and its files are listed through the official repository API. Every file row shows a fit verdict computed **before the download** from the published weight size plus 512 MiB of runtime overhead; the tooltip states that the KV cache is not included because it needs the model header.
+- **Download list.** Every request enters a queue in the Discover rail; one transfer runs at a time so browsing stays responsive. Each card shows byte counts, percentage, smoothed speed, the source and repository, with Cancel, Dismiss and Clear finished. A finished file can be added to Convert, opened, inspected or deployed; automatic queueing can be turned off in Settings. Downloads are resumable `.part` files, and **Clean partials** removes interrupted ones.
 - Files whose names indicate an existing quantization (`Q4_K_M`, `Q8_0`, `IQ…`, `TQ…`, `MXFP4`, …) are marked **already quantized** before download. After conversion starts, the tensor types are checked as well. Converting a quantized model to another quantized format requires a confirmation, because it compounds the loss; a virgin F16/BF16 release is the better source.
 - **Supported standalone GGUF models can be downloaded.** Non-GGUF files are hidden; importance matrices, adapters, split shards and PTQ1_0 containers are rejected. Vision projectors can be downloaded next to their model but never enter the conversion queue. The download function repeats the check before the network request, then re-opens the finished file, verifies its tensor types and deletes it if the native engine cannot decode it. Files already present are shown as cached and can be added to the queue with one click.
 - **Built with iced 0.14** (Elm architecture, no retained widget tree): state, messages and effects are separate from rendering, and the view is a pure function of the state.
-- **Frameless custom chrome.** The gear mark and the RUSTBLOCK wordmark sit once, at the left of the title bar; the square gear is the app icon and a large, faint backdrop behind the content. Minimize, maximize and close are inside the app, the window can be dragged from the brand and resized from its eight-pixel edges and corners. Double-click the brand to maximize. The full wordmark logo appears in the Help panel.
+- **Frameless custom chrome.** The supplied wordmark image is the only branding in the title bar — no text lockup and no second logo. Minimize, maximize/restore and close are canvas-drawn controls inside the app; the maximize icon switches to a restore icon, closing while a job is running asks for confirmation, and the window can be dragged from the wordmark and resized from its eight-pixel edges and corners. Double-click the wordmark to maximize. A faint wordmark remains as the content backdrop.
+- **Settings.** Persisted in `%APPDATA%\RustBlock\settings.json`: conversion confirmation and automatic queueing of finished downloads, download folder, model source, Hugging Face endpoint (use `https://hf-mirror.com` when the Hub is blocked), and the LM Studio, Jan and Prism/llama.cpp model folders. Reset defaults is one click away.
+- **Test in a runtime.** Any finished model can be registered in **Ollama** through a generated Modelfile and `ollama create`, or copied into the **LM Studio**, **Jan** or **Prism/llama.cpp** model folder; Jan also receives a `model.yml`. The dialog shows whether each target is actually available, copies run on a worker with progress and can be cancelled.
+- **Inspector.** Open a local `.gguf` with the native picker or paste its path. It shows header facts, metadata, the tensor type histogram with byte sizes and a memory estimate; a failed read explains why instead of leaving the tab blank.
 - The interface is deliberately minimal: dark graphite, neutral steel and square controls, with one action per view. The log panel is collapsed by default and opens with `Ctrl+L` or the Log button; it keeps the last 500 entries.
 
-Network access is used **only** when you search or download from Hugging Face. Local conversion works offline.
+Network access is used **only** when you search or download from a model source. Local conversion works offline.
 
 ### Multicore conversion
 
@@ -198,7 +201,7 @@ rustblock meta model.gguf --render-template context.json
 rustblock meta model.gguf --render-template context.json --json
 ```
 
-`context.json` must be a JSON object, for example `{"messages":[{"role":"user","content":"Ciao"}],"add_generation_prompt":true}`. The rendered text is printed as-is unless `--json` is used. Rope-pair validation against a live runtime remains an external integration check.
+`context.json` must be a JSON object, for example `{"messages":[{"role":"user","content":"Hello"}],"add_generation_prompt":true}`. The rendered text is printed as-is unless `--json` is used. Rope-pair validation against a live runtime remains an external integration check.
 
 Quantized Hugging Face checkpoints can be dequantized natively to BF16 safetensors before using the Python GGUF bridge. FP8 (`F8_E4M3`, `F8_E4M3FN`, `F8_E5M2`) and AutoAWQ 4-bit GEMM tensors are supported; AWQ matrices are transposed to the Hugging Face `[out_features, in_features]` layout, and the command does not invent model architecture metadata:
 
@@ -233,7 +236,7 @@ Events are `start`, `progress`, `done`, `error` and, for a batch, `summary`; eac
 - Unknown tensor types are rejected rather than guessed.
 - **Native safetensors → GGUF covers LLaMA, Mistral, Mixtral, Qwen2 and Qwen3 dense/MoE checkpoints with BPE or SentencePiece tokenizers, including direct FP8/AWQ sources.** It does not cover every Hugging Face architecture or every quantized layout; unsupported cases fail explicitly or use the Python bridge.
 - Quantization is inherently lossy. `Full` verification catches structural errors and gross numerical damage; it is not a mathematical proof of model quality.
-- The GUI runs one batch at a time. A stop request takes effect after the current file.
+- The GUI runs one conversion batch and one download transfer at a time. A stop request takes effect after the current file.
 - Converted `Q2_0` reblocks need llama.cpp **b11555+** or LM Studio **2.56+**. Other targets need a runtime that supports the chosen GGUF type.
 - No model weights are bundled.
 
@@ -280,7 +283,7 @@ The approved phases 2–8, their current implementation status, dependencies and
 
 **Roadmap updated 2026-11-21 with a full-project review.** The statuses, evidence and open gates are consolidated in [docs/roadmap.md](docs/roadmap.md): the open gates are consolidated in the “Lavoro aperto” section, and today's improvements are listed in the header. Today's changes include: `metadata_set`/`prune` refuse input == output (no data loss), download falls back to a `Range` probe when a server rejects HEAD, CSV quality reports escape tensor names, the CLI `inspect` target count is corrected, and the GUI shows the output file name on completed jobs plus new help entries.
 
-The GUI shows color-coded fit badges, uses the budget planner for the “Non so coda scegliere” suggestion and keeps a *Cache limit* control on the Discover tab. Since 2026-11-25 the GUI is **rewritten from zero** with a three-tab layout: Convert (new queue manager with inline progress, a benchmark banner and job details), Discover (license display, richer cards) and **Inspector** (a new tab: facts, metadata and the tensor type histogram of a local GGUF, the same view the Hugging Face Hub shows on model pages). The activity log now has per-level filters. The remaining acceptance gates need external models, runtimes or user sessions: 7B/70B runtime, the 10-model fit comparison, real Ollama/LM Studio installation, numerical MTP/Hadamard execution, a tensor-by-tensor AWQ comparison and the 5-person usability study.
+The GUI shows color-coded fit badges and uses the budget planner for the “Suggest a format” suggestion. On 2026-11-22 it was **rebuilt from scratch** on iced with a three-tab layout: Convert (queue manager with inline progress, a benchmark banner and job details), Discover (license display, richer cards, a queued download list, Hugging Face/ModelScope sources) and **Inspector** (facts, metadata and the tensor type histogram of a local GGUF). Settings, runtime deployment and the canvas-drawn window controls were added in the same pass, and the activity log has per-level filters. The remaining acceptance gates need external models, runtimes or user sessions: 7B/70B runtime, the 10-model fit comparison, real Ollama/LM Studio installation, numerical MTP/Hadamard execution, a tensor-by-tensor AWQ comparison and the 5-person usability study.
 
 The CLI now also exposes `quality`, `fit`, `split`, `merge`, `meta` (including `--render-template`), `prune`, `diff`, `hash`, `download` and `download-many` (with `--events`), `cache`, `install`, `quick-test`, `imatrix` and `from-safetensors`. GUI help/log, parameter popovers, fit badges, custom window controls and the `Ctrl+O`/`Ctrl+S`/`Ctrl+L`/`F1` shortcuts are available.
 

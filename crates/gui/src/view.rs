@@ -3,26 +3,31 @@
 //! The view is a pure function of [`RustBlock`]; every interaction is a
 //! [`Message`] handled in [`crate::app`].
 
+use iced::widget::canvas::{Frame, Stroke};
 use iced::widget::{
-    button, checkbox, column, container, image, progress_bar, row, scrollable, space, stack, text,
-    text_input, MouseArea,
+    button, canvas, checkbox, column, container, image, progress_bar, row, scrollable, space,
+    stack, text, text_input, MouseArea,
 };
-use iced::{Alignment, Border, Color, ContentFit, Element, Font, Length, Padding};
+use iced::{
+    mouse, Alignment, Border, Color, ContentFit, Element, Font, Length, Padding, Point, Rectangle,
+    Size,
+};
 
 use crate::app::{
     detected_hardware, format_count, short_date, size_fit_badge, DownloadUi, HfState, LogLevel,
     Message, RustBlock, Tab,
 };
+use crate::deploy::Runtime;
 use crate::hf::{self, HfFile, HfModel, HfSort};
 use crate::model::{
-    human_bytes, human_duration, human_speed, looks_quantized_name, shorten, JobStatus, OutputMode,
-    VerifyKind,
+    human_bytes, human_duration, human_speed, looks_quantized_name, shorten, DownloadState,
+    JobStatus, OutputMode, Settings, Source, VerifyKind,
 };
 use crate::theme::{
     self, ACCENT, ACCENT_DARK, BORDER, ERROR, INFO, INK, MUTED, OK, PANEL, PANEL_2, PANEL_3, STEEL,
     STEEL_LIGHT, TEXT, WARN, WELL,
 };
-use rustblock_core::{FitEstimate, Target, VerifyMode};
+use rustblock_core::{imatrix::find_tool, FitEstimate, Target, VerifyMode};
 
 fn spacer() -> iced::widget::Space {
     space().width(Length::Fill)
@@ -63,6 +68,15 @@ pub fn view<'a>(app: &'a RustBlock) -> El<'a> {
     layers.extend(resize_edges());
     if app.confirm_requantize.is_some() {
         layers.push(requantize_modal());
+    }
+    if app.show_settings {
+        layers.push(settings_modal(app));
+    }
+    if app.deploy.is_some() {
+        layers.push(deploy_modal(app));
+    }
+    if app.confirm_close {
+        layers.push(confirm_close_modal());
     }
     if app.show_help {
         layers.push(help_modal(app));
@@ -194,22 +208,9 @@ fn content(app: &RustBlock) -> El<'_> {
 
 fn chrome(app: &RustBlock) -> El<'_> {
     let brand = MouseArea::new(
-        row![
-            image(app.logo.clone())
-                .width(Length::Fixed(26.0))
-                .height(Length::Fixed(26.0))
-                .content_fit(ContentFit::Contain),
-            column![
-                text("RUSTBLOCK").size(14.0).color(TEXT),
-                text("NATIVE GGUF TOOLKIT")
-                    .size(7.5)
-                    .font(MONO)
-                    .color(MUTED),
-            ]
-            .spacing(1),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center),
+        image(app.wordmark.clone())
+            .height(Length::Fixed(26.0))
+            .content_fit(ContentFit::Contain),
     )
     .on_press(Message::DragWindow)
     .on_double_click(Message::ToggleMaximize);
@@ -227,10 +228,18 @@ fn chrome(app: &RustBlock) -> El<'_> {
             Message::ToggleLog,
             app.show_log,
         ),
+        text_button("SETTINGS", Message::ToggleSettings, app.show_settings),
         text_button("HELP", Message::ToggleHelp, app.show_help),
-        window_button("—", Message::Minimize, false),
-        window_button("□", Message::ToggleMaximize, false),
-        window_button("✕", Message::CloseWindow, true),
+        window_button(WindowIcon::Minimize, Message::Minimize),
+        window_button(
+            if app.maximized {
+                WindowIcon::Restore
+            } else {
+                WindowIcon::Maximize
+            },
+            Message::ToggleMaximize,
+        ),
+        window_button(WindowIcon::Close, Message::CloseWindow),
     ]
     .spacing(2)
     .align_y(Alignment::Center);
@@ -272,14 +281,109 @@ fn text_button(label: &'static str, message: Message, active: bool) -> El<'stati
     .into()
 }
 
-fn window_button(glyph: &'static str, message: Message, danger: bool) -> El<'static> {
-    button(text(glyph).size(13.0))
-        .on_press(message)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowIcon {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+impl WindowIcon {
+    fn danger(self) -> bool {
+        self == WindowIcon::Close
+    }
+}
+
+/// Crisp window controls drawn with canvas: font glyphs for minimize,
+/// maximize and close never line up across fonts and render blurry.
+fn window_button(icon: WindowIcon, message: Message) -> El<'static> {
+    button(
+        canvas(WindowGlyph {
+            icon,
+            color: if icon.danger() { STEEL_LIGHT } else { MUTED },
+        })
         .width(Length::Fixed(34.0))
-        .height(Length::Fixed(26.0))
-        .padding(0)
-        .style(theme::window_control(danger))
-        .into()
+        .height(Length::Fixed(26.0)),
+    )
+    .on_press(message)
+    .width(Length::Fixed(34.0))
+    .height(Length::Fixed(26.0))
+    .padding(0)
+    .style(theme::window_control(icon.danger()))
+    .into()
+}
+
+struct WindowGlyph {
+    icon: WindowIcon,
+    color: Color,
+}
+
+impl canvas::Program<Message> for WindowGlyph {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let center = frame.center();
+        let color = self.color;
+        let stroke = Stroke::default().with_color(color).with_width(1.0);
+        match self.icon {
+            WindowIcon::Minimize => {
+                frame.fill_rectangle(
+                    Point::new(center.x - 6.0, center.y + 0.5),
+                    Size::new(12.0, 1.0),
+                    color,
+                );
+            }
+            WindowIcon::Maximize => {
+                frame.stroke_rectangle(
+                    Point::new(center.x - 5.5, center.y - 4.5),
+                    Size::new(11.0, 9.0),
+                    stroke,
+                );
+            }
+            WindowIcon::Restore => {
+                frame.stroke_rectangle(
+                    Point::new(center.x - 6.5, center.y - 3.0),
+                    Size::new(9.0, 7.0),
+                    stroke,
+                );
+                frame.fill_rectangle(
+                    Point::new(center.x - 4.0, center.y - 5.0),
+                    Size::new(9.0, 1.0),
+                    color,
+                );
+                frame.fill_rectangle(
+                    Point::new(center.x + 4.0, center.y - 5.0),
+                    Size::new(1.0, 7.0),
+                    color,
+                );
+            }
+            WindowIcon::Close => {
+                for step in 0..10 {
+                    let offset = step as f32;
+                    frame.fill_rectangle(
+                        Point::new(center.x - 5.0 + offset, center.y - 5.0 + offset),
+                        Size::new(1.0, 1.0),
+                        color,
+                    );
+                    frame.fill_rectangle(
+                        Point::new(center.x + 4.0 - offset, center.y - 5.0 + offset),
+                        Size::new(1.0, 1.0),
+                        color,
+                    );
+                }
+            }
+        }
+        vec![frame.into_geometry()]
+    }
 }
 
 fn status_pill(app: &RustBlock) -> El<'static> {
@@ -410,8 +514,8 @@ fn convert_header(app: &RustBlock) -> El<'static> {
         button(text("Add files").size(12.0).color(INK))
             .on_press(Message::Browse)
             .padding(Padding::from([6.0, 16.0]))
-            .height(Length::Fixed(32.0))
-            .style(theme::secondary),
+            .height(Length::Fixed(34.0))
+            .style(theme::primary),
         button(text(label).size(12.5).color(INK))
             .on_press_maybe(can_start.then_some(Message::StartConvert))
             .padding(Padding::from([8.0, 18.0]))
@@ -519,16 +623,18 @@ fn empty_queue() -> El<'static> {
                 .font(MONO)
                 .color(STEEL_LIGHT),
             row![
-                button(text("Browse files").size(11.5))
+                button(text("Browse files").size(12.5).color(INK))
                     .on_press(Message::Browse)
-                    .padding(Padding::from([7.0, 16.0]))
-                    .style(theme::secondary),
-                button(text("Discover models").size(11.5).color(MUTED))
+                    .padding(Padding::from([9.0, 20.0]))
+                    .height(Length::Fixed(38.0))
+                    .style(theme::primary),
+                button(text("Discover models").size(12.5).color(INK))
                     .on_press(Message::TabSelected(Tab::Discover))
-                    .padding(Padding::from([7.0, 14.0]))
-                    .style(theme::ghost),
+                    .padding(Padding::from([9.0, 18.0]))
+                    .height(Length::Fixed(38.0))
+                    .style(theme::primary),
             ]
-            .spacing(8),
+            .spacing(10),
         ]
         .spacing(10)
         .align_x(Alignment::Center),
@@ -718,7 +824,19 @@ fn details<'a>(app: &'a RustBlock, job: &'a crate::model::Job) -> El<'a> {
     if let Some(output) = job.done_output() {
         buttons = buttons.push(
             button(text("Open folder").size(10.0))
-                .on_press(Message::OpenPath(output))
+                .on_press(Message::OpenPath(output.clone()))
+                .padding(Padding::from([4.0, 10.0]))
+                .style(theme::secondary),
+        );
+        buttons = buttons.push(
+            button(text("Inspect").size(10.0))
+                .on_press(Message::InspectPath(output.clone()))
+                .padding(Padding::from([4.0, 10.0]))
+                .style(theme::ghost),
+        );
+        buttons = buttons.push(
+            button(text("Test in runtime").size(10.0).color(INK))
+                .on_press(Message::Deploy(output))
                 .padding(Padding::from([4.0, 10.0]))
                 .style(theme::secondary),
         );
@@ -820,7 +938,7 @@ fn format_section(app: &RustBlock) -> El<'static> {
         row![
             section_label("OUTPUT FORMAT"),
             spacer(),
-            button(text("Non so cosa scegliere").size(9.0).color(STEEL_LIGHT))
+            button(text("Suggest a format").size(9.0).color(STEEL_LIGHT))
                 .on_press_maybe((!running).then_some(Message::SuggestTarget))
                 .padding(Padding::from([2.0, 4.0]))
                 .style(theme::ghost),
@@ -969,15 +1087,29 @@ fn discover_page(app: &RustBlock) -> El<'_> {
 }
 
 fn discover_header(app: &RustBlock) -> El<'static> {
+    let mut sources = row![].spacing(3);
+    for (source, label) in [
+        (Source::HuggingFace, "Hugging Face"),
+        (Source::ModelScope, "ModelScope"),
+    ] {
+        sources = sources.push(
+            button(text(label).size(10.0))
+                .on_press(Message::SetSource(source))
+                .padding(Padding::from([5.0, 10.0]))
+                .style(theme::segment(app.settings.source == source)),
+        );
+    }
+
     row![
         column![
             text("Discover").size(26.0).color(TEXT),
-            text("GGUF repositories on Hugging Face, with a fit verdict before the download.")
+            text("GGUF repositories from Hugging Face or ModelScope, with a fit verdict before the download.")
                 .size(10.5)
                 .color(MUTED),
         ]
         .spacing(3),
         spacer(),
+        sources,
         button(text("Trending").size(10.5))
             .on_press_maybe((!app.hf_busy()).then_some(Message::Trending))
             .padding(Padding::from([6.0, 14.0]))
@@ -991,29 +1123,33 @@ fn discover_header(app: &RustBlock) -> El<'static> {
 fn search_bar(app: &RustBlock) -> El<'_> {
     let busy = app.hf_busy();
     let mut sorts = row![].spacing(3);
-    for (sort, label) in [
-        (HfSort::Downloads, "Downloads"),
-        (HfSort::Likes, "Likes"),
-        (HfSort::Recent, "Recent"),
-    ] {
-        sorts = sorts.push(
-            button(text(label).size(9.5))
-                .on_press(Message::SetSort(sort))
-                .padding(Padding::from([5.0, 10.0]))
-                .style(theme::segment(app.hf_sort == sort)),
-        );
+    if app.settings.source == Source::HuggingFace {
+        for (sort, label) in [
+            (HfSort::Downloads, "Downloads"),
+            (HfSort::Likes, "Likes"),
+            (HfSort::Recent, "Recent"),
+        ] {
+            sorts = sorts.push(
+                button(text(label).size(9.5))
+                    .on_press(Message::SetSort(sort))
+                    .padding(Padding::from([5.0, 10.0]))
+                    .style(theme::segment(app.hf_sort == sort)),
+            );
+        }
     }
 
+    let placeholder = match app.settings.source {
+        Source::HuggingFace => "Search GGUF repositories or paste a huggingface.co link",
+        Source::ModelScope => "Paste a modelscope.cn/models/owner/name link",
+    };
+
     row![
-        text_input(
-            "Search GGUF repositories or paste a huggingface.co link",
-            &app.hf_query
-        )
-        .on_input(Message::SearchChanged)
-        .on_submit(Message::SearchSubmit)
-        .size(11.0)
-        .padding(Padding::from([8.0, 10.0]))
-        .style(theme::text_field),
+        text_input(placeholder, &app.hf_query)
+            .on_input(Message::SearchChanged)
+            .on_submit(Message::SearchSubmit)
+            .size(11.0)
+            .padding(Padding::from([8.0, 10.0]))
+            .style(theme::text_field),
         sorts,
         button(
             text(if busy { "Searching…" } else { "Search" })
@@ -1180,10 +1316,35 @@ fn card_button(selected: bool) -> impl Fn(&iced::Theme, button::Status) -> butto
 }
 
 fn downloads_rail(app: &RustBlock) -> El<'_> {
-    let mut body = column![].spacing(10);
-    if let Some(download) = &app.download {
-        body = body.push(download_card(app, download));
+    let active = app.active_downloads();
+    let header = row![
+        section_label("DOWNLOADS"),
+        chip(
+            format!("{active} active"),
+            PANEL_3,
+            if active > 0 { ACCENT } else { MUTED }
+        ),
+        spacer(),
+        button(text("Clear finished").size(8.5).color(MUTED))
+            .on_press_maybe((!app.downloads.is_empty()).then_some(Message::ClearFinishedDownloads))
+            .padding(Padding::from([2.0, 4.0]))
+            .style(theme::ghost),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    let mut body = column![header].spacing(8);
+    if app.downloads.is_empty() {
+        body = body.push(
+            text("Nothing queued. Press Get on a file: downloads keep running while you browse.")
+                .size(9.5)
+                .color(MUTED),
+        );
     }
+    for download in &app.downloads {
+        body = body.push(download_card(download));
+    }
+    body = body.push(divider());
     body = body.push(repo_panel(app));
 
     let body = container(body.width(Length::Fill)).padding(Padding::from([0.0, 10.0]));
@@ -1204,7 +1365,7 @@ fn repo_panel(app: &RustBlock) -> El<'_> {
                     .size(10.5)
                     .color(MUTED),
                 text(format!(
-                    "Downloads are resumable and verified against the SHA-256 published by the Hub. Destination: {}",
+                    "Downloads are resumable and SHA-256 checked when the source publishes a hash. Destination: {}",
                     shorten(&app.settings.download_dir.display().to_string(), 44)
                 ))
                 .size(9.0)
@@ -1230,7 +1391,7 @@ fn repo_panel(app: &RustBlock) -> El<'_> {
                 .size(15.0)
                 .color(TEXT)
                 .width(Length::Fill),
-            button(text("Hub ↗").size(9.5))
+            button(text("Open ↗").size(9.5))
                 .on_press(Message::OpenUrl(model.web_url()))
                 .padding(Padding::from([4.0, 6.0]))
                 .style(theme::ghost),
@@ -1378,91 +1539,151 @@ fn file_row<'a>(app: &'a RustBlock, file: &'a HfFile) -> El<'a> {
     .into()
 }
 
-fn download_card<'a>(app: &'a RustBlock, download: &'a DownloadUi) -> El<'a> {
-    let frac = if download.total > 0 {
-        (download.done as f64 / download.total as f64).clamp(0.0, 1.0) as f32
-    } else {
-        0.0
+fn download_card(download: &DownloadUi) -> El<'_> {
+    let frac = download.fraction();
+    let (status, color) = match download.state {
+        DownloadState::Queued => ("Queued".to_string(), MUTED),
+        DownloadState::Running => {
+            let label = if download.projector {
+                "Vision projector"
+            } else {
+                "Downloading"
+            };
+            (label.to_string(), ACCENT)
+        }
+        DownloadState::Done => ("Complete".to_string(), OK),
+        DownloadState::Failed => ("Failed".to_string(), ERROR),
+        DownloadState::Cancelled => ("Cancelled".to_string(), WARN),
     };
-    let (status, color) = if download.path.is_some() {
-        ("Complete".to_string(), OK)
-    } else if download.error.is_some() {
-        ("Failed".to_string(), ERROR)
-    } else if download.projector {
-        ("Downloading projector".to_string(), ACCENT)
-    } else {
-        ("Downloading".to_string(), ACCENT)
+
+    let detail = match download.state {
+        DownloadState::Queued => format!(
+            "{} · waiting for the current download",
+            human_bytes(download.total)
+        ),
+        DownloadState::Running => format!(
+            "{} / {} · {:.1}% · {}",
+            human_bytes(download.done),
+            if download.total > 0 {
+                human_bytes(download.total)
+            } else {
+                "?".to_string()
+            },
+            frac * 100.0,
+            human_speed(download.speed)
+        ),
+        DownloadState::Done => format!(
+            "{} · {}",
+            human_bytes(download.total),
+            shorten(
+                &download
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                38
+            )
+        ),
+        DownloadState::Failed | DownloadState::Cancelled => download
+            .error
+            .clone()
+            .unwrap_or_else(|| "Stopped.".to_string()),
     };
+
     let mut content = column![
         row![
-            text(shorten(hf::file_name(&download.file), 34))
+            text(shorten(&download.file_name(), 30))
                 .size(10.0)
                 .font(MONO)
-                .color(STEEL_LIGHT),
-            spacer(),
+                .color(STEEL_LIGHT)
+                .width(Length::Fill),
             text(status).size(9.5).color(color),
         ]
         .align_y(Alignment::Center),
-        progress_bar(0.0..=1.0, frac)
-            .girth(6.0)
-            .style(theme::progress),
         row![
-            text(format!(
-                "{} / {} · {:.1}% · {}",
-                human_bytes(download.done),
-                if download.total > 0 {
-                    human_bytes(download.total)
-                } else {
-                    "?".to_string()
-                },
-                frac * 100.0,
-                human_speed(download.speed)
-            ))
-            .size(9.0)
-            .font(MONO)
-            .color(MUTED),
-            spacer(),
-            button(text("Cancel").size(9.0).color(MUTED))
-                .on_press_maybe(
-                    (download.path.is_none() && download.error.is_none())
-                        .then_some(Message::CancelDownload)
-                )
-                .padding(Padding::from([2.0, 6.0]))
-                .style(theme::ghost),
-            button(text("Dismiss").size(9.0).color(MUTED))
-                .on_press_maybe(
-                    (download.path.is_some() || download.error.is_some())
-                        .then_some(Message::DismissDownload)
-                )
-                .padding(Padding::from([2.0, 6.0]))
-                .style(theme::ghost),
+            chip(download.source.label(), PANEL_3, MUTED),
+            text(shorten(&download.repo, 30))
+                .size(8.5)
+                .font(MONO)
+                .color(MUTED),
         ]
+        .spacing(6)
         .align_y(Alignment::Center),
+        progress_bar(0.0..=1.0, frac)
+            .girth(5.0)
+            .style(theme::progress),
+        text(detail)
+            .size(8.5)
+            .font(MONO)
+            .color(if download.state == DownloadState::Failed {
+                ERROR
+            } else {
+                MUTED
+            }),
     ]
-    .spacing(6);
+    .spacing(5);
 
-    if let Some(path) = &download.path {
-        content = content.push(
-            button(text("Open folder").size(9.0))
-                .on_press(Message::OpenPath(path.clone()))
-                .padding(Padding::from([2.0, 6.0]))
-                .style(theme::ghost),
-        );
+    let mut actions = row![].spacing(4);
+    match download.state {
+        DownloadState::Queued | DownloadState::Running => {
+            actions = actions.push(
+                button(text("Cancel").size(9.0).color(MUTED))
+                    .on_press(Message::CancelDownload(download.id))
+                    .padding(Padding::from([2.0, 6.0]))
+                    .style(theme::ghost),
+            );
+        }
+        DownloadState::Done => {
+            if let Some(path) = &download.path {
+                if !download.projector {
+                    actions = actions.push(
+                        button(text("Add").size(9.0))
+                            .on_press(Message::AddCached(path.clone()))
+                            .padding(Padding::from([2.0, 8.0]))
+                            .style(theme::secondary),
+                    );
+                    actions = actions.push(
+                        button(text("Deploy").size(9.0))
+                            .on_press(Message::Deploy(path.clone()))
+                            .padding(Padding::from([2.0, 8.0]))
+                            .style(theme::secondary),
+                    );
+                }
+                actions = actions.push(
+                    button(text("Inspect").size(9.0).color(MUTED))
+                        .on_press(Message::InspectPath(path.clone()))
+                        .padding(Padding::from([2.0, 6.0]))
+                        .style(theme::ghost),
+                );
+                actions = actions.push(
+                    button(text("Open").size(9.0).color(MUTED))
+                        .on_press(Message::OpenPath(path.clone()))
+                        .padding(Padding::from([2.0, 6.0]))
+                        .style(theme::ghost),
+                );
+            }
+        }
+        DownloadState::Failed | DownloadState::Cancelled => {
+            actions = actions.push(
+                button(text("Dismiss").size(9.0).color(MUTED))
+                    .on_press(Message::DismissDownload(download.id))
+                    .padding(Padding::from([2.0, 6.0]))
+                    .style(theme::ghost),
+            );
+        }
     }
-    let _ = app;
+    content = content.push(actions);
+
     if download.quantized {
         content = content.push(
-            text("Already quantized · requantizing will not restore the original weights.")
-                .size(9.0)
+            text("Already quantized · converting it again will not restore the original weights.")
+                .size(8.5)
                 .color(WARN),
         );
     }
-    if let Some(error) = &download.error {
-        content = content.push(text(error.as_str()).size(9.0).color(ERROR));
-    }
 
     container(content)
-        .padding(10)
+        .padding(9)
         .width(Length::Fill)
         .style(|_| theme::outlined(PANEL_2, BORDER, 6.0))
         .into()
@@ -1480,10 +1701,21 @@ fn inspector_page(app: &RustBlock) -> El<'_> {
         ]
         .spacing(3),
         spacer(),
+        text_input("Path to a .gguf file", &app.inspector_input)
+            .on_input(Message::InspectorPathChanged)
+            .on_submit(Message::InspectorLoad)
+            .size(10.0)
+            .padding(Padding::from([7.0, 9.0]))
+            .width(Length::Fixed(300.0))
+            .style(theme::text_field),
+        button(text("Inspect").size(10.5))
+            .on_press(Message::InspectorLoad)
+            .padding(Padding::from([6.0, 12.0]))
+            .style(theme::secondary),
         button(text("Refresh").size(10.5))
             .on_press(Message::InspectorRefresh)
             .padding(Padding::from([6.0, 12.0]))
-            .style(theme::secondary),
+            .style(theme::ghost),
         button(text("Open file").size(11.0).color(INK))
             .on_press(Message::InspectorOpen)
             .padding(Padding::from([7.0, 14.0]))
@@ -1498,9 +1730,15 @@ fn inspector_page(app: &RustBlock) -> El<'_> {
         None => container(
             column![
                 text("Open a GGUF").size(17.0).color(TEXT),
-                text("Pick any local .gguf: header facts, metadata and the exact tensor type histogram.")
+                text("Pick any local .gguf or paste its path: header facts, metadata and the exact tensor type histogram.")
                     .size(10.5)
                     .color(MUTED),
+                match &app.inspector_error {
+                    Some(error) => text(error.as_str()).size(10.0).color(ERROR),
+                    None => text("The file dialog is owned by this window, so it opens on top.")
+                        .size(9.5)
+                        .color(STEEL_LIGHT),
+                },
             ]
             .spacing(6)
             .align_x(Alignment::Center),
@@ -1810,7 +2048,391 @@ fn requantize_modal() -> El<'static> {
     )
 }
 
-fn modal(card: impl Into<El<'static>>) -> El<'static> {
+fn settings_modal(app: &RustBlock) -> El<'_> {
+    let settings = &app.settings;
+
+    let conversion = column![
+        section_label("CONVERSION"),
+        setting_toggle(
+            "Confirm requantization",
+            "Ask before converting a model that is already quantized.",
+            settings.confirm_requantize,
+            Message::SetConfirmRequantize,
+        ),
+        setting_toggle(
+            "Auto-add downloads",
+            "Put a finished download straight into the conversion queue.",
+            settings.auto_add_downloads,
+            Message::SetAutoAdd,
+        ),
+    ]
+    .spacing(8);
+
+    let downloads = column![
+        section_label("DOWNLOADS"),
+        folder_setting(
+            "Download folder",
+            &settings.download_dir,
+            Message::PickDownloadDir,
+        ),
+        row![
+            text("Partial files keep their .part suffix and resume on the next attempt.")
+                .size(9.0)
+                .color(MUTED)
+                .width(Length::Fill),
+            button(text("Delete partials").size(9.5))
+                .on_press(Message::ClearPartials)
+                .padding(Padding::from([4.0, 10.0]))
+                .style(theme::secondary),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(8);
+
+    let mut source_row = row![].spacing(3);
+    for (source, label) in [
+        (Source::HuggingFace, "Hugging Face"),
+        (Source::ModelScope, "ModelScope"),
+    ] {
+        source_row = source_row.push(
+            button(text(label).size(10.0))
+                .on_press(Message::SetSource(source))
+                .padding(Padding::from([5.0, 12.0]))
+                .style(theme::segment(settings.source == source)),
+        );
+    }
+    let sources = column![
+        section_label("MODEL SOURCES"),
+        row![
+            source_row,
+            spacer(),
+            text("ModelScope: paste a model link.")
+                .size(9.0)
+                .color(MUTED),
+        ]
+        .align_y(Alignment::Center),
+        text("Hugging Face endpoint")
+            .size(10.0)
+            .color(STEEL_LIGHT),
+        text_input("https://huggingface.co", &settings.hf_endpoint)
+            .on_input(Message::HfEndpointChanged)
+            .size(10.0)
+            .padding(Padding::from([7.0, 9.0]))
+            .style(theme::text_field),
+        text("Use https://hf-mirror.com when huggingface.co is blocked. Applies to search, file lists and downloads.")
+            .size(9.0)
+            .color(MUTED),
+    ]
+    .spacing(6);
+
+    let runtimes =
+        column![
+        section_label("TEST IN A RUNTIME"),
+        text("Finished models can be copied or imported into these folders from the deploy dialog.")
+            .size(9.5)
+            .color(MUTED),
+        folder_setting("LM Studio models", &settings.lmstudio_dir, Message::PickLmStudioDir),
+        folder_setting("Jan data folder", &settings.jan_dir, Message::PickJanDir),
+        folder_setting("Prism / llama.cpp", &settings.prism_dir, Message::PickPrismDir),
+        text("Ollama is imported with a generated Modelfile through the ollama command.")
+            .size(9.0)
+            .color(MUTED),
+    ]
+        .spacing(8);
+
+    let content = column![
+        conversion,
+        divider(),
+        downloads,
+        divider(),
+        sources,
+        divider(),
+        runtimes
+    ]
+    .spacing(12)
+    .width(Length::Fill);
+
+    let footer = row![
+        button(text("Reset defaults").size(10.0).color(MUTED))
+            .on_press(Message::ResetSettings)
+            .padding(Padding::from([6.0, 12.0]))
+            .style(theme::ghost),
+        spacer(),
+        button(text("Close").size(10.5))
+            .on_press(Message::ToggleSettings)
+            .padding(Padding::from([6.0, 16.0]))
+            .style(theme::secondary),
+    ]
+    .align_y(Alignment::Center);
+
+    let card = column![
+        row![
+            text("Settings").size(18.0).color(TEXT),
+            spacer(),
+            text("Saved to %APPDATA%\\RustBlock\\settings.json")
+                .size(8.5)
+                .font(MONO)
+                .color(MUTED),
+        ]
+        .align_y(Alignment::Center),
+        divider(),
+        container(
+            scroll(container(content).padding(Padding::from([0.0, 12.0]))).height(Length::Fill)
+        )
+        .height(Length::Fill),
+        footer,
+    ]
+    .spacing(12);
+
+    modal(
+        container(card)
+            .width(Length::Fixed(660.0))
+            .height(Length::Fixed(620.0))
+            .padding(18)
+            .style(|_| theme::outlined(PANEL, BORDER, 8.0)),
+    )
+}
+
+fn setting_toggle<'a>(
+    label: &'a str,
+    hint: &'a str,
+    value: bool,
+    message: fn(bool) -> Message,
+) -> El<'a> {
+    row![
+        column![
+            text(label).size(11.0).color(TEXT),
+            text(hint).size(9.0).color(MUTED),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+        checkbox(value)
+            .on_toggle(message)
+            .style(theme::checkbox_style),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn folder_setting(label: &str, path: &std::path::Path, pick: Message) -> El<'static> {
+    row![
+        column![
+            text(label.to_string()).size(10.5).color(TEXT),
+            text(shorten(&path.display().to_string(), 58))
+                .size(9.0)
+                .font(MONO)
+                .color(MUTED),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+        button(text("Change").size(9.5))
+            .on_press(pick)
+            .padding(Padding::from([4.0, 10.0]))
+            .style(theme::secondary),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn runtime_ready(runtime: Runtime, settings: &Settings) -> (bool, String) {
+    match runtime {
+        Runtime::Ollama => match find_tool("ollama") {
+            Some(path) => (true, shorten(&path.display().to_string(), 48)),
+            None => (false, "ollama not found on PATH".to_string()),
+        },
+        Runtime::LmStudio => (
+            settings.lmstudio_dir.exists(),
+            shorten(&settings.lmstudio_dir.display().to_string(), 48),
+        ),
+        Runtime::Jan => (
+            settings.jan_dir.exists(),
+            shorten(&settings.jan_dir.display().to_string(), 48),
+        ),
+        Runtime::Prism => (
+            settings.prism_dir.exists(),
+            shorten(&settings.prism_dir.display().to_string(), 48),
+        ),
+    }
+}
+
+fn deploy_modal(app: &RustBlock) -> El<'_> {
+    let Some(deploy) = &app.deploy else {
+        return space().height(Length::Fixed(0.0)).into();
+    };
+    let name = deploy
+        .model
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let folder = deploy.folder.clone();
+
+    let mut runtimes = column![].spacing(8);
+    for runtime in Runtime::ALL {
+        let (ready, detail) = runtime_ready(runtime, &app.settings);
+        let selected = deploy.runtime == Some(runtime);
+        let state = if deploy.busy && selected {
+            "Working…"
+        } else if !ready {
+            "Folder missing"
+        } else {
+            "Deploy"
+        };
+        runtimes = runtimes.push(
+            container(
+                row![
+                    column![
+                        row![
+                            text(runtime.label()).size(11.5).color(TEXT),
+                            if ready {
+                                chip("ready", PANEL_3, OK)
+                            } else {
+                                chip("not found", PANEL_3, WARN)
+                            },
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                        text(runtime.hint()).size(9.0).color(MUTED),
+                        text(detail).size(8.5).font(MONO).color(STEEL_LIGHT),
+                    ]
+                    .spacing(3)
+                    .width(Length::Fill),
+                    button(text(state).size(9.5).color(INK))
+                        .on_press_maybe(
+                            (!deploy.busy && ready).then_some(Message::DeployTo(runtime))
+                        )
+                        .padding(Padding::from([5.0, 12.0]))
+                        .style(theme::secondary),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .padding(10)
+            .width(Length::Fill)
+            .style({
+                let (fill, line) = if selected {
+                    (PANEL_3, ACCENT_DARK)
+                } else {
+                    (PANEL_2, BORDER)
+                };
+                move |_| theme::outlined(fill, line, 6.0)
+            }),
+        );
+    }
+
+    let mut status = column![].spacing(6);
+    if deploy.busy || deploy.done > 0 {
+        status = status.push(
+            progress_bar(0.0..=1.0, deploy.fraction())
+                .girth(6.0)
+                .style(theme::progress),
+        );
+        status = status.push(
+            text(format!(
+                "{} / {}",
+                human_bytes(deploy.done),
+                if deploy.total > 0 {
+                    human_bytes(deploy.total)
+                } else {
+                    "?".to_string()
+                }
+            ))
+            .size(9.0)
+            .font(MONO)
+            .color(MUTED),
+        );
+    }
+    if let Some(message) = &deploy.message {
+        status = status.push(
+            text(message.as_str())
+                .size(9.5)
+                .color(if deploy.folder.is_some() { OK } else { ERROR }),
+        );
+    }
+
+    let mut footer = row![spacer()].spacing(8);
+    if let Some(folder) = folder {
+        footer = footer.push(
+            button(text("Open folder").size(10.0))
+                .on_press(Message::OpenPath(folder))
+                .padding(Padding::from([6.0, 12.0]))
+                .style(theme::secondary),
+        );
+    }
+    if deploy.busy {
+        footer = footer.push(
+            button(text("Cancel").size(10.0).color(MUTED))
+                .on_press(Message::DeployCancel)
+                .padding(Padding::from([6.0, 14.0]))
+                .style(theme::ghost),
+        );
+    } else {
+        footer = footer.push(
+            button(text("Close").size(10.5))
+                .on_press(Message::DeployClose)
+                .padding(Padding::from([6.0, 16.0]))
+                .style(theme::secondary),
+        );
+    }
+
+    let card = column![
+        text("Test in a runtime").size(18.0).color(TEXT),
+        text(shorten(&name, 62))
+            .size(10.0)
+            .font(MONO)
+            .color(STEEL_LIGHT),
+        text("Pick a runtime. Ollama registers the model with its own command; the other targets copy the GGUF into their model folder.")
+            .size(9.5)
+            .color(MUTED),
+        divider(),
+        container(scroll(container(runtimes).padding(Padding::from([0.0, 12.0]))).height(Length::Fill))
+            .height(Length::Fill),
+        status,
+        footer,
+    ]
+    .spacing(10);
+
+    modal(
+        container(card)
+            .width(Length::Fixed(620.0))
+            .height(Length::Fixed(520.0))
+            .padding(18)
+            .style(|_| theme::outlined(PANEL, BORDER, 8.0)),
+    )
+}
+
+fn confirm_close_modal() -> El<'static> {
+    modal(
+        container(
+            column![
+                text("Quit while RustBlock is busy?").size(17.0).color(WARN),
+                text("A conversion, download or deploy is still running. Closing now stops it; partial files stay on disk.")
+                    .size(10.5)
+                    .color(MUTED)
+                    .width(Length::Fill),
+                row![
+                    button(text("Keep working").size(11.0))
+                        .on_press(Message::ConfirmClose(false))
+                        .padding(Padding::from([7.0, 16.0]))
+                        .style(theme::secondary),
+                    button(text("Quit anyway").size(11.0).color(INK))
+                        .on_press(Message::ConfirmClose(true))
+                        .padding(Padding::from([7.0, 16.0]))
+                        .style(theme::primary),
+                ]
+                .spacing(8),
+            ]
+            .spacing(10),
+        )
+        .width(Length::Fixed(460.0))
+        .padding(20)
+        .style(|_| theme::outlined(PANEL, BORDER, 8.0)),
+    )
+}
+
+fn modal<'a>(card: impl Into<El<'a>>) -> El<'a> {
     container(card.into())
         .width(Length::Fill)
         .height(Length::Fill)
@@ -1923,6 +2545,17 @@ mod tests {
         app.show_help = true;
         let _ = view(&app);
         app.confirm_requantize = Some(crate::worker::WorkKind::Convert);
+        let _ = view(&app);
+        app.confirm_requantize = None;
+        app.show_settings = true;
+        let _ = view(&app);
+        app.show_settings = false;
+        app.deploy = Some(crate::deploy::DeployUi::new(std::path::PathBuf::from(
+            "model.gguf",
+        )));
+        let _ = view(&app);
+        app.deploy = None;
+        app.confirm_close = true;
         let _ = view(&app);
     }
 

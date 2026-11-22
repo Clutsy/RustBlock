@@ -434,6 +434,38 @@ pub enum OutputMode {
     Custom(PathBuf),
 }
 
+/// Where Discover looks for models. ModelScope is link-driven because its
+/// public search endpoint is not available to every network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    HuggingFace,
+    ModelScope,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HuggingFace => "Hugging Face",
+            Self::ModelScope => "ModelScope",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadState {
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl DownloadState {
+    pub fn is_finished(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub target: Target,
@@ -441,18 +473,160 @@ pub struct Settings {
     pub overwrite: bool,
     pub output_mode: OutputMode,
     pub download_dir: PathBuf,
+    /// Model source used by Discover.
+    pub source: Source,
+    /// Queue a finished download automatically.
+    pub auto_add_downloads: bool,
+    /// Ask before converting an already quantized model again.
+    pub confirm_requantize: bool,
+    /// Hub endpoint; `https://hf-mirror.com` works as a drop-in mirror.
+    pub hf_endpoint: String,
+    /// Runtime model folders used by the deploy dialog.
+    pub lmstudio_dir: PathBuf,
+    pub jan_dir: PathBuf,
+    pub prism_dir: PathBuf,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            target: Target::Reblock,
+            target: Target::Q4KM,
             verify: VerifyMode::Structure,
             overwrite: false,
             output_mode: OutputMode::NextToInput,
             download_dir: default_download_dir(),
+            source: Source::HuggingFace,
+            auto_add_downloads: true,
+            confirm_requantize: true,
+            hf_endpoint: "https://huggingface.co".to_string(),
+            lmstudio_dir: home_dir()
+                .map(|home| home.join(".lmstudio").join("models"))
+                .unwrap_or_else(|| PathBuf::from(".lmstudio/models")),
+            jan_dir: std::env::var_os("APPDATA")
+                .map(|appdata| PathBuf::from(appdata).join("Jan").join("data"))
+                .or_else(|| home_dir().map(|home| home.join("Jan").join("data")))
+                .unwrap_or_else(|| PathBuf::from("Jan/data")),
+            prism_dir: home_dir()
+                .map(|home| home.join(".prism").join("models"))
+                .unwrap_or_else(|| PathBuf::from(".prism/models")),
         }
     }
+}
+
+impl Settings {
+    /// Read the settings file, falling back to defaults field by field so a
+    /// partial or hand-edited file never prevents the app from starting.
+    pub fn load() -> Self {
+        let mut settings = Self::default();
+        let Ok(text) = std::fs::read_to_string(settings_path()) else {
+            return settings;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return settings;
+        };
+        if let Some(target) = value.get("target").and_then(|v| v.as_str()) {
+            if let Some(found) = Target::ALL
+                .iter()
+                .copied()
+                .find(|candidate| candidate.short() == target)
+            {
+                settings.target = found;
+            }
+        }
+        if let Some(mode) = value.get("verify").and_then(|v| v.as_str()) {
+            settings.verify = match mode {
+                "none" => VerifyMode::None,
+                "full" => VerifyMode::Full,
+                _ => VerifyMode::Structure,
+            };
+        }
+        settings.overwrite = value
+            .get("overwrite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(settings.overwrite);
+        if let Some(path) = value.get("output_dir").and_then(|v| v.as_str()) {
+            if !path.trim().is_empty() {
+                settings.output_mode = OutputMode::Custom(PathBuf::from(path));
+            }
+        }
+        for (key, slot) in [
+            ("download_dir", &mut settings.download_dir),
+            ("lmstudio_dir", &mut settings.lmstudio_dir),
+            ("jan_dir", &mut settings.jan_dir),
+            ("prism_dir", &mut settings.prism_dir),
+        ] {
+            if let Some(path) = value.get(key).and_then(|v| v.as_str()) {
+                if !path.trim().is_empty() {
+                    *slot = PathBuf::from(path);
+                }
+            }
+        }
+        if let Some(source) = value.get("source").and_then(|v| v.as_str()) {
+            settings.source = match source {
+                "modelscope" => Source::ModelScope,
+                _ => Source::HuggingFace,
+            };
+        }
+        settings.auto_add_downloads = value
+            .get("auto_add_downloads")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(settings.auto_add_downloads);
+        settings.confirm_requantize = value
+            .get("confirm_requantize")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(settings.confirm_requantize);
+        if let Some(endpoint) = value.get("hf_endpoint").and_then(|v| v.as_str()) {
+            if endpoint.starts_with("http") {
+                settings.hf_endpoint = endpoint.trim_end_matches('/').to_string();
+            }
+        }
+        settings
+    }
+
+    /// Persist the settings. Failures are silent: the app works with the
+    /// in-memory values even when the config directory is read-only.
+    pub fn save(&self) {
+        let value = serde_json::json!({
+            "target": self.target.short(),
+            "verify": match self.verify {
+                VerifyMode::None => "none",
+                VerifyMode::Structure => "structure",
+                VerifyMode::Full => "full",
+            },
+            "overwrite": self.overwrite,
+            "output_dir": match &self.output_mode {
+                OutputMode::NextToInput => serde_json::Value::Null,
+                OutputMode::Custom(path) => serde_json::Value::String(path.display().to_string()),
+            },
+            "download_dir": self.download_dir.display().to_string(),
+            "source": match self.source {
+                Source::HuggingFace => "huggingface",
+                Source::ModelScope => "modelscope",
+            },
+            "auto_add_downloads": self.auto_add_downloads,
+            "confirm_requantize": self.confirm_requantize,
+            "hf_endpoint": self.hf_endpoint,
+            "lmstudio_dir": self.lmstudio_dir.display().to_string(),
+            "jan_dir": self.jan_dir.display().to_string(),
+            "prism_dir": self.prism_dir.display().to_string(),
+        });
+        if let Ok(text) = serde_json::to_string_pretty(&value) {
+            let dir = config_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("settings.json"), text);
+        }
+    }
+}
+
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(|appdata| PathBuf::from(appdata).join("RustBlock"))
+        .or_else(|| home_dir().map(|home| home.join(".config").join("rustblock")))
+        .unwrap_or_else(|| PathBuf::from(".rustblock"))
+}
+
+pub fn settings_path() -> PathBuf {
+    config_dir().join("settings.json")
 }
 
 pub fn default_download_dir() -> PathBuf {

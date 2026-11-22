@@ -11,11 +11,38 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
-const BASE: &str = "https://huggingface.co";
+use crate::model::Source;
+
+const DEFAULT_BASE: &str = "https://huggingface.co";
+const MODELSCOPE: &str = "https://modelscope.cn";
 const UA: &str = "RustBlock/0.1 (GGUF conversion desktop app)";
+
+static ENDPOINT: OnceLock<RwLock<String>> = OnceLock::new();
+
+/// Point the Hub client at a mirror such as `https://hf-mirror.com`.
+pub fn set_endpoint(value: &str) {
+    let value = value.trim().trim_end_matches('/');
+    let endpoint = if value.starts_with("http") {
+        value.to_string()
+    } else {
+        DEFAULT_BASE.to_string()
+    };
+    let lock = ENDPOINT.get_or_init(|| RwLock::new(DEFAULT_BASE.to_string()));
+    if let Ok(mut guard) = lock.write() {
+        *guard = endpoint;
+    }
+}
+
+fn base() -> String {
+    ENDPOINT
+        .get_or_init(|| RwLock::new(DEFAULT_BASE.to_string()))
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_else(|_| DEFAULT_BASE.to_string())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HfSort {
@@ -63,9 +90,17 @@ pub fn parse_link(input: &str) -> Option<HfLink> {
         host.as_str(),
         "huggingface.co" | "www.huggingface.co" | "hf.co" | "www.hf.co"
     );
+    let is_ms_host = matches!(
+        host.as_str(),
+        "modelscope.cn" | "www.modelscope.cn" | "modelscope.ai"
+    );
 
-    let (segments, from_hf): (Vec<&str>, bool) = if is_hf_host {
-        (path.split('/').filter(|s| !s.is_empty()).collect(), true)
+    let (segments, from_hf): (Vec<&str>, bool) = if is_hf_host || is_ms_host {
+        let mut parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if is_ms_host && parts.first() == Some(&"models") {
+            parts.remove(0);
+        }
+        (parts, true)
     } else if !no_fragment.contains("://") && is_repo_pair(&host, path) {
         // A bare `owner/model` reference.
         (vec![host.as_str(), path], false)
@@ -125,7 +160,7 @@ fn is_repo_pair(host: &str, path: &str) -> bool {
 
 /// Fetch one model by exact repo id. Used by the paste-a-link flow.
 pub fn fetch_model(repo: &str) -> Result<HfModel, String> {
-    let url = format!("{BASE}/api/models/{}", encode_path(repo));
+    let url = format!("{}/api/models/{}", base(), encode_path(repo));
     let value = get_json(&url)?;
     parse_model(&value).ok_or_else(|| format!("Hugging Face did not return a model for {repo}"))
 }
@@ -246,11 +281,13 @@ pub struct HfModel {
     pub gguf_files: usize,
     /// License declared on the Hub, when the API exposes one.
     pub license: Option<String>,
+    /// Public page for this repository on its own source.
+    pub web: String,
 }
 
 impl HfModel {
     pub fn web_url(&self) -> String {
-        format!("{BASE}/{}", self.id)
+        self.web.clone()
     }
 }
 
@@ -331,8 +368,6 @@ pub enum HfEvent {
     },
     Error(String),
     DownloadStarted {
-        repo: String,
-        file: String,
         total: u64,
     },
     DownloadProgress {
@@ -361,7 +396,8 @@ pub fn search(query: &str, sort: HfSort) -> Result<Vec<HfModel>, String> {
         format!("&search={}", urlencoding::encode(query.trim()))
     };
     let url = format!(
-        "{BASE}/api/models?filter=gguf&sort={}&direction=-1&limit=50&full=true{search}",
+        "{}/api/models?filter=gguf&sort={}&direction=-1&limit=50&full=true{search}",
+        base(),
         sort.api()
     );
     let value = get_json(&url)?;
@@ -397,10 +433,12 @@ fn parse_model(item: &Value) -> Option<HfModel> {
                 .count()
         })
         .unwrap_or(0);
+    let web = format!("{}/{}", base(), id);
     Some(HfModel {
         id,
         author,
         name,
+        web,
         downloads: u64_field(item, "downloads").unwrap_or(0),
         last_modified: str_field(item, "lastModified")
             .unwrap_or_default()
@@ -415,6 +453,167 @@ fn parse_model(item: &Value) -> Option<HfModel> {
     })
 }
 
+pub fn parse_modelscope(input: &str) -> Option<String> {
+    let raw = input.trim().trim_end_matches('/');
+    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let no_scheme = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))
+        .unwrap_or(raw);
+    let (host, path) = no_scheme.split_once('/')?;
+    let host = host.to_ascii_lowercase();
+    if matches!(
+        host.as_str(),
+        "modelscope.cn" | "www.modelscope.cn" | "modelscope.ai"
+    ) {
+        let mut parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.first() == Some(&"models") {
+            parts.remove(0);
+        }
+        let owner = *parts.first()?;
+        let name = *parts.get(1)?;
+        return Some(format!("{owner}/{name}"));
+    }
+    if !host.contains('.') && !path.contains('/') && !host.is_empty() {
+        return Some(format!("{host}/{path}"));
+    }
+    None
+}
+
+pub fn fetch_model_ms(repo: &str) -> HfModel {
+    let mut parts = repo.splitn(2, '/');
+    let author = parts.next().unwrap_or("unknown").to_string();
+    let name = parts.next().unwrap_or(repo).to_string();
+    HfModel {
+        id: repo.to_string(),
+        author,
+        name,
+        downloads: 0,
+        last_modified: String::new(),
+        gated: false,
+        sha: "master".to_string(),
+        gguf_files: 0,
+        license: None,
+        web: format!("{MODELSCOPE}/models/{repo}"),
+    }
+}
+
+fn get_json_ms(url: &str) -> Result<Value, String> {
+    match ureq::get(url).set("User-Agent", UA).call() {
+        Ok(response) => response
+            .into_json::<Value>()
+            .map_err(|error| format!("invalid ModelScope response: {error}")),
+        Err(ureq::Error::Status(code, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            Err(format!(
+                "ModelScope returned HTTP {code}. {}",
+                body.chars().take(180).collect::<String>()
+            ))
+        }
+        Err(error) => Err(format!("network error: {error}")),
+    }
+}
+
+pub fn list_files_ms(repo: &str) -> Result<Vec<HfFile>, String> {
+    let url = format!(
+        "{MODELSCOPE}/api/v1/models/{}/repo/files?Revision=master&Recursive=true",
+        encode_path(repo)
+    );
+    let value = get_json_ms(&url)?;
+    if value.get("Success").and_then(Value::as_bool) == Some(false) {
+        let message = value
+            .get("Message")
+            .and_then(Value::as_str)
+            .unwrap_or("ModelScope rejected the request");
+        return Err(format!("ModelScope: {message}"));
+    }
+    let data = value
+        .get("Data")
+        .or_else(|| value.get("data"))
+        .ok_or_else(|| "ModelScope returned an unexpected file list".to_string())?;
+    let array = data
+        .get("Files")
+        .or_else(|| data.get("files"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "ModelScope returned an unexpected file list".to_string())?;
+    let mut out = Vec::new();
+    for item in array {
+        let Some(path) = item
+            .get("Path")
+            .or_else(|| item.get("path"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if !path.to_ascii_lowercase().ends_with(".gguf") {
+            continue;
+        }
+        let size = item
+            .get("Size")
+            .or_else(|| item.get("size"))
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+            })
+            .unwrap_or(0);
+        let sha256 = item
+            .get("Sha256")
+            .or_else(|| item.get("sha256"))
+            .and_then(Value::as_str)
+            .filter(|oid| oid.len() == 64 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .map(str::to_string);
+        let projector = is_projector(path);
+        let support = if projector {
+            Err("vision projector")
+        } else {
+            file_support(path)
+        };
+        out.push(HfFile {
+            path: path.to_string(),
+            size,
+            sha256,
+            supported: support.is_ok(),
+            projector,
+        });
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "ModelScope lists no GGUF files for {repo}. Check the model id."
+        ));
+    }
+    out.sort_by_key(|file| (!file.supported, file.size));
+    Ok(out)
+}
+
+pub fn resolve_url(source: Source, repo: &str, revision: &str, file: &str) -> String {
+    let revision = if revision.is_empty() {
+        match source {
+            Source::HuggingFace => "main",
+            Source::ModelScope => "master",
+        }
+    } else {
+        revision
+    };
+    match source {
+        Source::HuggingFace => format!(
+            "{}/{}/resolve/{}/{}",
+            base(),
+            encode_path(repo),
+            encode_path(revision),
+            encode_path(file)
+        ),
+        Source::ModelScope => format!(
+            "{MODELSCOPE}/api/v1/models/{}/repo?Revision={}&FilePath={}",
+            encode_path(repo),
+            urlencoding::encode(revision),
+            urlencoding::encode(file)
+        ),
+    }
+}
+
 pub fn list_files(repo: &str, revision: &str) -> Result<Vec<HfFile>, String> {
     let rev = if revision.is_empty() {
         "main"
@@ -422,7 +621,8 @@ pub fn list_files(repo: &str, revision: &str) -> Result<Vec<HfFile>, String> {
         revision
     };
     let url = format!(
-        "{BASE}/api/models/{}/tree/{}?recursive=true",
+        "{}/api/models/{}/tree/{}?recursive=true",
+        base(),
         encode_path(repo),
         encode_path(rev)
     );
@@ -501,6 +701,7 @@ fn validate_download(path: &Path) -> Result<(), String> {
 /// Download through the core's parallel/resumable transfer engine. The GUI
 /// used to keep its own single-stream implementation; this wrapper preserves
 /// the UI events while using the same 16-range downloader as the CLI.
+#[cfg(test)]
 pub fn download_parallel(
     repo: &str,
     revision: &str,
@@ -520,11 +721,13 @@ pub fn download_parallel(
         cancel,
         tx,
         false,
+        Source::HuggingFace,
     )
 }
 
 /// Download a vision projector explicitly. Projectors are GGUF containers but
 /// are not standalone models, so they are kept out of the model download path.
+#[cfg(test)]
 pub fn download_projector(
     repo: &str,
     revision: &str,
@@ -544,6 +747,38 @@ pub fn download_projector(
         cancel,
         tx,
         true,
+        Source::HuggingFace,
+    )
+}
+
+/// Download a file from either source. The URL shape and token policy are the
+/// only differences; transfers and UI events stay shared with the Hub path.
+#[allow(clippy::too_many_arguments)]
+pub fn download_from(
+    source: Source,
+    repo: &str,
+    revision: &str,
+    file: &str,
+    dest_dir: &Path,
+    expected_sha256: Option<&str>,
+    cancel: &AtomicBool,
+    tx: &Sender<HfEvent>,
+) -> Result<PathBuf, String> {
+    let projector = is_projector(file);
+    if source == Source::ModelScope && projector {
+        return Err("ModelScope projectors are not supported by this build.".to_string());
+    }
+    download_artifact(
+        repo,
+        revision,
+        file,
+        dest_dir,
+        false,
+        expected_sha256,
+        cancel,
+        tx,
+        projector,
+        source,
     )
 }
 
@@ -558,6 +793,7 @@ fn download_artifact(
     cancel: &AtomicBool,
     tx: &Sender<HfEvent>,
     projector: bool,
+    source: Source,
 ) -> Result<PathBuf, String> {
     if projector {
         if !is_projector(file) {
@@ -571,32 +807,23 @@ fn download_artifact(
     let name = if name.is_empty() { "model.gguf" } else { name };
     let final_path = dest_dir.join(name);
     let existed = final_path.exists();
-    let url = format!(
-        "{BASE}/{}/resolve/{}/{}",
-        encode_path(repo),
-        encode_path(if revision.is_empty() {
-            "main"
-        } else {
-            revision
-        }),
-        encode_path(file)
-    );
+    let url = resolve_url(source, repo, revision, file);
     let options = rustblock_core::DownloadOptions {
-        connections: 16,
+        connections: if source == Source::ModelScope { 4 } else { 16 },
         force: overwrite,
         expected_sha256: expected_sha256.map(str::to_string),
-        token: std::env::var("HF_TOKEN")
-            .ok()
-            .filter(|value| !value.trim().is_empty()),
+        token: if source == Source::HuggingFace {
+            std::env::var("HF_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        } else {
+            None
+        },
     };
     let started = AtomicBool::new(false);
     let meter = Mutex::new((Instant::now(), 0u64));
     let send_started = |total: u64| {
-        let _ = tx.send(HfEvent::DownloadStarted {
-            repo: repo.to_string(),
-            file: file.to_string(),
-            total,
-        });
+        let _ = tx.send(HfEvent::DownloadStarted { total });
     };
     let progress_tx = tx.clone();
     let report = rustblock_core::download_url_with_progress(

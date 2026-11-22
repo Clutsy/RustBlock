@@ -6,6 +6,7 @@
 //! minimize, maximize and close. Everything else is plain iced.
 
 mod app;
+mod deploy;
 mod hf;
 mod model;
 mod theme;

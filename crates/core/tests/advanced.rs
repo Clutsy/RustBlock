@@ -400,10 +400,10 @@ fn chat_template_renders_with_a_real_context() {
     );
     let context = serde_json::json!({
         "messages": [
-            { "role": "user", "content": "Ciao" }
+            { "role": "user", "content": "Hello" }
         ],
         "add_generation_prompt": true
     });
     let rendered = render_chat_template(&model, &context).unwrap();
-    assert_eq!(rendered, "<user>Ciao</user><assistant>");
+    assert_eq!(rendered, "<user>Hello</user><assistant>");
 }
