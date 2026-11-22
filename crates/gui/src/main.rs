@@ -1,35 +1,37 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 //! RustBlock — native desktop GGUF conversion toolkit.
+//!
+//! The window is frameless: the app draws its own chrome and owns dragging,
+//! minimize, maximize and close. Everything else is plain iced.
 
 mod app;
 mod hf;
 mod model;
 mod theme;
+mod view;
 mod worker;
 
-use eframe::egui;
+use iced::window;
 
-fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("RustBlock — Native GGUF converter")
-            // The window chrome is drawn inside the app, so the client area is
-            // the whole window and the custom title bar owns dragging and
-            // minimize/close.
-            .with_decorations(false)
-            .with_resizable(true)
-            .with_inner_size([1120.0, 680.0])
-            .with_min_inner_size([880.0, 560.0])
-            .with_position(egui::pos2(20.0, 0.0))
-            .with_clamp_size_to_monitor_size(true)
-            .with_icon(theme::app_icon()),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "RustBlock",
-        options,
-        Box::new(|cc| Ok(Box::new(app::RustBlockApp::new(cc)))),
+fn main() -> iced::Result {
+    iced::application(
+        app::RustBlock::boot,
+        app::RustBlock::update,
+        app::RustBlock::view,
     )
+    .title(|_: &app::RustBlock| "RustBlock — Native GGUF converter".to_string())
+    .theme(|_: &app::RustBlock| theme::theme())
+    .subscription(app::RustBlock::subscription)
+    .antialiasing(true)
+    .window(window::Settings {
+        size: iced::Size::new(1120.0, 700.0),
+        min_size: Some(iced::Size::new(900.0, 580.0)),
+        position: window::Position::Specific(iced::Point::new(20.0, 0.0)),
+        decorations: false,
+        resizable: true,
+        icon: Some(theme::app_icon()),
+        ..window::Settings::default()
+    })
+    .run()
 }

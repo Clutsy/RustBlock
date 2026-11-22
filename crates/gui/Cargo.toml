@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 rustblock-core = { path = "../core" }
-eframe.workspace = true
+iced.workspace = true
 rfd.workspace = true
 serde_json.workspace = true
 ureq.workspace = true

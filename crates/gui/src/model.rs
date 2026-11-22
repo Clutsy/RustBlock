@@ -441,7 +441,6 @@ pub struct Settings {
     pub overwrite: bool,
     pub output_mode: OutputMode,
     pub download_dir: PathBuf,
-    pub cache_quota_gib: u64,
 }
 
 impl Default for Settings {
@@ -452,7 +451,6 @@ impl Default for Settings {
             overwrite: false,
             output_mode: OutputMode::NextToInput,
             download_dir: default_download_dir(),
-            cache_quota_gib: 50,
         }
     }
 }
