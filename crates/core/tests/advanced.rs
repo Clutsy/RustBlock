@@ -4,9 +4,9 @@ use std::path::Path;
 use pmetal_gguf::imatrix::IMatrix;
 use pmetal_gguf::{GgufBuilder, MetadataValue};
 use rustblock_core::{
-    compare_quality, diff, estimate_fit, merge, plan_budget, render_chat_template, sha256_file,
-    split, transcode, validate_metadata, BudgetRequest, ConvertOptions, FitRequest, Hardware,
-    ImportanceMatrix, Target, VerifyMode,
+    compare_quality, diff, estimate_fit, merge, plan_budget, render_chat_template,
+    retarget_tensors, sha256_file, split, transcode, validate_metadata, BudgetRequest,
+    ConvertOptions, FitRequest, Gguf, Hardware, ImportanceMatrix, Target, VerifyMode,
 };
 
 fn build_model(path: &Path) {
@@ -406,4 +406,52 @@ fn chat_template_renders_with_a_real_context() {
     });
     let rendered = render_chat_template(&model, &context).unwrap();
     assert_eq!(rendered, "<user>Hello</user><assistant>");
+}
+
+#[test]
+fn retarget_rewrites_one_tensor_and_copies_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.gguf");
+    let output = dir.path().join("edited.gguf");
+    build_model(&source);
+
+    let report = retarget_tensors(
+        &source,
+        &output,
+        &[("a.weight".to_string(), Target::F16)],
+        None,
+    )
+    .unwrap();
+    assert_eq!(report.tensors_total, 2);
+    assert_eq!(
+        report.new_file_size,
+        std::fs::metadata(&output).unwrap().len()
+    );
+
+    let before = Gguf::open(&source).unwrap();
+    let after = Gguf::open(&output).unwrap();
+    let edited = after.tensors.iter().find(|t| t.name == "a.weight").unwrap();
+    let copied = after.tensors.iter().find(|t| t.name == "b.weight").unwrap();
+    assert_eq!(edited.ty, 1, "a.weight should be F16");
+    assert_eq!(edited.size, Some(16));
+    assert_eq!(copied.ty, 0, "b.weight should stay F32");
+    assert_eq!(copied.size, Some(32));
+    assert_eq!(after.file_type, before.file_type);
+    assert_eq!(
+        after.prism_metadata_signature(),
+        before.prism_metadata_signature()
+    );
+
+    let quality = compare_quality(&source, &output, None).unwrap();
+    assert_eq!(quality.tensors.len(), 2);
+    assert!(quality.mean_snr_db > 40.0, "SNR {}", quality.mean_snr_db);
+
+    let error = retarget_tensors(
+        &source,
+        &output,
+        &[("a.weight".to_string(), Target::F16)],
+        None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("already exists"));
 }

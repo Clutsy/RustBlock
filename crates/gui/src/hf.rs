@@ -375,6 +375,10 @@ pub enum HfEvent {
         total: u64,
         speed: f64,
     },
+    DownloadVerifying {
+        done: u64,
+        total: u64,
+    },
     Downloaded {
         repo: String,
         file: String,
@@ -718,6 +722,7 @@ pub fn download_parallel(
         dest_dir,
         false,
         expected_sha256,
+        true,
         cancel,
         tx,
         false,
@@ -744,6 +749,7 @@ pub fn download_projector(
         dest_dir,
         false,
         expected_sha256,
+        true,
         cancel,
         tx,
         true,
@@ -761,6 +767,7 @@ pub fn download_from(
     file: &str,
     dest_dir: &Path,
     expected_sha256: Option<&str>,
+    verify: bool,
     cancel: &AtomicBool,
     tx: &Sender<HfEvent>,
 ) -> Result<PathBuf, String> {
@@ -775,6 +782,7 @@ pub fn download_from(
         dest_dir,
         false,
         expected_sha256,
+        verify,
         cancel,
         tx,
         projector,
@@ -790,6 +798,7 @@ fn download_artifact(
     dest_dir: &Path,
     overwrite: bool,
     expected_sha256: Option<&str>,
+    verify: bool,
     cancel: &AtomicBool,
     tx: &Sender<HfEvent>,
     projector: bool,
@@ -811,7 +820,11 @@ fn download_artifact(
     let options = rustblock_core::DownloadOptions {
         connections: if source == Source::ModelScope { 4 } else { 16 },
         force: overwrite,
-        expected_sha256: expected_sha256.map(str::to_string),
+        expected_sha256: if verify {
+            expected_sha256.map(str::to_string)
+        } else {
+            None
+        },
         token: if source == Source::HuggingFace {
             std::env::var("HF_TOKEN")
                 .ok()
@@ -819,6 +832,7 @@ fn download_artifact(
         } else {
             None
         },
+        compute_sha256: verify,
     };
     let started = AtomicBool::new(false);
     let meter = Mutex::new((Instant::now(), 0u64));
@@ -826,7 +840,8 @@ fn download_artifact(
         let _ = tx.send(HfEvent::DownloadStarted { total });
     };
     let progress_tx = tx.clone();
-    let report = rustblock_core::download_url_with_progress(
+    let verify_tx = tx.clone();
+    let report = rustblock_core::download_url_with_progress_and_verify(
         &url,
         &final_path,
         &options,
@@ -850,6 +865,9 @@ fn download_artifact(
                 total: total.max(done),
                 speed,
             });
+        },
+        &move |done, total| {
+            let _ = verify_tx.send(HfEvent::DownloadVerifying { done, total });
         },
     )
     .map_err(|error| {

@@ -16,7 +16,7 @@
 //! after the requested verification succeeds.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -570,6 +570,264 @@ pub fn transcode_with_overrides(
         dry_run: false,
         verified: opts.verify,
     })
+}
+
+/// Re-encodes selected tensors to a new type while copying every other
+/// tensor byte-for-byte.
+///
+/// This backs the inspector's per-block editor. It never touches metadata,
+/// tensor order, names or shapes, and it refuses to write over an existing
+/// file. Tensors whose requested type equals their current type are copied
+/// raw, so selecting an unchanged type produces a byte-identical copy.
+pub fn retarget_tensors(
+    input: &Path,
+    output: &Path,
+    changes: &[(String, Target)],
+    mut on_progress: Option<&mut dyn FnMut(&Progress)>,
+) -> Result<Report, ConvertError> {
+    let started = Instant::now();
+    if changes.is_empty() {
+        return Err(ConvertError::Codec(
+            "choose at least one tensor to retarget".into(),
+        ));
+    }
+    let g = Gguf::open(input)?;
+    if g.has_ptq1() {
+        return Err(ConvertError::Ptq1);
+    }
+    for (name, target) in changes {
+        let tensor =
+            g.tensors.iter().find(|t| &t.name == name).ok_or_else(|| {
+                ConvertError::Codec(format!("tensor '{name}' is not in this file"))
+            })?;
+        if *target == Target::Reblock {
+            return Err(ConvertError::Codec(
+                "reblocking is a whole-file operation, not a per-tensor type".into(),
+            ));
+        }
+        if !source_supported(tensor.ty) {
+            return Err(ConvertError::UnsupportedTensor {
+                name: name.clone(),
+                ty: tensor.ty,
+            });
+        }
+        if target.type_id().is_none() {
+            return Err(ConvertError::Codec(format!(
+                "tensor '{name}' cannot be written as {}",
+                target.short()
+            )));
+        }
+    }
+
+    let mut order: Vec<usize> = (0..g.tensors.len()).collect();
+    order.sort_by_key(|&i| g.tensors[i].offset);
+
+    let mut cursor = 0u64;
+    let mut plans = Vec::with_capacity(order.len());
+    let mut encode_targets: Vec<Option<Target>> = Vec::with_capacity(order.len());
+    for index in order {
+        let t = &g.tensors[index];
+        let change = changes
+            .iter()
+            .find(|(name, _)| name == &t.name)
+            .map(|(_, target)| *target);
+        let out_ty = match change {
+            Some(target) => target.type_id().expect("validated above"),
+            None => t.ty,
+        };
+        if t.size.is_none() && change.is_none() {
+            return Err(ConvertError::UnsupportedTensor {
+                name: t.name.clone(),
+                ty: t.ty,
+            });
+        }
+        let info = type_info(out_ty).ok_or_else(|| ConvertError::UnsupportedTensor {
+            name: t.name.clone(),
+            ty: out_ty,
+        })?;
+        let elems = t.element_count();
+        if !elems.is_multiple_of(info.block) {
+            return Err(ConvertError::Codec(format!(
+                "tensor '{}' has {} values, not a multiple of the {} block size {}",
+                t.name, elems, info.name, info.block
+            )));
+        }
+        let new_size = (elems / info.block)
+            .checked_mul(info.bytes)
+            .ok_or(ConvertError::Overflow)?;
+        let new_offset = align_up(cursor, g.alignment).ok_or(ConvertError::Overflow)?;
+        cursor = new_offset
+            .checked_add(new_size)
+            .ok_or(ConvertError::Overflow)?;
+        plans.push(Plan {
+            index,
+            out_ty,
+            new_offset,
+            new_size,
+            copy_raw: change.is_none() || (t.ty == out_ty && t.size == Some(new_size)),
+        });
+        encode_targets.push(change);
+    }
+
+    if paths_same(input, output)? {
+        return Err(ConvertError::SameFile);
+    }
+    if output.exists() {
+        return Err(ConvertError::OutputExists(output.to_path_buf()));
+    }
+
+    let new_data_size = plans
+        .iter()
+        .map(|p| p.new_offset + p.new_size)
+        .max()
+        .unwrap_or(0);
+    let mut header = g.header[..g.tensor_info_end as usize].to_vec();
+    for plan in &plans {
+        let t = &g.tensors[plan.index];
+        patch_u32(&mut header, t.type_pos, plan.out_ty)?;
+        patch_u64(&mut header, t.offset_pos, plan.new_offset)?;
+    }
+    let new_data_start =
+        align_up(header.len() as u64, g.alignment).ok_or(ConvertError::Overflow)?;
+    header.resize(new_data_start as usize, 0);
+    let new_file_size = new_data_start
+        .checked_add(new_data_size)
+        .ok_or(ConvertError::Overflow)?;
+
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.exists() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut tmp = NamedTempFile::new_in(parent)?;
+    tmp.write_all(&header)?;
+    tmp.as_file().set_len(new_file_size)?;
+
+    let src = File::open(input)?;
+    let threads = conversion_workers();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("rustblock-retarget-{i}"))
+        .build()
+        .map_err(|e| ConvertError::Codec(format!("cannot start conversion workers: {e}")))?;
+    let mut written = 0u64;
+
+    for (plan, target) in plans.iter().zip(&encode_targets) {
+        let t = &g.tensors[plan.index];
+        if plan.copy_raw {
+            copy_tensor_raw(
+                &src,
+                tmp.as_file(),
+                g.data_start + t.offset,
+                new_data_start + plan.new_offset,
+                plan.new_size,
+            )?;
+        } else {
+            let target = target.expect("a copied tensor never needs an encoder");
+            let bytes = pool.install(|| encode_plan(&src, &g, plan, target, true, threads))?;
+            if bytes.len() as u64 != plan.new_size {
+                return Err(ConvertError::Codec(format!(
+                    "tensor '{}' encoded to {} bytes, expected {}",
+                    t.name,
+                    bytes.len(),
+                    plan.new_size
+                )));
+            }
+            write_all_at(tmp.as_file(), new_data_start + plan.new_offset, &bytes)?;
+        }
+        written = written.saturating_add(plan.new_size);
+        emit(
+            &mut on_progress,
+            Phase::Converting,
+            plan.index,
+            &t.name,
+            g.tensors.len(),
+            written,
+            new_data_size,
+        );
+    }
+
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    if tmp.as_file().metadata()?.len() != new_file_size {
+        return Err(ConvertError::Verify(format!(
+            "output size is {} bytes, expected {}",
+            tmp.as_file().metadata()?.len(),
+            new_file_size
+        )));
+    }
+
+    let g_out = Gguf::open(tmp.path())?;
+    verify_retarget(&g, &g_out, &plans)?;
+
+    tmp.persist(output).map_err(|e| ConvertError::Io(e.error))?;
+
+    Ok(Report {
+        input: input.to_path_buf(),
+        output: output.to_path_buf(),
+        tensors_total: g.tensors.len(),
+        tensors_pq2: g.pq2_count(),
+        old_file_size: g.file_len,
+        new_file_size,
+        old_data_size: g.file_len - g.data_start,
+        new_data_size,
+        elapsed: started.elapsed(),
+        dry_run: false,
+        verified: VerifyMode::Structure,
+    })
+}
+
+fn copy_tensor_raw(
+    src: &File,
+    dst: &File,
+    source: u64,
+    target: u64,
+    len: u64,
+) -> Result<(), ConvertError> {
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    let mut done = 0u64;
+    while done < len {
+        let n = (len - done).min(buf.len() as u64) as usize;
+        read_exact_at(src, source + done, &mut buf[..n])?;
+        write_all_at(dst, target + done, &buf[..n])?;
+        done += n as u64;
+    }
+    Ok(())
+}
+
+fn verify_retarget(input: &Gguf, output: &Gguf, plans: &[Plan]) -> Result<(), ConvertError> {
+    if output.version != input.version
+        || output.alignment != input.alignment
+        || output.tensors.len() != input.tensors.len()
+    {
+        return Err(ConvertError::Verify(
+            "output GGUF parameters do not match the input".into(),
+        ));
+    }
+    for plan in plans {
+        let t_in = &input.tensors[plan.index];
+        let t_out = &output.tensors[plan.index];
+        if t_in.name != t_out.name
+            || t_in.dims != t_out.dims
+            || t_out.ty != plan.out_ty
+            || t_out.offset != plan.new_offset
+            || t_out.size != Some(plan.new_size)
+        {
+            return Err(ConvertError::Verify(format!(
+                "tensor '{}' was not written as requested",
+                t_in.name
+            )));
+        }
+    }
+    if output.prism_metadata_signature() != input.prism_metadata_signature() {
+        return Err(ConvertError::Verify(
+            "prism.* metadata (Hadamard/MTP) was not preserved byte-for-byte".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Quantize with an importance matrix. Importance selects the highest-value
@@ -1262,66 +1520,164 @@ fn verify_values(
     target: Target,
     cb: &mut Option<&mut dyn FnMut(&Progress)>,
 ) -> Result<(), ConvertError> {
-    let mut src = File::open(in_path)?;
-    let mut dst = File::open(out_path)?;
     let total = output
         .tensors
         .iter()
         .filter_map(|t| t.size)
         .fold(0u64, |acc, size| acc.saturating_add(size));
+    let threads = conversion_workers();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("rustblock-verify-{i}"))
+        .build()
+        .map_err(|e| ConvertError::Codec(format!("cannot start verification workers: {e}")))?;
+    let src = File::open(in_path)?;
+    let dst = File::open(out_path)?;
+    let in_start = input.data_start;
+    let out_start = output.data_start;
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, u64, Result<(), String>)>();
     let mut done = 0u64;
+    let mut first_error: Option<String> = None;
 
-    for (i, t_in) in input.tensors.iter().enumerate() {
-        let t_out = &output.tensors[i];
-        src.seek(SeekFrom::Start(input.data_start + t_in.offset))?;
-        dst.seek(SeekFrom::Start(output.data_start + t_out.offset))?;
-        let mut raw_in = vec![0u8; t_in.size.expect("validated") as usize];
-        let mut raw_out = vec![0u8; t_out.size.expect("validated") as usize];
-        src.read_exact(&mut raw_in)?;
-        dst.read_exact(&mut raw_out)?;
-        let a = decode_tensor(&raw_in, t_in)?;
-        let b = decode_tensor(&raw_out, t_out)?;
-        if a.len() != b.len() {
+    let result = std::thread::scope(|scope| {
+        let worker_tx = tx.clone();
+        let pool_ref = &pool;
+        let src_ref = &src;
+        let dst_ref = &dst;
+        let input_ref = input;
+        let output_ref = output;
+        let worker = scope.spawn(move || -> Result<(), ConvertError> {
+            let mut start = 0usize;
+            while start < input_ref.tensors.len() {
+                let end = verify_batch_end(input_ref, start, threads);
+                pool_ref.install(|| {
+                    (start..end).into_par_iter().try_for_each(|index| {
+                        let t_in = &input_ref.tensors[index];
+                        let t_out = output_ref.tensors.get(index).ok_or_else(|| {
+                            ConvertError::Verify(format!(
+                                "output has no tensor for '{}'",
+                                t_in.name
+                            ))
+                        })?;
+                        let bytes = t_out.size.unwrap_or(0);
+                        match verify_tensor_pair(
+                            src_ref, in_start, dst_ref, out_start, t_in, t_out, target,
+                        ) {
+                            Ok(()) => {
+                                let _ = worker_tx.send((index, bytes, Ok(())));
+                                Ok(())
+                            }
+                            Err(error) => {
+                                let message = error.to_string();
+                                let _ = worker_tx.send((index, bytes, Err(message.clone())));
+                                Err(ConvertError::Verify(message))
+                            }
+                        }
+                    })
+                })?;
+                start = end;
+            }
+            Ok(())
+        });
+
+        // The callback is not `Send`, so the main thread emits the progress
+        // messages as workers finish tensors. The workers only own file
+        // handles and plain tensor metadata.
+        drop(tx);
+        while let Ok((index, bytes, outcome)) = rx.recv() {
+            done = done.saturating_add(bytes);
+            emit(
+                cb,
+                Phase::Verifying,
+                index,
+                &input.tensors[index].name,
+                input.tensors.len(),
+                done,
+                total,
+            );
+            if let Err(message) = outcome {
+                if first_error.is_none() {
+                    first_error = Some(message);
+                }
+            }
+        }
+        match worker.join() {
+            Ok(result) => result,
+            Err(_) => Err(ConvertError::Verify("verification worker panicked".into())),
+        }
+    });
+
+    if let Some(message) = first_error {
+        return Err(ConvertError::Verify(message));
+    }
+    result
+}
+
+/// Keep a parallel verification batch under a raw-byte budget: decoding both
+/// copies to f32 costs several times the on-disk size, so all tensors at once
+/// would exhaust memory on a large model.
+fn verify_batch_end(input: &Gguf, start: usize, threads: usize) -> usize {
+    const BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+    let max_tensors = threads.max(1);
+    let mut end = start;
+    let mut bytes = 0u64;
+    while end < input.tensors.len() && end - start < max_tensors {
+        let cost = input.tensors[end].size.unwrap_or(0).saturating_mul(2);
+        if end > start && bytes.saturating_add(cost) > BUDGET_BYTES {
+            break;
+        }
+        bytes = bytes.saturating_add(cost);
+        end += 1;
+    }
+    end.max(start + 1).min(input.tensors.len())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_tensor_pair(
+    src: &File,
+    in_start: u64,
+    dst: &File,
+    out_start: u64,
+    t_in: &TensorInfo,
+    t_out: &TensorInfo,
+    target: Target,
+) -> Result<(), ConvertError> {
+    let mut raw_in = vec![0u8; t_in.size.expect("validated") as usize];
+    let mut raw_out = vec![0u8; t_out.size.expect("validated") as usize];
+    read_exact_at(src, in_start + t_in.offset, &mut raw_in)?;
+    read_exact_at(dst, out_start + t_out.offset, &mut raw_out)?;
+    let a = decode_tensor(&raw_in, t_in)?;
+    let b = decode_tensor(&raw_out, t_out)?;
+    if a.len() != b.len() {
+        return Err(ConvertError::Verify(format!(
+            "tensor '{}' changed element count",
+            t_in.name
+        )));
+    }
+
+    let exact = target == Target::F32 && t_out.ty == 0;
+    let max_abs = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let tolerance = if exact {
+        0.0
+    } else if target == Target::F16 {
+        0.01 * max_abs + 1e-5
+    } else if target == Target::Bf16 {
+        0.08 * max_abs + 1e-4
+    } else if matches!(
+        target,
+        Target::Tq1_0 | Target::Tq2_0 | Target::Mxfp4 | Target::Nvfp4 | Target::Q1_0
+    ) {
+        1.0 * max_abs + 1e-4
+    } else {
+        0.5 * max_abs + 1e-4
+    };
+    for (j, (x, y)) in a.iter().zip(&b).enumerate() {
+        if !y.is_finite() || (*x - *y).abs() > tolerance {
             return Err(ConvertError::Verify(format!(
-                "tensor '{}' changed element count",
+                "value mismatch in tensor '{}' at element {j}: {x} vs {y} (tolerance {tolerance})",
                 t_in.name
             )));
         }
-
-        let exact = target == Target::F32 && t_out.ty == 0;
-        let max_abs = a.iter().fold(0f32, |m, v| m.max(v.abs()));
-        let tolerance = if exact {
-            0.0
-        } else if target == Target::F16 {
-            0.01 * max_abs + 1e-5
-        } else if target == Target::Bf16 {
-            0.08 * max_abs + 1e-4
-        } else if matches!(
-            target,
-            Target::Tq1_0 | Target::Tq2_0 | Target::Mxfp4 | Target::Nvfp4 | Target::Q1_0
-        ) {
-            1.0 * max_abs + 1e-4
-        } else {
-            0.5 * max_abs + 1e-4
-        };
-        for (j, (x, y)) in a.iter().zip(&b).enumerate() {
-            if !y.is_finite() || (*x - *y).abs() > tolerance {
-                return Err(ConvertError::Verify(format!(
-                    "value mismatch in tensor '{}' at element {j}: {x} vs {y} (tolerance {tolerance})",
-                    t_in.name
-                )));
-            }
-        }
-        done += t_out.size.unwrap_or(0);
-        emit(
-            cb,
-            Phase::Verifying,
-            i,
-            &t_in.name,
-            input.tensors.len(),
-            done,
-            total,
-        );
     }
     Ok(())
 }

@@ -3,7 +3,7 @@
 //! The view is a pure function of [`RustBlock`]; every interaction is a
 //! [`Message`] handled in [`crate::app`].
 
-use iced::widget::canvas::{Frame, Stroke};
+use iced::widget::canvas::{Frame, Path, Stroke};
 use iced::widget::{
     button, canvas, checkbox, column, container, image, progress_bar, row, scrollable, space,
     stack, text, text_input, MouseArea,
@@ -21,13 +21,13 @@ use crate::deploy::Runtime;
 use crate::hf::{self, HfFile, HfModel, HfSort};
 use crate::model::{
     human_bytes, human_duration, human_speed, looks_quantized_name, shorten, DownloadState,
-    JobStatus, OutputMode, Settings, Source, VerifyKind,
+    InspectorBlock, InspectorData, JobStatus, OutputMode, Settings, Source, VerifyKind,
 };
 use crate::theme::{
     self, ACCENT, ACCENT_DARK, BORDER, ERROR, INFO, INK, MUTED, OK, PANEL, PANEL_2, PANEL_3, STEEL,
     STEEL_LIGHT, TEXT, WARN, WELL,
 };
-use rustblock_core::{imatrix::find_tool, FitEstimate, Target, VerifyMode};
+use rustblock_core::{conversion_workers, imatrix::find_tool, FitEstimate, Target, VerifyMode};
 
 fn spacer() -> iced::widget::Space {
     space().width(Length::Fill)
@@ -50,7 +50,6 @@ pub fn view<'a>(app: &'a RustBlock) -> El<'a> {
     if app.show_log {
         layout = layout.push(log_panel(app));
     }
-    layout = layout.push(status_bar(app));
 
     let root = container(layout)
         .width(Length::Fill)
@@ -200,6 +199,7 @@ fn content(app: &RustBlock) -> El<'_> {
     match app.tab {
         Tab::Convert => convert_page(app),
         Tab::Discover => discover_page(app),
+        Tab::Downloads => downloads_page(app),
         Tab::Inspector => inspector_page(app),
     }
 }
@@ -218,18 +218,20 @@ fn chrome(app: &RustBlock) -> El<'_> {
     let tabs = row![
         tab_button(app, Tab::Convert),
         tab_button(app, Tab::Discover),
+        tab_button(app, Tab::Downloads),
         tab_button(app, Tab::Inspector),
     ]
     .spacing(3);
 
     let right = row![
-        text_button(
-            if app.show_log { "LOG ON" } else { "LOG" },
-            Message::ToggleLog,
-            app.show_log,
+        chrome_icon_button(NavIcon::Log, "LOG", Message::ToggleLog, app.show_log),
+        chrome_icon_button(
+            NavIcon::Settings,
+            "SETTINGS",
+            Message::ToggleSettings,
+            app.show_settings,
         ),
-        text_button("SETTINGS", Message::ToggleSettings, app.show_settings),
-        text_button("HELP", Message::ToggleHelp, app.show_help),
+        chrome_icon_button(NavIcon::Help, "HELP", Message::ToggleHelp, app.show_help),
         window_button(WindowIcon::Minimize, Message::Minimize),
         window_button(
             if app.maximized {
@@ -246,8 +248,8 @@ fn chrome(app: &RustBlock) -> El<'_> {
 
     container(
         row![brand, spacer(), tabs, spacer(), status_pill(app), right,]
-            .padding(Padding::from([0.0, 12.0]))
-            .spacing(14)
+            .padding(Padding::from([0.0, 10.0]))
+            .spacing(10)
             .align_y(Alignment::Center),
     )
     .width(Length::Fill)
@@ -258,27 +260,172 @@ fn chrome(app: &RustBlock) -> El<'_> {
 }
 
 fn tab_button(app: &RustBlock, tab: Tab) -> El<'static> {
-    button(text(tab.label()).size(12.0))
-        .on_press(Message::TabSelected(tab))
-        .padding(Padding::from([6.0, 14.0]))
-        .width(Length::Fixed(92.0))
-        .height(Length::Fixed(30.0))
-        .style(theme::tab(app.tab == tab))
-        .into()
+    let active = app.tab == tab;
+    button(
+        row![
+            nav_glyph(tab_icon(tab), 13.0, if active { INK } else { MUTED }),
+            text(tab.label()).size(11.0),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .on_press(Message::TabSelected(tab))
+    .padding(Padding::from([6.0, 8.0]))
+    .width(Length::Fixed(100.0))
+    .height(Length::Fixed(30.0))
+    .style(theme::tab(active))
+    .into()
 }
 
-fn text_button(label: &'static str, message: Message, active: bool) -> El<'static> {
+fn tab_icon(tab: Tab) -> NavIcon {
+    match tab {
+        Tab::Convert => NavIcon::Convert,
+        Tab::Discover => NavIcon::Discover,
+        Tab::Downloads => NavIcon::Downloads,
+        Tab::Inspector => NavIcon::Inspector,
+    }
+}
+
+/// Small chrome button with a drawn icon, used by Settings and Help.
+fn chrome_icon_button(
+    icon: NavIcon,
+    label: &'static str,
+    message: Message,
+    active: bool,
+) -> El<'static> {
+    let color = if active { INK } else { STEEL_LIGHT };
     button(
-        text(label)
-            .size(9.5)
-            .font(MONO)
-            .color(if active { ACCENT } else { MUTED }),
+        row![
+            nav_glyph(icon, 13.0, color),
+            text(label).size(9.0).font(MONO).color(color),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center),
     )
     .on_press(message)
     .padding(Padding::from([5.0, 8.0]))
     .height(Length::Fixed(26.0))
-    .style(theme::ghost)
+    .style(move |style_theme, status| {
+        if active {
+            theme::primary(style_theme, status)
+        } else {
+            theme::secondary(style_theme, status)
+        }
+    })
     .into()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavIcon {
+    Convert,
+    Discover,
+    Downloads,
+    Inspector,
+    Settings,
+    Help,
+    Log,
+}
+
+fn nav_glyph(icon: NavIcon, size: f32, color: Color) -> El<'static> {
+    canvas(NavGlyph { icon, color })
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .into()
+}
+
+struct NavGlyph {
+    icon: NavIcon,
+    color: Color,
+}
+
+impl canvas::Program<Message> for NavGlyph {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let center = frame.center();
+        let color = self.color;
+        let stroke = Stroke::default().with_color(color).with_width(1.2);
+        let point = |x: f32, y: f32| Point::new(center.x + x, center.y + y);
+        match self.icon {
+            NavIcon::Convert => {
+                frame.fill_rectangle(point(-5.0, -4.5), Size::new(10.0, 2.0), color);
+                frame.fill_rectangle(point(-5.0, -1.5), Size::new(7.0, 2.0), color);
+                frame.fill_rectangle(point(-5.0, 1.5), Size::new(4.0, 2.0), color);
+            }
+            NavIcon::Discover => {
+                frame.stroke(&Path::circle(point(-1.0, -1.0), 4.0), stroke);
+                frame.stroke(
+                    &Path::line(point(2.0, 2.0), point(5.5, 5.5)),
+                    stroke.with_width(1.6),
+                );
+            }
+            NavIcon::Downloads => {
+                frame.stroke(&Path::line(point(0.0, -5.0), point(0.0, 2.0)), stroke);
+                frame.stroke(&Path::line(point(-3.5, -1.5), point(0.0, 2.0)), stroke);
+                frame.stroke(&Path::line(point(3.5, -1.5), point(0.0, 2.0)), stroke);
+                frame.stroke(
+                    &Path::line(point(-5.0, 5.0), point(5.0, 5.0)),
+                    stroke.with_width(1.6),
+                );
+            }
+            NavIcon::Inspector => {
+                for (x, y) in [(-5.0, -5.0), (1.0, -5.0), (-5.0, 1.0), (1.0, 1.0)] {
+                    frame.stroke_rectangle(point(x, y), Size::new(4.0, 4.0), stroke);
+                }
+            }
+            NavIcon::Settings => {
+                frame.stroke(&Path::circle(center, 3.8), stroke);
+                frame.stroke(&Path::circle(center, 1.5), stroke);
+                for step in 0..8 {
+                    let angle = step as f32 * std::f32::consts::PI / 4.0;
+                    let inner = 4.6;
+                    let outer = 6.2;
+                    frame.stroke(
+                        &Path::line(
+                            point(angle.cos() * inner, angle.sin() * inner),
+                            point(angle.cos() * outer, angle.sin() * outer),
+                        ),
+                        stroke.with_width(1.6),
+                    );
+                }
+            }
+            NavIcon::Log => {
+                for (line, width) in [10.0_f32, 7.0, 10.0, 5.0].iter().enumerate() {
+                    frame.fill_rectangle(
+                        point(-5.0, -4.5 + line as f32 * 3.0),
+                        Size::new(*width, 1.6),
+                        color,
+                    );
+                }
+            }
+            NavIcon::Help => {
+                frame.stroke(&Path::circle(center, 6.0), stroke);
+                let arc = Path::new(|builder| {
+                    let center_y = -1.5;
+                    let radius = 2.2;
+                    let start = 200.0_f32.to_radians();
+                    builder.move_to(point(start.cos() * radius, center_y + start.sin() * radius));
+                    for step in 1..=12 {
+                        let angle = (200.0 + step as f32 * 11.0).to_radians();
+                        builder
+                            .line_to(point(angle.cos() * radius, center_y + angle.sin() * radius));
+                    }
+                    builder.line_to(point(0.0, 1.4));
+                });
+                frame.stroke(&arc, stroke);
+                frame.fill(&Path::circle(point(0.0, 4.0), 0.9), color);
+            }
+        }
+        vec![frame.into_geometry()]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,42 +564,6 @@ fn status_pill(app: &RustBlock) -> El<'static> {
         .into()
 }
 
-fn status_bar(app: &RustBlock) -> El<'static> {
-    let ram = app
-        .hardware
-        .ram_bytes
-        .map(human_bytes)
-        .unwrap_or_else(|| "RAM ?".to_string());
-    let vram = app
-        .hardware
-        .vram_bytes
-        .map(|bytes| format!("{} VRAM", human_bytes(bytes)))
-        .unwrap_or_else(|| "no NVIDIA GPU".to_string());
-    container(
-        row![
-            text(format!("{ram} RAM · {vram}"))
-                .size(9.0)
-                .font(MONO)
-                .color(MUTED),
-            spacer(),
-            text(format!(
-                "{} files · iced {}",
-                app.jobs.len(),
-                env!("CARGO_PKG_VERSION")
-            ))
-            .size(9.0)
-            .font(MONO)
-            .color(STEEL),
-        ]
-        .padding(Padding::from([0.0, 12.0]))
-        .align_y(Alignment::Center),
-    )
-    .width(Length::Fill)
-    .height(Length::Fixed(24.0))
-    .style(|_| theme::outlined(PANEL, BORDER, 0.0))
-    .into()
-}
-
 // ----- Convert ------------------------------------------------------------
 
 fn convert_page(app: &RustBlock) -> El<'_> {
@@ -488,7 +599,6 @@ fn convert_header(app: &RustBlock) -> El<'static> {
         format!("Convert {count} files")
     };
     let can_start = !running_batch && count > 0;
-    let bench_ready = app.benchmark.is_none() && app.done_job_output().is_some();
 
     row![
         column![
@@ -507,7 +617,7 @@ fn convert_header(app: &RustBlock) -> El<'static> {
             .padding(Padding::from([6.0, 10.0]))
             .style(theme::ghost),
         button(text("Benchmark").size(10.5))
-            .on_press_maybe(bench_ready.then_some(Message::Benchmark))
+            .on_press_maybe(app.benchmark.is_none().then_some(Message::Benchmark))
             .padding(Padding::from([6.0, 12.0]))
             .height(Length::Fixed(32.0))
             .style(theme::secondary),
@@ -528,21 +638,65 @@ fn convert_header(app: &RustBlock) -> El<'static> {
 }
 
 fn benchmark_note(app: &RustBlock) -> El<'static> {
-    match &app.benchmark {
-        Some(bench) => container(
-            text(format!(
-                "Running llama-bench on {}…",
-                shorten(&bench.model.display().to_string(), 52)
-            ))
-            .size(10.5)
-            .color(WARN),
+    if let Some(bench) = &app.benchmark {
+        return container(
+            row![
+                text(format!(
+                    "Running llama-bench on {} · {} CPU threads",
+                    shorten(&bench.model.display().to_string(), 52),
+                    conversion_workers()
+                ))
+                .size(10.0)
+                .color(WARN),
+                spacer(),
+                text("The result will appear here.").size(9.0).color(MUTED),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
         )
         .padding(Padding::from([8.0, 12.0]))
         .width(Length::Fill)
         .style(|_| theme::outlined(PANEL_2, BORDER, 6.0))
-        .into(),
-        None => spacer().height(Length::Fixed(0.0)).into(),
+        .into();
     }
+    let Some((ok, output)) = &app.benchmark_result else {
+        return spacer().height(Length::Fixed(0.0)).into();
+    };
+    let preview = output.lines().take(12).collect::<Vec<_>>().join("\n");
+    let border = if *ok { BORDER } else { ERROR };
+    container(
+        column![
+            row![
+                text(if *ok {
+                    "Benchmark complete"
+                } else {
+                    "Benchmark failed"
+                })
+                .size(10.5)
+                .color(if *ok { OK } else { ERROR }),
+                spacer(),
+                button(text("Show log").size(9.5))
+                    .on_press(Message::ToggleLog)
+                    .padding(Padding::from([4.0, 10.0]))
+                    .style(theme::secondary),
+                button(text("Dismiss").size(9.5).color(MUTED))
+                    .on_press(Message::DismissBenchmark)
+                    .padding(Padding::from([4.0, 8.0]))
+                    .style(theme::ghost),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            text(preview)
+                .size(9.0)
+                .font(MONO)
+                .color(if *ok { STEEL_LIGHT } else { ERROR }),
+        ]
+        .spacing(6),
+    )
+    .padding(10)
+    .width(Length::Fill)
+    .style(move |_| theme::outlined(PANEL_2, border, 6.0))
+    .into()
 }
 
 fn batch_card(app: &RustBlock) -> El<'static> {
@@ -579,6 +733,10 @@ fn batch_card(app: &RustBlock) -> El<'static> {
                     .size(10.5)
                     .font(MONO)
                     .color(MUTED),
+                text(format!("{} threads", conversion_workers()))
+                    .size(9.0)
+                    .font(MONO)
+                    .color(STEEL_LIGHT),
                 spacer(),
                 button(text(if stopping { "Stopping…" } else { "Stop" }).size(10.5))
                     .on_press_maybe((!stopping).then_some(Message::CancelBatch))
@@ -628,11 +786,11 @@ fn empty_queue() -> El<'static> {
                     .padding(Padding::from([9.0, 20.0]))
                     .height(Length::Fixed(38.0))
                     .style(theme::primary),
-                button(text("Discover models").size(12.5).color(INK))
+                button(text("Discover models").size(12.5).color(ACCENT))
                     .on_press(Message::TabSelected(Tab::Discover))
                     .padding(Padding::from([9.0, 18.0]))
                     .height(Length::Fixed(38.0))
-                    .style(theme::primary),
+                    .style(theme::accent_outline),
             ]
             .spacing(10),
         ]
@@ -696,6 +854,40 @@ fn job_card<'a>(app: &'a RustBlock, job: &'a crate::model::Job) -> El<'a> {
         text(status).size(10.0).color(color),
     ]
     .spacing(4);
+
+    if let Some(output) = job.done_output() {
+        let mut targets = row![].spacing(4).align_y(Alignment::Center);
+        let mut detected = 0;
+        for runtime in Runtime::ALL {
+            let (ready, _) = runtime_ready(runtime, &app.settings);
+            if ready {
+                detected += 1;
+                targets = targets.push(
+                    button(
+                        text(format!("Copy to {}", runtime.label()))
+                            .size(9.5)
+                            .color(INK),
+                    )
+                    .on_press(Message::DeployNow(output.clone(), runtime))
+                    .padding(Padding::from([4.0, 10.0]))
+                    .style(theme::primary),
+                );
+            }
+        }
+        if detected > 0 {
+            body = body.push(
+                row![text("COPY TO").size(8.5).font(MONO).color(MUTED), targets,]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+            );
+        } else {
+            body = body.push(
+                text("No runtime folder detected; set one in Settings to copy the finished model.")
+                    .size(9.0)
+                    .color(MUTED),
+            );
+        }
+    }
 
     if let JobStatus::Running(state) = &job.status {
         body = body.push(
@@ -951,7 +1143,11 @@ fn format_section(app: &RustBlock) -> El<'static> {
     ]
     .spacing(4);
 
-    section = section.push(target_grid(&standard, app.settings.target));
+    section = section.push(target_grid(
+        &standard,
+        app.settings.target,
+        Message::SetTarget,
+    ));
     if !ternary.is_empty() {
         section = section.push(
             row![
@@ -960,12 +1156,20 @@ fn format_section(app: &RustBlock) -> El<'static> {
             ]
             .spacing(8),
         );
-        section = section.push(target_grid(&ternary, app.settings.target));
+        section = section.push(target_grid(
+            &ternary,
+            app.settings.target,
+            Message::SetTarget,
+        ));
     }
     section.into()
 }
 
-fn target_grid(targets: &[Target], selected: Target) -> El<'static> {
+fn target_grid(
+    targets: &[Target],
+    selected: Target,
+    message: impl Fn(Target) -> Message + 'static,
+) -> El<'static> {
     let mut grid = column![].spacing(4);
     for chunk in targets.chunks(3) {
         let mut line = row![].spacing(4);
@@ -980,7 +1184,7 @@ fn target_grid(targets: &[Target], selected: Target) -> El<'static> {
                             STEEL_LIGHT
                         }),
                 )
-                .on_press(Message::SetTarget(*target))
+                .on_press(message(*target))
                 .width(Length::FillPortion(1))
                 .padding(Padding::from([6.0, 4.0]))
                 .style(theme::segment(*target == selected)),
@@ -1080,7 +1284,7 @@ fn discover_page(app: &RustBlock) -> El<'_> {
         .width(Length::Fill)
         .height(Length::Fill);
 
-    row![main, downloads_rail(app)]
+    row![main, repository_rail(app)]
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -1096,27 +1300,34 @@ fn discover_header(app: &RustBlock) -> El<'static> {
             button(text(label).size(10.0))
                 .on_press(Message::SetSource(source))
                 .padding(Padding::from([5.0, 10.0]))
+                .width(Length::Fixed(118.0))
+                .height(Length::Fixed(28.0))
                 .style(theme::segment(app.settings.source == source)),
         );
     }
 
-    row![
-        column![
+    column![
+        row![
             text("Discover").size(26.0).color(TEXT),
+            spacer(),
+            button(text("Trending").size(10.5).color(ACCENT))
+                .on_press_maybe((!app.hf_busy()).then_some(Message::Trending))
+                .padding(Padding::from([6.0, 14.0]))
+                .height(Length::Fixed(30.0))
+                .style(theme::accent_outline),
+        ]
+        .align_y(Alignment::Center),
+        row![
             text("GGUF repositories from Hugging Face or ModelScope, with a fit verdict before the download.")
                 .size(10.5)
-                .color(MUTED),
+                .color(MUTED)
+                .width(Length::Fill),
+            sources,
         ]
-        .spacing(3),
-        spacer(),
-        sources,
-        button(text("Trending").size(10.5))
-            .on_press_maybe((!app.hf_busy()).then_some(Message::Trending))
-            .padding(Padding::from([6.0, 14.0]))
-            .height(Length::Fixed(32.0))
-            .style(theme::secondary),
+        .spacing(12)
+        .align_y(Alignment::Center),
     ]
-    .align_y(Alignment::Center)
+    .spacing(6)
     .into()
 }
 
@@ -1133,6 +1344,7 @@ fn search_bar(app: &RustBlock) -> El<'_> {
                 button(text(label).size(9.5))
                     .on_press(Message::SetSort(sort))
                     .padding(Padding::from([5.0, 10.0]))
+                    .height(Length::Fixed(26.0))
                     .style(theme::segment(app.hf_sort == sort)),
             );
         }
@@ -1158,6 +1370,7 @@ fn search_bar(app: &RustBlock) -> El<'_> {
         )
         .on_press_maybe((!busy).then_some(Message::SearchSubmit))
         .padding(Padding::from([8.0, 18.0]))
+        .height(Length::Fixed(38.0))
         .style(theme::primary),
     ]
     .spacing(8)
@@ -1216,10 +1429,10 @@ fn idle_discover() -> El<'static> {
     let mut chips = row![].spacing(6);
     for query in ["Qwen", "Llama", "Mistral", "Gemma", "Phi", "DeepSeek"] {
         chips = chips.push(
-            button(text(query).size(10.5))
-                .on_press(Message::SearchChanged(query.to_string()))
+            button(text(query).size(10.5).color(STEEL_LIGHT))
+                .on_press(Message::QuickSearch(query.to_string()))
                 .padding(Padding::from([5.0, 12.0]))
-                .style(theme::secondary),
+                .style(theme::accent_outline),
         );
     }
     container(
@@ -1315,38 +1528,8 @@ fn card_button(selected: bool) -> impl Fn(&iced::Theme, button::Status) -> butto
     }
 }
 
-fn downloads_rail(app: &RustBlock) -> El<'_> {
-    let active = app.active_downloads();
-    let header = row![
-        section_label("DOWNLOADS"),
-        chip(
-            format!("{active} active"),
-            PANEL_3,
-            if active > 0 { ACCENT } else { MUTED }
-        ),
-        spacer(),
-        button(text("Clear finished").size(8.5).color(MUTED))
-            .on_press_maybe((!app.downloads.is_empty()).then_some(Message::ClearFinishedDownloads))
-            .padding(Padding::from([2.0, 4.0]))
-            .style(theme::ghost),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
-
-    let mut body = column![header].spacing(8);
-    if app.downloads.is_empty() {
-        body = body.push(
-            text("Nothing queued. Press Get on a file: downloads keep running while you browse.")
-                .size(9.5)
-                .color(MUTED),
-        );
-    }
-    for download in &app.downloads {
-        body = body.push(download_card(download));
-    }
-    body = body.push(divider());
-    body = body.push(repo_panel(app));
-
+fn repository_rail(app: &RustBlock) -> El<'_> {
+    let body = column![section_label("REPOSITORY"), repo_panel(app)].spacing(8);
     let body = container(body.width(Length::Fill)).padding(Padding::from([0.0, 10.0]));
     container(scroll(body).height(Length::Fill))
         .width(Length::Fixed(372.0))
@@ -1356,11 +1539,101 @@ fn downloads_rail(app: &RustBlock) -> El<'_> {
         .into()
 }
 
+fn downloads_page(app: &RustBlock) -> El<'_> {
+    let active = app.active_downloads();
+    let finished = app
+        .downloads
+        .iter()
+        .filter(|download| download.state.is_finished())
+        .count();
+    let header = row![
+        column![
+            row![
+                nav_glyph(NavIcon::Downloads, 22.0, ACCENT),
+                text("Downloads").size(26.0).color(TEXT),
+            ]
+            .spacing(9)
+            .align_y(Alignment::Center),
+            text(format!(
+                "{active} active · {finished} finished · {}",
+                shorten(&app.settings.download_dir.display().to_string(), 58)
+            ))
+            .size(10.5)
+            .color(MUTED),
+        ]
+        .spacing(3),
+        spacer(),
+        button(text("Clean partials").size(9.5).color(MUTED))
+            .on_press(Message::ClearPartials)
+            .padding(Padding::from([5.0, 10.0]))
+            .style(theme::ghost),
+        button(text("Open folder").size(10.5))
+            .on_press(Message::OpenPath(app.settings.download_dir.clone()))
+            .padding(Padding::from([6.0, 12.0]))
+            .style(theme::secondary),
+        button(text("Clear finished").size(10.0).color(MUTED))
+            .on_press_maybe((!app.downloads.is_empty()).then_some(Message::ClearFinishedDownloads))
+            .padding(Padding::from([6.0, 10.0]))
+            .style(theme::ghost),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    let body: El<'_> = if app.downloads.is_empty() {
+        container(
+            column![
+                nav_glyph(NavIcon::Downloads, 34.0, STEEL),
+                text("No downloads yet").size(18.0).color(TEXT),
+                text("Search the Hub and press Get on a file. Transfers keep running while you convert or inspect a model.")
+                    .size(10.5)
+                    .color(MUTED),
+                row![
+                    button(text("Browse models").size(11.5).color(INK))
+                        .on_press(Message::TabSelected(Tab::Discover))
+                        .padding(Padding::from([8.0, 18.0]))
+                        .style(theme::primary),
+                    button(text("Open folder").size(11.0))
+                        .on_press(Message::OpenPath(app.settings.download_dir.clone()))
+                        .padding(Padding::from([8.0, 16.0]))
+                        .style(theme::secondary),
+                ]
+                .spacing(8),
+            ]
+            .spacing(9)
+            .align_x(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center(Length::Fill)
+        .style(|_| theme::outlined(theme::translucent(PANEL, 0.66), BORDER, 8.0))
+        .into()
+    } else {
+        let mut list = column![].spacing(8);
+        for download in &app.downloads {
+            list = list.push(download_card(download));
+        }
+        if app.settings.verify_downloads {
+            list = list.push(
+                text("SHA-256 verification reads the whole file once, so a large model can pause at 100% while it is checked. Turn it off in Settings → Downloads.")
+                    .size(9.0)
+                    .color(MUTED),
+            );
+        }
+        scroll(list).height(Length::Fill).into()
+    };
+
+    column![header, body]
+        .spacing(12)
+        .padding(Padding::from([18.0, 20.0]))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
 fn repo_panel(app: &RustBlock) -> El<'_> {
     let Some(model) = app.current_model() else {
         return container(
             column![
-                section_label("REPOSITORY"),
                 text("Pick a repository to list its GGUF files.")
                     .size(10.5)
                     .color(MUTED),
@@ -1493,10 +1766,10 @@ fn file_row<'a>(app: &'a RustBlock, file: &'a HfFile) -> El<'a> {
     }
 
     let action: El<'_> = if cached {
-        button(text("Add").size(9.5))
+        button(text("Add").size(9.5).color(ACCENT))
             .on_press(Message::AddCached(path))
             .padding(Padding::from([5.0, 10.0]))
-            .style(theme::secondary)
+            .style(theme::accent_outline)
             .into()
     } else if file.projector {
         button(text("Get").size(9.5))
@@ -1544,12 +1817,17 @@ fn download_card(download: &DownloadUi) -> El<'_> {
     let (status, color) = match download.state {
         DownloadState::Queued => ("Queued".to_string(), MUTED),
         DownloadState::Running => {
-            let label = if download.projector {
+            let label = if download.verifying {
+                "Verifying SHA-256"
+            } else if download.projector {
                 "Vision projector"
             } else {
                 "Downloading"
             };
-            (label.to_string(), ACCENT)
+            (
+                label.to_string(),
+                if download.verifying { INFO } else { ACCENT },
+            )
         }
         DownloadState::Done => ("Complete".to_string(), OK),
         DownloadState::Failed => ("Failed".to_string(), ERROR),
@@ -1560,6 +1838,12 @@ fn download_card(download: &DownloadUi) -> El<'_> {
         DownloadState::Queued => format!(
             "{} · waiting for the current download",
             human_bytes(download.total)
+        ),
+        DownloadState::Running if download.verifying => format!(
+            "{} / {} · {:.0}% · one full read",
+            human_bytes(download.done),
+            human_bytes(download.total),
+            frac * 100.0
         ),
         DownloadState::Running => format!(
             "{} / {} · {:.1}% · {}",
@@ -1695,7 +1979,7 @@ fn inspector_page(app: &RustBlock) -> El<'_> {
     let mut header = row![
         column![
             text("Inspector").size(26.0).color(TEXT),
-            text("Facts, metadata and tensor histogram of a local GGUF.")
+            text("Every block in the file, one at a time, with a per-block type editor.")
                 .size(10.5)
                 .color(MUTED),
         ]
@@ -1706,7 +1990,7 @@ fn inspector_page(app: &RustBlock) -> El<'_> {
             .on_submit(Message::InspectorLoad)
             .size(10.0)
             .padding(Padding::from([7.0, 9.0]))
-            .width(Length::Fixed(300.0))
+            .width(Length::Fixed(270.0))
             .style(theme::text_field),
         button(text("Inspect").size(10.5))
             .on_press(Message::InspectorLoad)
@@ -1727,150 +2011,8 @@ fn inspector_page(app: &RustBlock) -> El<'_> {
     header = header.push(spacer());
 
     let body: El<'_> = match &app.inspector {
-        None => container(
-            column![
-                text("Open a GGUF").size(17.0).color(TEXT),
-                text("Pick any local .gguf or paste its path: header facts, metadata and the exact tensor type histogram.")
-                    .size(10.5)
-                    .color(MUTED),
-                match &app.inspector_error {
-                    Some(error) => text(error.as_str()).size(10.0).color(ERROR),
-                    None => text("The file dialog is owned by this window, so it opens on top.")
-                        .size(9.5)
-                        .color(STEEL_LIGHT),
-                },
-            ]
-            .spacing(6)
-            .align_x(Alignment::Center),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center(Length::Fill)
-        .style(|_| theme::outlined(theme::translucent(PANEL, 0.66), BORDER, 8.0))
-        .into(),
-        Some(data) => {
-            let mut facts = column![].spacing(4);
-            for (label, value) in [
-                ("file", human_bytes(data.file_len)),
-                ("version", format!("v{}", data.version)),
-                ("tensors", data.tensors.to_string()),
-                ("alignment", data.alignment.to_string()),
-                ("data start", human_bytes(data.data_start)),
-                ("PQ2_0 tensors", data.pq2.to_string()),
-                ("PTQ1_0 tensors", data.ptq1.to_string()),
-                (
-                    "file type",
-                    data.file_type
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "unknown".to_string()),
-                ),
-            ] {
-                facts = facts.push(
-                    row![
-                        text(label).size(9.5).font(MONO).color(MUTED).width(Length::Fixed(130.0)),
-                        text(value).size(10.5).font(MONO).color(TEXT),
-                    ]
-                    .spacing(8),
-                );
-            }
-
-            let mut metadata = column![].spacing(3);
-            for (key, value) in &data.metadata {
-                metadata = metadata.push(
-                    row![
-                        text(key.as_str())
-                            .size(9.5)
-                            .font(MONO)
-                            .color(MUTED)
-                            .width(Length::Fixed(230.0)),
-                        text(value.as_str()).size(10.0).color(TEXT),
-                    ]
-                    .spacing(8),
-                );
-            }
-
-            let max_bytes = data
-                .histogram
-                .iter()
-                .map(|(_, _, bytes)| *bytes)
-                .max()
-                .unwrap_or(1);
-            let mut histogram = column![].spacing(5);
-            for (name, count, bytes) in &data.histogram {
-                let fraction = *bytes as f32 / max_bytes as f32;
-                histogram = histogram.push(
-                    column![
-                        row![
-                            text(name.as_str()).size(10.0).font(MONO).color(TEXT),
-                            spacer(),
-                            text(format!("{count} × {}", human_bytes(*bytes)))
-                                .size(9.5)
-                                .font(MONO)
-                                .color(MUTED),
-                        ],
-                        progress_bar(0.0..=1.0, fraction)
-                            .girth(5.0)
-                            .style(theme::progress),
-                    ]
-                    .spacing(3),
-                );
-            }
-
-            let fit: El<'_> = match &data.fit {
-                Some(estimate) => {
-                    let (label, color, hint) = fit_badge(estimate);
-                    column![
-                        row![chip_text(label, color), text(fit_summary(estimate)).size(9.5).color(MUTED)]
-                            .spacing(10)
-                            .align_y(Alignment::Center),
-                        text(hint).size(9.0).color(MUTED),
-                    ]
-                    .spacing(4)
-                    .into()
-                }
-                None => text("Fit estimate unavailable.").size(9.5).color(MUTED).into(),
-            };
-
-            scroll(
-                column![
-                    row![
-                        text(data.path.display().to_string())
-                            .size(9.5)
-                            .font(MONO)
-                            .color(STEEL_LIGHT),
-                        spacer(),
-                        text(format!("{} tensors", data.tensors)).size(9.5).color(MUTED),
-                    ]
-                    .align_y(Alignment::Center),
-                    divider(),
-                    text("FACTS").size(9.0).font(MONO).color(STEEL_LIGHT),
-                    facts,
-                    row![
-                        text("weights")
-                            .size(9.5)
-                            .font(MONO)
-                            .color(MUTED)
-                            .width(Length::Fixed(130.0)),
-                        text(human_bytes(data.weights_bytes))
-                            .size(10.5)
-                            .font(MONO)
-                            .color(TEXT),
-                    ]
-                    .spacing(8),
-                    fit,
-                    divider(),
-                    text("METADATA").size(9.0).font(MONO).color(STEEL_LIGHT),
-                    metadata,
-                    divider(),
-                    text("TENSOR TYPES").size(9.0).font(MONO).color(STEEL_LIGHT),
-                    histogram,
-                ]
-                .spacing(8)
-                .width(Length::Fill),
-            )
-            .height(Length::Fill)
-            .into()
-        }
+        None => inspector_empty(app),
+        Some(data) => inspector_loaded(app, data),
     };
 
     column![header, body]
@@ -1879,6 +2021,431 @@ fn inspector_page(app: &RustBlock) -> El<'_> {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+fn inspector_empty(app: &RustBlock) -> El<'_> {
+    container(
+        column![
+            text("Open a GGUF").size(17.0).color(TEXT),
+            text("Drop a .gguf anywhere in this window, pick one, or paste its path: every block is listed with its type, shape and size, and each one can be re-encoded on its own.")
+                .size(10.5)
+                .color(MUTED),
+            match &app.inspector_error {
+                Some(error) => text(error.as_str()).size(10.0).color(ERROR),
+                None => text("Dropping a model while this tab is open inspects it instead of queueing it.")
+                    .size(9.5)
+                    .color(STEEL_LIGHT),
+            },
+        ]
+        .spacing(6)
+        .align_x(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .center(Length::Fill)
+    .style(|_| theme::outlined(theme::translucent(PANEL, 0.66), BORDER, 8.0))
+    .into()
+}
+
+fn inspector_loaded<'a>(app: &'a RustBlock, data: &'a InspectorData) -> El<'a> {
+    let visible: Vec<usize> = data
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.matches(&app.inspector_filter))
+        .map(|(index, _)| index)
+        .collect();
+
+    let list: El<'a> = if visible.is_empty() {
+        container(
+            text("No block matches this filter.")
+                .size(10.0)
+                .color(MUTED),
+        )
+        .padding(12)
+        .width(Length::Fill)
+        .into()
+    } else {
+        let mut rows = column![].spacing(2);
+        for &index in &visible {
+            rows = rows.push(block_row(app, data, index));
+        }
+        scroll(rows).height(Length::Fill).into()
+    };
+
+    let left = container(
+        column![
+            row![
+                section_label("BLOCKS"),
+                spacer(),
+                text(format!("{} / {}", visible.len(), data.blocks.len()))
+                    .size(9.0)
+                    .font(MONO)
+                    .color(MUTED),
+            ]
+            .align_y(Alignment::Center),
+            text_input("Filter by name or type", &app.inspector_filter)
+                .on_input(Message::InspectorFilterChanged)
+                .size(9.5)
+                .padding(Padding::from([6.0, 8.0]))
+                .style(theme::text_field),
+            list,
+        ]
+        .spacing(8)
+        .height(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .padding(10)
+    .style(|_| theme::outlined(PANEL, BORDER, 8.0));
+
+    let right = container(scroll(inspector_details(app, data)).height(Length::Fill))
+        .width(Length::Fixed(444.0))
+        .height(Length::Fill)
+        .padding(12)
+        .style(|_| theme::outlined(PANEL, BORDER, 8.0));
+
+    row![left, right].spacing(12).height(Length::Fill).into()
+}
+
+fn block_row<'a>(app: &'a RustBlock, data: &'a InspectorData, index: usize) -> El<'a> {
+    let block = &data.blocks[index];
+    let selected = app.inspector_selected == Some(index);
+    button(
+        row![
+            text(format!("{index:>4}"))
+                .size(8.5)
+                .font(MONO)
+                .color(STEEL),
+            text(shorten(&block.name, 54))
+                .size(9.5)
+                .font(MONO)
+                .color(if selected { TEXT } else { STEEL_LIGHT })
+                .width(Length::Fill),
+            text(block.type_name).size(8.5).font(MONO).color(MUTED),
+            text(human_bytes(block.bytes))
+                .size(8.5)
+                .font(MONO)
+                .color(MUTED)
+                .width(Length::Fixed(62.0)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .on_press(Message::InspectorSelect(index))
+    .width(Length::Fill)
+    .padding(Padding::from([5.0, 7.0]))
+    .style(theme::list_row(selected))
+    .into()
+}
+
+fn inspector_details<'a>(app: &'a RustBlock, data: &'a InspectorData) -> El<'a> {
+    let mut body = column![].spacing(8).width(Length::Fill);
+
+    let selected = app
+        .inspector_selected
+        .and_then(|index| data.blocks.get(index).map(|block| (index, block)));
+    match selected {
+        Some((index, block)) => body = body.push(block_editor(app, block, index)),
+        None => {
+            body = body.push(
+                column![
+                    text("No block selected").size(13.0).color(TEXT),
+                    text("Pick a block from the list to see its layout and re-encode it.")
+                        .size(9.5)
+                        .color(MUTED),
+                ]
+                .spacing(4),
+            );
+        }
+    }
+
+    body = body.push(divider());
+    body = body.push(file_summary(data));
+    body.into()
+}
+
+fn block_editor<'a>(app: &'a RustBlock, block: &'a InspectorBlock, index: usize) -> El<'a> {
+    let target = app.inspector_target;
+    let mut body = column![
+        row![
+            text(block.name.as_str())
+                .size(10.5)
+                .font(MONO)
+                .color(TEXT)
+                .width(Length::Fill),
+            chip(block.type_name, PANEL_3, TEXT),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+        text(format!(
+            "block {index} · type id {} · {} values/block · {} bytes/block",
+            block.ty, block.block, block.block_bytes
+        ))
+        .size(8.5)
+        .font(MONO)
+        .color(MUTED),
+    ]
+    .spacing(4);
+
+    body = body.push(divider());
+    body = body.push(block_facts(block));
+    body = body.push(divider());
+    body = body.push(section_label("CHANGE TYPE"));
+    let targets: Vec<Target> = Target::ALL
+        .iter()
+        .copied()
+        .filter(|target| *target != Target::Reblock)
+        .collect();
+    body = body.push(target_grid(&targets, target, Message::InspectorEditTarget));
+    body = body.push(text(target_caption(target)).size(9.0).color(MUTED));
+    body = body.push(
+        text(format!("{} → {}", block.type_name, target.short()))
+            .size(10.0)
+            .font(MONO)
+            .color(STEEL_LIGHT),
+    );
+    body = body.push(
+        text_input("Path for the edited copy", &app.inspector_output)
+            .on_input(Message::InspectorEditOutput)
+            .size(9.5)
+            .padding(Padding::from([6.0, 8.0]))
+            .style(theme::text_field),
+    );
+    let encodable = rustblock_core::source_supported(block.ty);
+    if !encodable {
+        body = body.push(
+            text("This block's source type has no native decoder in this build, so it cannot be re-encoded. It is still listed and copied by other conversions.")
+                .size(9.0)
+                .color(ERROR),
+        );
+    }
+    let unchanged = target.type_id() == Some(block.ty);
+    body = body.push(
+        text(if unchanged {
+            "This is already the block's type: the copy will be byte-identical."
+        } else {
+            "Only this block is re-encoded. Every other tensor is copied byte-for-byte; metadata, names and shapes are untouched. Re-quantizing an already quantized block loses precision."
+        })
+        .size(9.0)
+        .color(if unchanged { MUTED } else { WARN }),
+    );
+
+    if let Some((done, total, label)) = &app.edit_progress {
+        let fraction = if *total > 0 {
+            *done as f32 / *total as f32
+        } else {
+            0.0
+        };
+        body = body.push(
+            column![
+                text(label.as_str()).size(9.5).font(MONO).color(STEEL_LIGHT),
+                progress_bar(0.0..=1.0, fraction.clamp(0.0, 1.0))
+                    .girth(5.0)
+                    .style(theme::progress),
+                text(format!("{} / {}", human_bytes(*done), human_bytes(*total)))
+                    .size(8.5)
+                    .font(MONO)
+                    .color(MUTED),
+            ]
+            .spacing(4),
+        );
+    }
+    if let Some(error) = &app.edit_error {
+        body = body.push(text(error.as_str()).size(9.5).color(ERROR));
+    }
+    if let Some(path) = &app.edit_done {
+        body = body.push(
+            row![
+                text(format!(
+                    "Edited copy: {}",
+                    shorten(&path.display().to_string(), 42)
+                ))
+                .size(9.0)
+                .font(MONO)
+                .color(OK)
+                .width(Length::Fill),
+                button(text("Inspect it").size(9.0))
+                    .on_press(Message::InspectPath(path.clone()))
+                    .padding(Padding::from([4.0, 8.0]))
+                    .style(theme::secondary),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+    body = body.push(
+        button(
+            text(if app.edit_busy() {
+                "Writing…"
+            } else {
+                "Write edited copy"
+            })
+            .size(11.0)
+            .color(INK),
+        )
+        .on_press_maybe((!app.edit_busy() && encodable).then_some(Message::InspectorWriteBlock))
+        .width(Length::Fill)
+        .padding(Padding::from([8.0, 14.0]))
+        .style(theme::primary),
+    );
+    body.into()
+}
+
+fn block_facts(block: &InspectorBlock) -> El<'static> {
+    let shape = if block.dims.is_empty() {
+        "scalar".to_string()
+    } else {
+        block
+            .dims
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(" × ")
+    };
+    let mut facts = column![].spacing(3);
+    for (label, value) in [
+        ("shape", shape),
+        ("elements", format_count(block.elements)),
+        ("on disk", human_bytes(block.bytes)),
+        ("bits / weight", format!("{:.3}", block.bits_per_weight)),
+        (
+            "native codec",
+            if rustblock_core::source_supported(block.ty) {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            },
+        ),
+        ("data offset", format!("0x{:x}", block.offset)),
+        ("share", format!("{:.2}%", block.share * 100.0)),
+    ] {
+        facts = facts.push(
+            row![
+                text(label)
+                    .size(9.0)
+                    .font(MONO)
+                    .color(MUTED)
+                    .width(Length::Fixed(96.0)),
+                text(value)
+                    .size(9.5)
+                    .font(MONO)
+                    .color(TEXT)
+                    .width(Length::Fill),
+            ]
+            .spacing(8),
+        );
+    }
+    facts.into()
+}
+
+fn file_summary<'a>(data: &'a InspectorData) -> El<'a> {
+    let mut body = column![].spacing(8).width(Length::Fill);
+    body = body.push(section_label("FILE"));
+    body = body.push(
+        text(data.path.display().to_string())
+            .size(8.5)
+            .font(MONO)
+            .color(STEEL_LIGHT),
+    );
+
+    let mut facts = column![].spacing(3);
+    for (label, value) in [
+        ("file", human_bytes(data.file_len)),
+        ("version", format!("v{}", data.version)),
+        ("tensors", data.tensors.to_string()),
+        ("alignment", data.alignment.to_string()),
+        ("data start", human_bytes(data.data_start)),
+        ("weights", human_bytes(data.weights_bytes)),
+        (
+            "file type",
+            data.file_type
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+        ("PQ2_0 / PTQ1_0", format!("{} / {}", data.pq2, data.ptq1)),
+    ] {
+        facts = facts.push(
+            row![
+                text(label)
+                    .size(9.0)
+                    .font(MONO)
+                    .color(MUTED)
+                    .width(Length::Fixed(110.0)),
+                text(value)
+                    .size(9.5)
+                    .font(MONO)
+                    .color(TEXT)
+                    .width(Length::Fill),
+            ]
+            .spacing(8),
+        );
+    }
+    body = body.push(facts);
+
+    match &data.fit {
+        Some(estimate) => {
+            let (label, color, hint) = fit_badge(estimate);
+            body = body.push(
+                row![
+                    chip_text(label, color),
+                    text(fit_summary(estimate)).size(9.5).color(MUTED),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            );
+            body = body.push(text(hint).size(9.0).color(MUTED));
+        }
+        None => body = body.push(text("Fit estimate unavailable.").size(9.5).color(MUTED)),
+    }
+
+    let max_bytes = data
+        .histogram
+        .iter()
+        .map(|(_, _, bytes)| *bytes)
+        .max()
+        .unwrap_or(1);
+    body = body.push(divider());
+    body = body.push(section_label("TENSOR TYPES"));
+    for (name, count, bytes) in &data.histogram {
+        let fraction = *bytes as f32 / max_bytes as f32;
+        body = body.push(
+            column![
+                row![
+                    text(name.as_str()).size(10.0).font(MONO).color(TEXT),
+                    spacer(),
+                    text(format!("{count} × {}", human_bytes(*bytes)))
+                        .size(9.5)
+                        .font(MONO)
+                        .color(MUTED),
+                ],
+                progress_bar(0.0..=1.0, fraction)
+                    .girth(5.0)
+                    .style(theme::progress),
+            ]
+            .spacing(3),
+        );
+    }
+
+    body = body.push(divider());
+    body = body.push(section_label("METADATA"));
+    for (key, value) in &data.metadata {
+        body = body.push(
+            row![
+                text(key.as_str())
+                    .size(9.0)
+                    .font(MONO)
+                    .color(MUTED)
+                    .width(Length::Fixed(190.0)),
+                text(value.as_str())
+                    .size(9.5)
+                    .color(TEXT)
+                    .width(Length::Fill),
+            ]
+            .spacing(8),
+        );
+    }
+    body.into()
 }
 
 // ----- Log ----------------------------------------------------------------
@@ -1917,14 +2484,18 @@ fn log_panel(app: &RustBlock) -> El<'_> {
             .padding(Padding::from([5.0, 8.0]))
             .width(Length::Fixed(160.0))
             .style(theme::text_field),
-        button(text("Clear").size(9.5).color(MUTED))
+        button(text("Copy log").size(9.5))
+            .on_press(Message::CopyLog)
+            .padding(Padding::from([4.0, 10.0]))
+            .style(theme::secondary),
+        button(text("Clear").size(9.5))
             .on_press(Message::ClearLog)
-            .padding(Padding::from([4.0, 8.0]))
-            .style(theme::ghost),
-        button(text("Close").size(9.5).color(MUTED))
+            .padding(Padding::from([4.0, 10.0]))
+            .style(theme::secondary),
+        button(text("Close").size(9.5).color(INK))
             .on_press(Message::ToggleLog)
-            .padding(Padding::from([4.0, 8.0]))
-            .style(theme::ghost),
+            .padding(Padding::from([4.0, 12.0]))
+            .style(theme::primary),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
@@ -1971,7 +2542,7 @@ fn help_modal<'a>(app: &'a RustBlock) -> El<'a> {
         ("Fit badge", "An estimate at 4096 tokens: weights plus KV cache plus a fixed runtime overhead. A warning, not a guarantee."),
         ("Discover badge", "Computed before the download from the published weights plus 512 MiB. The KV cache needs the model header, so it is not included."),
         ("GPU not detected", "When VRAM is unknown the badge uses system RAM and marks VRAM as not detected. RustBlock never assumes a GPU."),
-        ("Benchmark", "Run llama-bench on the newest finished model. Install llama.cpp tools to enable it."),
+        ("Benchmark", "Run llama-bench on the newest finished model, or on the first queued file. The result appears above the queue; install llama.cpp tools or set LLAMA_BENCH."),
         ("GGUF inspector", "Facts, metadata and the tensor type histogram with byte sizes, straight from the file."),
         ("Shortcuts", "Ctrl+O add files · Ctrl+S start · Ctrl+L log · F1 help"),
     ];
@@ -2074,105 +2645,151 @@ fn settings_modal(app: &RustBlock) -> El<'_> {
             "Download folder",
             &settings.download_dir,
             Message::PickDownloadDir,
+            settings.download_dir.exists(),
         ),
-        row![
-            text("Partial files keep their .part suffix and resume on the next attempt.")
-                .size(9.0)
-                .color(MUTED)
-                .width(Length::Fill),
-            button(text("Delete partials").size(9.5))
-                .on_press(Message::ClearPartials)
-                .padding(Padding::from([4.0, 10.0]))
-                .style(theme::secondary),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
+        setting_toggle(
+            "Verify SHA-256 after download",
+            "Reads the whole file once after the transfer. Turn it off to stop at 100% on slow disks: the published size is still checked, the hash pass is skipped.",
+            settings.verify_downloads,
+            Message::SetVerifyDownloads,
+        ),
     ]
     .spacing(8);
 
-    let mut source_row = row![].spacing(3);
-    for (source, label) in [
-        (Source::HuggingFace, "Hugging Face"),
-        (Source::ModelScope, "ModelScope"),
-    ] {
-        source_row = source_row.push(
-            button(text(label).size(10.0))
-                .on_press(Message::SetSource(source))
-                .padding(Padding::from([5.0, 12.0]))
-                .style(theme::segment(settings.source == source)),
-        );
-    }
-    let sources = column![
-        section_label("MODEL SOURCES"),
-        row![
-            source_row,
-            spacer(),
-            text("ModelScope: paste a model link.")
-                .size(9.0)
-                .color(MUTED),
-        ]
-        .align_y(Alignment::Center),
-        text("Hugging Face endpoint")
-            .size(10.0)
-            .color(STEEL_LIGHT),
+    let network = column![
+        section_label("NETWORK"),
+        text("Hugging Face mirror").size(10.0).color(STEEL_LIGHT),
         text_input("https://huggingface.co", &settings.hf_endpoint)
             .on_input(Message::HfEndpointChanged)
             .size(10.0)
             .padding(Padding::from([7.0, 9.0]))
             .style(theme::text_field),
-        text("Use https://hf-mirror.com when huggingface.co is blocked. Applies to search, file lists and downloads.")
+        text("Use https://hf-mirror.com when huggingface.co is blocked; it applies to search, file lists and downloads. Hugging Face or ModelScope is chosen in Discover.")
             .size(9.0)
             .color(MUTED),
     ]
     .spacing(6);
 
-    let runtimes =
-        column![
-        section_label("TEST IN A RUNTIME"),
-        text("Finished models can be copied or imported into these folders from the deploy dialog.")
+    let ollama = match find_tool("ollama") {
+        Some(path) => format!(
+            "Ollama found at {}",
+            shorten(&path.display().to_string(), 56)
+        ),
+        None => "Ollama not found on PATH; install it to import models with a generated Modelfile."
+            .to_string(),
+    };
+    let runtimes = column![
+        section_label("RUNTIME FOLDERS"),
+        text("Detected folders appear as one-click copy targets on finished models.")
             .size(9.5)
             .color(MUTED),
-        folder_setting("LM Studio models", &settings.lmstudio_dir, Message::PickLmStudioDir),
-        folder_setting("Jan data folder", &settings.jan_dir, Message::PickJanDir),
-        folder_setting("Prism / llama.cpp", &settings.prism_dir, Message::PickPrismDir),
-        text("Ollama is imported with a generated Modelfile through the ollama command.")
-            .size(9.0)
-            .color(MUTED),
+        folder_setting(
+            "LM Studio models",
+            &settings.lmstudio_dir,
+            Message::PickLmStudioDir,
+            settings.lmstudio_dir.exists(),
+        ),
+        folder_setting(
+            "Jan data folder",
+            &settings.jan_dir,
+            Message::PickJanDir,
+            settings.jan_dir.exists(),
+        ),
+        folder_setting(
+            "Prism / llama.cpp",
+            &settings.prism_dir,
+            Message::PickPrismDir,
+            settings.prism_dir.exists(),
+        ),
+        text(ollama).size(9.0).color(MUTED),
     ]
-        .spacing(8);
+    .spacing(8);
+
+    let ram = app
+        .hardware
+        .ram_bytes
+        .map(human_bytes)
+        .unwrap_or_else(|| "not detected".to_string());
+    let vram = app
+        .hardware
+        .vram_bytes
+        .map(|bytes| format!("{} VRAM", human_bytes(bytes)))
+        .unwrap_or_else(|| "no NVIDIA GPU detected".to_string());
+    let system = column![
+        section_label("SYSTEM"),
+        row![
+            text("CPU threads").size(10.5).color(TEXT),
+            spacer(),
+            text(format!("{} · all logical processors", conversion_workers()))
+                .size(9.5)
+                .font(MONO)
+                .color(STEEL_LIGHT),
+        ]
+        .align_y(Alignment::Center),
+        row![
+            text("System RAM").size(10.5).color(TEXT),
+            spacer(),
+            text(ram).size(9.5).font(MONO).color(STEEL_LIGHT),
+        ]
+        .align_y(Alignment::Center),
+        row![
+            text("GPU VRAM").size(10.5).color(TEXT),
+            spacer(),
+            text(vram).size(9.5).font(MONO).color(STEEL_LIGHT),
+        ]
+        .align_y(Alignment::Center),
+    ]
+    .spacing(7);
 
     let content = column![
         conversion,
         divider(),
         downloads,
         divider(),
-        sources,
+        network,
+        divider(),
+        system,
         divider(),
         runtimes
     ]
     .spacing(12)
     .width(Length::Fill);
 
-    let footer = row![
-        button(text("Reset defaults").size(10.0).color(MUTED))
-            .on_press(Message::ResetSettings)
-            .padding(Padding::from([6.0, 12.0]))
-            .style(theme::ghost),
-        spacer(),
-        button(text("Close").size(10.5))
-            .on_press(Message::ToggleSettings)
-            .padding(Padding::from([6.0, 16.0]))
-            .style(theme::secondary),
+    let footer = column![
+        divider(),
+        row![
+            column![
+                text(format!("RustBlock v{}", env!("CARGO_PKG_VERSION")))
+                    .size(9.0)
+                    .font(MONO)
+                    .color(STEEL_LIGHT),
+                text("Saved to %APPDATA%\\RustBlock\\settings.json")
+                    .size(8.0)
+                    .font(MONO)
+                    .color(MUTED),
+            ]
+            .spacing(1),
+            spacer(),
+            button(text("Reset defaults").size(10.0))
+                .on_press(Message::ResetSettings)
+                .padding(Padding::from([7.0, 14.0]))
+                .style(theme::secondary),
+            button(text("Done").size(11.0).color(INK))
+                .on_press(Message::ToggleSettings)
+                .padding(Padding::from([7.0, 22.0]))
+                .style(theme::primary),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
     ]
-    .align_y(Alignment::Center);
+    .spacing(8);
 
     let card = column![
         row![
             text("Settings").size(18.0).color(TEXT),
             spacer(),
-            text("Saved to %APPDATA%\\RustBlock\\settings.json")
-                .size(8.5)
-                .font(MONO)
+            text("Everything is saved as you change it.")
+                .size(9.0)
                 .color(MUTED),
         ]
         .align_y(Alignment::Center),
@@ -2187,8 +2804,8 @@ fn settings_modal(app: &RustBlock) -> El<'_> {
 
     modal(
         container(card)
-            .width(Length::Fixed(660.0))
-            .height(Length::Fixed(620.0))
+            .width(Length::Fixed(700.0))
+            .height(Length::Fixed(560.0))
             .padding(18)
             .style(|_| theme::outlined(PANEL, BORDER, 8.0)),
     )
@@ -2216,10 +2833,19 @@ fn setting_toggle<'a>(
     .into()
 }
 
-fn folder_setting(label: &str, path: &std::path::Path, pick: Message) -> El<'static> {
+fn folder_setting(label: &str, path: &std::path::Path, pick: Message, ready: bool) -> El<'static> {
     row![
         column![
-            text(label.to_string()).size(10.5).color(TEXT),
+            row![
+                text(label.to_string()).size(10.5).color(TEXT),
+                chip(
+                    if ready { "found" } else { "missing" },
+                    PANEL_3,
+                    if ready { OK } else { MUTED },
+                ),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
             text(shorten(&path.display().to_string(), 58))
                 .size(9.0)
                 .font(MONO)
@@ -2536,7 +3162,7 @@ mod tests {
     #[test]
     fn every_tab_builds_its_view() {
         let mut app = RustBlock::empty();
-        for tab in [Tab::Convert, Tab::Discover, Tab::Inspector] {
+        for tab in [Tab::Convert, Tab::Discover, Tab::Downloads, Tab::Inspector] {
             app.tab = tab;
             let _ = view(&app);
         }
@@ -2582,6 +3208,77 @@ mod tests {
         app.hf_state = HfState::Idle;
         let _ = view(&app);
         app.hf_details_error = Some("bad link".to_string());
+        let _ = view(&app);
+    }
+
+    #[test]
+    fn inspector_lists_blocks_and_builds_the_editor() {
+        let mut app = RustBlock::empty();
+        app.tab = Tab::Inspector;
+        app.inspector_path = Some(std::path::PathBuf::from("model.gguf"));
+        app.inspector_input = "model.gguf".to_string();
+        app.inspector_output = "model.edited.gguf".to_string();
+        app.inspector_selected = Some(1);
+        app.inspector = Some(InspectorData {
+            path: std::path::PathBuf::from("model.gguf"),
+            version: 3,
+            file_len: 16384,
+            alignment: 32,
+            data_start: 1024,
+            tensors: 3,
+            blocks: vec![
+                InspectorBlock {
+                    name: "blk.0.attn_norm.weight".to_string(),
+                    ty: 0,
+                    type_name: "F32",
+                    dims: vec![64],
+                    elements: 64,
+                    bytes: 256,
+                    offset: 1024,
+                    block: 1,
+                    block_bytes: 4,
+                    bits_per_weight: 32.0,
+                    share: 0.02,
+                },
+                InspectorBlock {
+                    name: "blk.0.attn_q.weight".to_string(),
+                    ty: 12,
+                    type_name: "Q4_K",
+                    dims: vec![64, 64],
+                    elements: 4096,
+                    bytes: 2304,
+                    offset: 1280,
+                    block: 256,
+                    block_bytes: 144,
+                    bits_per_weight: 4.5,
+                    share: 0.8,
+                },
+                InspectorBlock {
+                    name: "output.weight".to_string(),
+                    ty: 1,
+                    type_name: "F16",
+                    dims: vec![64, 64],
+                    elements: 4096,
+                    bytes: 8192,
+                    offset: 5120,
+                    block: 1,
+                    block_bytes: 2,
+                    bits_per_weight: 16.0,
+                    share: 0.18,
+                },
+            ],
+            pq2: 0,
+            ptq1: 0,
+            file_type: Some(14),
+            metadata: vec![("general.architecture".to_string(), "llama".to_string())],
+            histogram: vec![("Q4_K".to_string(), 1, 2304)],
+            weights_bytes: 10752,
+            fit: None,
+        });
+        let _ = view(&app);
+        app.inspector_filter = "q4_k".to_string();
+        let _ = view(&app);
+        app.inspector_filter = "nothing".to_string();
         let _ = view(&app);
     }
 

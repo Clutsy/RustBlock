@@ -35,6 +35,9 @@ pub struct DownloadOptions {
     pub force: bool,
     pub expected_sha256: Option<String>,
     pub token: Option<String>,
+    /// Hash the finished file even when no expected hash is available.
+    /// Set to false to skip the full read on slow disks.
+    pub compute_sha256: bool,
 }
 
 impl Default for DownloadOptions {
@@ -46,6 +49,7 @@ impl Default for DownloadOptions {
             token: std::env::var("HF_TOKEN")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
+            compute_sha256: true,
         }
     }
 }
@@ -82,7 +86,7 @@ pub fn download_url(
     options: &DownloadOptions,
     cancel: &AtomicBool,
 ) -> Result<DownloadReport, DownloadError> {
-    download_impl(url, destination, options, cancel, None)
+    download_impl(url, destination, options, cancel, None, None)
 }
 
 /// Same as `download_url`, with a `(bytes_done, bytes_total)` callback used by
@@ -96,7 +100,28 @@ pub fn download_url_with_progress(
     cancel: &AtomicBool,
     on_progress: &(dyn Fn(u64, u64) + Sync),
 ) -> Result<DownloadReport, DownloadError> {
-    download_impl(url, destination, options, cancel, Some(on_progress))
+    download_impl(url, destination, options, cancel, Some(on_progress), None)
+}
+
+/// Like [`download_url_with_progress`], with a second callback for the
+/// SHA-256 pass. The hash reads the whole file, so the desktop app reports it
+/// as its own phase instead of leaving the transfer bar stuck at 100%.
+pub fn download_url_with_progress_and_verify(
+    url: &str,
+    destination: &Path,
+    options: &DownloadOptions,
+    cancel: &AtomicBool,
+    on_progress: &(dyn Fn(u64, u64) + Sync),
+    on_verify: &(dyn Fn(u64, u64) + Sync),
+) -> Result<DownloadReport, DownloadError> {
+    download_impl(
+        url,
+        destination,
+        options,
+        cancel,
+        Some(on_progress),
+        Some(on_verify),
+    )
 }
 
 fn download_impl(
@@ -105,10 +130,11 @@ fn download_impl(
     options: &DownloadOptions,
     cancel: &AtomicBool,
     on_progress: Option<&(dyn Fn(u64, u64) + Sync)>,
+    on_verify: Option<&(dyn Fn(u64, u64) + Sync)>,
 ) -> Result<DownloadReport, DownloadError> {
     if destination.exists() && !options.force {
         let bytes = destination.metadata().map(|m| m.len()).unwrap_or(0);
-        let sha256 = sha256(destination)?;
+        let sha256 = hash_if_requested(destination, bytes, options, on_verify)?;
         if let Some(expected) = &options.expected_sha256 {
             if !sha256.eq_ignore_ascii_case(expected.trim()) {
                 return Err(DownloadError::HashMismatch {
@@ -172,7 +198,7 @@ fn download_impl(
             expected: total,
         });
     }
-    let sha256 = sha256(&partial)?;
+    let sha256 = hash_if_requested(&partial, total, options, on_verify)?;
     if let Some(expected) = &options.expected_sha256 {
         if !sha256.eq_ignore_ascii_case(expected.trim()) {
             let _ = fs::remove_file(&partial);
@@ -489,10 +515,31 @@ pub fn download_many_with_events(
         .collect()
 }
 
-fn sha256(path: &Path) -> Result<String, DownloadError> {
+fn hash_if_requested(
+    path: &Path,
+    total: u64,
+    options: &DownloadOptions,
+    on_verify: Option<&(dyn Fn(u64, u64) + Sync)>,
+) -> Result<String, DownloadError> {
+    if !options.compute_sha256 && options.expected_sha256.is_none() {
+        return Ok(String::new());
+    }
+    sha256(path, total, on_verify)
+}
+
+fn sha256(
+    path: &Path,
+    total: u64,
+    on_verify: Option<&(dyn Fn(u64, u64) + Sync)>,
+) -> Result<String, DownloadError> {
     let mut file = File::open(path).map_err(|error| DownloadError::Io(error.to_string()))?;
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut buffer = vec![0u8; 4 * 1024 * 1024];
+    let mut done = 0u64;
+    let mut reported = 0u64;
+    if let Some(callback) = on_verify {
+        callback(0, total);
+    }
     loop {
         let read = file
             .read(&mut buffer)
@@ -501,6 +548,16 @@ fn sha256(path: &Path) -> Result<String, DownloadError> {
             break;
         }
         hasher.update(&buffer[..read]);
+        done += read as u64;
+        if let Some(callback) = on_verify {
+            if done.saturating_sub(reported) >= 64 * 1024 * 1024 {
+                reported = done;
+                callback(done, total.max(done));
+            }
+        }
+    }
+    if let Some(callback) = on_verify {
+        callback(done, total.max(done));
     }
     Ok(format!("{:x}", hasher.finalize()))
 }

@@ -144,6 +144,18 @@ pub fn secondary(_: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// Outlined accent button: quieter than primary, stronger than secondary.
+pub fn accent_outline(_: &Theme, status: button::Status) -> button::Style {
+    match status {
+        button::Status::Hovered => button_style(PANEL_3, PANEL_3, PANEL_3, ACCENT, ACCENT),
+        button::Status::Pressed => {
+            button_style(ACCENT_DARK, ACCENT_DARK, ACCENT_DARK, INK, ACCENT_DARK)
+        }
+        button::Status::Disabled => button_style(PANEL, PANEL, PANEL, MUTED, BORDER),
+        _ => button_style(PANEL_2, PANEL_2, PANEL_2, ACCENT, ACCENT_DARK),
+    }
+}
+
 pub fn ghost(_: &Theme, status: button::Status) -> button::Style {
     match status {
         button::Status::Hovered => {
@@ -245,6 +257,22 @@ pub fn segment(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Sty
             button_style(PANEL_2, PANEL_2, PANEL_2, TEXT, BORDER)
         } else {
             button_style(BG, BG, BG, MUTED, BORDER)
+        }
+    }
+}
+
+/// Rows in the inspector's block list.
+pub fn list_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        if selected {
+            button_style(PANEL_2, PANEL_2, PANEL_2, TEXT, ACCENT_DARK)
+        } else if hovered {
+            button_style(PANEL_2, PANEL_2, PANEL_2, TEXT, BORDER)
+        } else {
+            let mut style = button_style(BG, BG, BG, STEEL_LIGHT, BG);
+            style.border.width = 0.0;
+            style
         }
     }
 }

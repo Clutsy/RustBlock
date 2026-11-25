@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use iced::{Subscription, Task};
 
 use crate::deploy::{self, DeployEvent, DeployUi, Runtime};
+use crate::edit::{self, EditEvent};
 use crate::hf::{self, HfEvent, HfFile, HfModel, HfSort};
 use crate::model::{
     analyze, human_bytes, human_duration, looks_quantized_name, output_path, path_key,
@@ -38,6 +39,7 @@ use rustblock_core::{plan_budget, BudgetRequest, Hardware, Target, VerifyMode};
 pub enum Tab {
     Convert,
     Discover,
+    Downloads,
     Inspector,
 }
 
@@ -46,6 +48,7 @@ impl Tab {
         match self {
             Self::Convert => "Convert",
             Self::Discover => "Discover",
+            Self::Downloads => "Downloads",
             Self::Inspector => "Inspector",
         }
     }
@@ -134,6 +137,7 @@ pub struct DownloadUi {
     pub projector: bool,
     pub path: Option<PathBuf>,
     pub error: Option<String>,
+    pub verifying: bool,
     pub state: DownloadState,
 }
 
@@ -187,6 +191,7 @@ pub enum Message {
     ToggleSettings,
     SetSource(Source),
     SetAutoAdd(bool),
+    SetVerifyDownloads(bool),
     SetConfirmRequantize(bool),
     HfEndpointChanged(String),
     PickLmStudioDir,
@@ -213,9 +218,15 @@ pub enum Message {
     InspectorRefresh,
     InspectorPathChanged(String),
     InspectorLoad,
+    InspectorFilterChanged(String),
+    InspectorSelect(usize),
+    InspectorEditTarget(Target),
+    InspectorEditOutput(String),
+    InspectorWriteBlock,
     InspectPath(PathBuf),
     OpenPath(PathBuf),
     SearchChanged(String),
+    QuickSearch(String),
     SearchSubmit,
     SetSort(HfSort),
     Trending,
@@ -230,6 +241,7 @@ pub enum Message {
     OpenUrl(String),
     ClearPartials,
     Deploy(PathBuf),
+    DeployNow(PathBuf, Runtime),
     DeployTo(Runtime),
     DeployCancel,
     DeployClose,
@@ -237,6 +249,8 @@ pub enum Message {
     LogFilterChanged(String),
     ToggleLevel(usize),
     ClearLog,
+    CopyLog,
+    DismissBenchmark,
 }
 
 pub struct RustBlock {
@@ -251,6 +265,7 @@ pub struct RustBlock {
     pub batch: Option<Batch>,
     pub last_output_dir: Option<PathBuf>,
     pub benchmark: Option<BenchmarkUi>,
+    pub benchmark_result: Option<(bool, String)>,
     pub logs: Vec<LogEntry>,
     pub show_log: bool,
     pub log_filter: String,
@@ -282,6 +297,15 @@ pub struct RustBlock {
     pub confirm_close: bool,
     pub inspector_error: Option<String>,
     pub inspector_input: String,
+    pub inspector_filter: String,
+    pub inspector_selected: Option<usize>,
+    pub inspector_target: Target,
+    pub inspector_output: String,
+    pub edit_rx: Option<Receiver<EditEvent>>,
+    pub edit_worker: Option<JoinHandle<()>>,
+    pub edit_progress: Option<(u64, u64, String)>,
+    pub edit_error: Option<String>,
+    pub edit_done: Option<PathBuf>,
     pub deploy: Option<DeployUi>,
     pub maximized: bool,
     pub window: Option<iced::window::Id>,
@@ -289,6 +313,14 @@ pub struct RustBlock {
     pub logo: iced::widget::image::Handle,
     pub wordmark: iced::widget::image::Handle,
     pub wordmark_aspect: f32,
+}
+
+fn default_edit_output(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "model".to_string());
+    path.with_file_name(format!("{stem}.edited.gguf"))
 }
 
 fn file_name_of(path: &Path) -> String {
@@ -307,6 +339,8 @@ fn spawn_benchmark(model: PathBuf) -> BenchmarkUi {
                 .arg(&model_thread)
                 .arg("-ngl")
                 .arg("99")
+                .arg("-t")
+                .arg(rustblock_core::conversion_workers().to_string())
                 .output()
                 .map(|output| {
                     let ok = output.status.success();
@@ -389,6 +423,7 @@ impl RustBlock {
             batch: None,
             last_output_dir: None,
             benchmark: None,
+            benchmark_result: None,
             logs: Vec::new(),
             show_log: false,
             log_filter: String::new(),
@@ -400,6 +435,15 @@ impl RustBlock {
             inspector: None,
             inspector_error: None,
             inspector_input: String::new(),
+            inspector_filter: String::new(),
+            inspector_selected: None,
+            inspector_target: Target::Q8_0,
+            inspector_output: String::new(),
+            edit_rx: None,
+            edit_worker: None,
+            edit_progress: None,
+            edit_error: None,
+            edit_done: None,
             hf_query: String::new(),
             hf_sort: HfSort::Downloads,
             hf_state: HfState::Idle,
@@ -462,6 +506,7 @@ impl RustBlock {
             || self.downloads_busy()
             || self.benchmark.is_some()
             || self.deploy.as_ref().is_some_and(|deploy| deploy.busy)
+            || self.edit_worker.is_some()
     }
 
     pub fn job_name(&self, id: u64) -> String {
@@ -537,6 +582,7 @@ impl RustBlock {
                 self.poll_downloads();
                 self.poll_benchmark();
                 self.poll_deploy();
+                self.poll_edit();
             }
             Message::WindowOpened(id) => {
                 if self.window.is_none() {
@@ -605,6 +651,10 @@ impl RustBlock {
                 self.settings.auto_add_downloads = value;
                 self.settings.save();
             }
+            Message::SetVerifyDownloads(value) => {
+                self.settings.verify_downloads = value;
+                self.settings.save();
+            }
             Message::SetConfirmRequantize(value) => {
                 self.settings.confirm_requantize = value;
                 self.settings.save();
@@ -638,7 +688,18 @@ impl RustBlock {
                 hf::set_endpoint(&self.settings.hf_endpoint);
             }
             Message::Browse => self.browse(),
-            Message::FilesDropped(path) => self.add_paths(vec![path]),
+            Message::FilesDropped(path) => {
+                let is_gguf = path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"));
+                if self.tab == Tab::Inspector && is_gguf {
+                    self.inspector_input = path.display().to_string();
+                    self.inspector_path = Some(path);
+                    self.inspector_refresh();
+                } else {
+                    self.add_paths(vec![path]);
+                }
+            }
             Message::ClearQueue => {
                 if !self.is_running() {
                     self.jobs.clear();
@@ -716,12 +777,39 @@ impl RustBlock {
                     self.inspector_refresh();
                 }
             }
+            Message::InspectorFilterChanged(value) => {
+                self.inspector_filter = value;
+                let selected_visible = self
+                    .inspector
+                    .as_ref()
+                    .and_then(|data| {
+                        self.inspector_selected
+                            .and_then(|index| data.blocks.get(index))
+                            .map(|block| block.matches(&self.inspector_filter))
+                    })
+                    .unwrap_or(false);
+                if !selected_visible {
+                    self.inspector_selected = self.inspector.as_ref().and_then(|data| {
+                        data.blocks
+                            .iter()
+                            .position(|block| block.matches(&self.inspector_filter))
+                    });
+                }
+            }
+            Message::InspectorSelect(index) => self.inspector_selected = Some(index),
+            Message::InspectorEditTarget(target) => self.inspector_target = target,
+            Message::InspectorEditOutput(value) => self.inspector_output = value,
+            Message::InspectorWriteBlock => self.write_block(),
             Message::InspectPath(path) => {
                 self.inspector_path = Some(path);
                 self.tab = Tab::Inspector;
                 self.inspector_refresh();
             }
             Message::Deploy(path) => self.deploy = Some(DeployUi::new(path)),
+            Message::DeployNow(path, runtime) => {
+                self.deploy = Some(DeployUi::new(path));
+                self.deploy_to(runtime);
+            }
             Message::DeployTo(runtime) => self.deploy_to(runtime),
             Message::DeployCancel => {
                 if let Some(deploy) = &self.deploy {
@@ -738,6 +826,10 @@ impl RustBlock {
             }
             Message::OpenPath(path) => open_folder(&path),
             Message::SearchChanged(query) => self.hf_query = query,
+            Message::QuickSearch(query) => {
+                self.hf_query = query;
+                self.start_search();
+            }
             Message::SearchSubmit => self.start_search(),
             Message::SetSort(sort) => {
                 if self.hf_sort != sort {
@@ -816,6 +908,18 @@ impl RustBlock {
                 }
             }
             Message::ClearLog => self.logs.clear(),
+            Message::DismissBenchmark => self.benchmark_result = None,
+            Message::CopyLog => {
+                if !self.logs.is_empty() {
+                    let content = self
+                        .logs
+                        .iter()
+                        .map(|entry| format!("[{}] {}", entry.level.short(), entry.text))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return iced::clipboard::write(content);
+                }
+            }
         }
         Task::none()
     }
@@ -1271,13 +1375,53 @@ impl RustBlock {
         if self.benchmark.is_some() {
             return;
         }
-        let Some(model) = self.done_job_output() else {
+        if self.is_running() {
+            self.benchmark_result = Some((
+                false,
+                "Wait for the conversion to finish: benchmarking uses the same CPU.".to_string(),
+            ));
+            return;
+        }
+        let model = self.done_job_output().or_else(|| {
+            self.jobs
+                .iter()
+                .rev()
+                .find(|job| job.input.exists())
+                .map(|job| job.input.clone())
+        });
+        let Some(model) = model else {
+            self.benchmark_result = Some((
+                false,
+                "Add a GGUF file first: Benchmark runs llama-bench on a local model.".to_string(),
+            ));
+            self.log(
+                LogLevel::Warn,
+                "Benchmark needs a local GGUF: add a file or finish a conversion first."
+                    .to_string(),
+            );
             return;
         };
+        if find_tool("llama-bench").is_none() {
+            self.benchmark_result = Some((
+                false,
+                "llama-bench not found. Install the llama.cpp tools or set LLAMA_BENCH to the full path of llama-bench.exe."
+                    .to_string(),
+            ));
+            self.log(
+                LogLevel::Error,
+                "llama-bench not found on PATH; set LLAMA_BENCH to its executable.".to_string(),
+            );
+            return;
+        }
+        self.benchmark_result = None;
         let bench = spawn_benchmark(model.clone());
         self.log(
             LogLevel::Info,
-            format!("Benchmark: llama-bench -m {}", model.display()),
+            format!(
+                "Benchmark: llama-bench -m {} -t {}",
+                model.display(),
+                rustblock_core::conversion_workers()
+            ),
         );
         self.benchmark = Some(bench);
     }
@@ -1301,6 +1445,7 @@ impl RustBlock {
                 if ok { LogLevel::Ok } else { LogLevel::Error },
                 format!("Benchmark result (ok={ok}):\n{text}"),
             );
+            self.benchmark_result = Some((ok, text));
             if let Some(bench) = self.benchmark.take() {
                 let _ = bench.handle.join();
             }
@@ -1320,17 +1465,138 @@ impl RustBlock {
     fn inspector_refresh(&mut self) {
         self.inspector = None;
         self.inspector_error = None;
+        self.inspector_selected = None;
+        self.edit_error = None;
+        self.edit_done = None;
+        if self.edit_worker.is_none() {
+            self.edit_progress = None;
+        }
         let Some(path) = self.inspector_path.as_deref() else {
             return;
         };
         self.inspector_input = path.display().to_string();
+        if self.edit_worker.is_none() {
+            self.inspector_output = default_edit_output(path).display().to_string();
+        }
         match InspectorData::open(path) {
-            Some(data) => self.inspector = Some(data),
+            Some(data) => {
+                self.inspector_selected = (!data.blocks.is_empty()).then_some(0);
+                self.inspector = Some(data);
+            }
             None => {
                 self.inspector_error = Some(format!(
                     "Cannot read {}: not a valid GGUF, or a tensor type this build cannot decode.",
                     path.display()
                 ));
+            }
+        }
+    }
+
+    pub fn edit_busy(&self) -> bool {
+        self.edit_worker.is_some()
+    }
+
+    fn write_block(&mut self) {
+        if self.edit_busy() {
+            return;
+        }
+        let Some(data) = &self.inspector else {
+            return;
+        };
+        let Some(block) = self
+            .inspector_selected
+            .and_then(|index| data.blocks.get(index))
+        else {
+            self.edit_error = Some("Select a block first.".to_string());
+            return;
+        };
+        let text = self.inspector_output.trim();
+        if text.is_empty() {
+            self.edit_error = Some("Choose an output path for the edited copy.".to_string());
+            return;
+        }
+        let output = PathBuf::from(text);
+        if same_file(&data.path, &output) {
+            self.edit_error = Some("The edited copy needs a different file name.".to_string());
+            return;
+        }
+        if output.exists() {
+            self.edit_error = Some(format!(
+                "{} already exists. Choose a new name: nothing is overwritten.",
+                output.display()
+            ));
+            return;
+        }
+        let input = data.path.clone();
+        let tensor = block.name.clone();
+        let target = self.inspector_target;
+        let (tx, rx) = mpsc::channel();
+        self.edit_rx = Some(rx);
+        self.edit_worker = Some(edit::spawn(
+            input,
+            output.clone(),
+            tensor.clone(),
+            target,
+            tx,
+        ));
+        self.edit_progress = Some((0, 0, format!("Starting · {tensor}")));
+        self.edit_error = None;
+        self.edit_done = None;
+        self.log(
+            LogLevel::Info,
+            format!(
+                "Writing {tensor} as {} to {}.",
+                target.short(),
+                output.display()
+            ),
+        );
+    }
+
+    fn poll_edit(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &self.edit_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for event in events {
+            match event {
+                EditEvent::Progress { done, total, label } => {
+                    self.edit_progress = Some((done, total, label));
+                }
+                EditEvent::Done { path, report } => {
+                    self.edit_progress = None;
+                    self.edit_done = Some(path.clone());
+                    self.log(
+                        LogLevel::Ok,
+                        format!(
+                            "Edited copy written to {} ({} → {}, {} tensors).",
+                            path.display(),
+                            human_bytes(report.old_file_size),
+                            human_bytes(report.new_file_size),
+                            report.tensors_total
+                        ),
+                    );
+                }
+                EditEvent::Failed(error) => {
+                    self.edit_progress = None;
+                    self.edit_error = Some(error.clone());
+                    self.log(LogLevel::Error, format!("Per-block edit failed: {error}"));
+                }
+            }
+        }
+        if disconnected {
+            self.edit_rx = None;
+            if let Some(worker) = self.edit_worker.take() {
+                let _ = worker.join();
             }
         }
     }
@@ -1710,6 +1976,7 @@ impl RustBlock {
             projector,
             path: None,
             error: None,
+            verifying: false,
             state: DownloadState::Queued,
         });
         self.log(
@@ -1742,6 +2009,7 @@ impl RustBlock {
             item.done = 0;
             item.speed = 0.0;
             item.error = None;
+            item.verifying = false;
             (
                 item.source,
                 item.repo.clone(),
@@ -1750,6 +2018,7 @@ impl RustBlock {
                 item.expected_sha.clone(),
             )
         };
+        let verify = self.settings.verify_downloads;
         let (tx, rx) = mpsc::channel();
         self.dl_rx = Some(rx);
         self.dl_cancel = Arc::new(AtomicBool::new(false));
@@ -1764,6 +2033,7 @@ impl RustBlock {
                 &file,
                 &dest,
                 sha.as_deref(),
+                verify,
                 &cancel,
                 &tx,
             );
@@ -1801,12 +2071,22 @@ impl RustBlock {
                 HfEvent::DownloadStarted { total, .. } => {
                     if let Some(download) = self.active_download_mut() {
                         download.total = total;
+                        download.verifying = false;
+                    }
+                }
+                HfEvent::DownloadVerifying { done, total } => {
+                    if let Some(download) = self.active_download_mut() {
+                        download.verifying = true;
+                        download.done = done;
+                        download.total = total.max(done);
+                        download.speed = 0.0;
                     }
                 }
                 HfEvent::DownloadProgress { done, total, speed } => {
                     if let Some(download) = self.active_download_mut() {
                         download.done = done;
                         download.total = total;
+                        download.verifying = false;
                         download.speed = if download.speed <= 0.0 {
                             speed
                         } else {
@@ -1825,6 +2105,7 @@ impl RustBlock {
                         .map(|download| {
                             download.path = Some(path.clone());
                             download.done = download.total;
+                            download.verifying = false;
                             download.state = DownloadState::Done;
                             download.quantized
                         })

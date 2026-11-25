@@ -36,7 +36,8 @@ pub use convert::{
 };
 pub use download::{
     download_many, download_many_with_events, download_mmproj, download_url,
-    download_url_with_progress, BatchDownloadEvent, DownloadError, DownloadOptions, DownloadReport,
+    download_url_with_progress, download_url_with_progress_and_verify, BatchDownloadEvent,
+    DownloadError, DownloadOptions, DownloadReport,
 };
 pub use fit::{
     detect_hardware, estimate as estimate_fit, hardware_fits, human_bytes, suggest_target,
@@ -73,7 +74,7 @@ pub use safetensors_native::{
     NativeError as SafetensorsNativeError, NativeReport as SafetensorsNativeReport,
 };
 pub use transcode::{
-    conversion_workers, source_supported, transcode, transcode_with_imatrix,
+    conversion_workers, retarget_tensors, source_supported, transcode, transcode_with_imatrix,
     transcode_with_overrides, Target,
 };
 pub use types::{type_info, type_name, TypeInfo, TY_PQ2_0, TY_PTQ1_0, TY_Q2_0};

@@ -187,7 +187,11 @@ pub fn high_precision_type(target: Target) -> Option<Target> {
 /// `LLAMA_<NAME>` take precedence over `PATH`.
 pub fn find_tool(name: &str) -> Option<PathBuf> {
     let upper = name.to_ascii_uppercase().replace('-', "_");
-    for key in [format!("RUSTBLOCK_{upper}"), format!("LLAMA_{upper}")] {
+    for key in [
+        format!("RUSTBLOCK_{upper}"),
+        upper.clone(),
+        format!("LLAMA_{upper}"),
+    ] {
         if let Some(path) = std::env::var_os(key) {
             let path = PathBuf::from(path);
             if path.is_file() {

@@ -7,6 +7,7 @@
 
 mod app;
 mod deploy;
+mod edit;
 mod hf;
 mod model;
 mod theme;
@@ -27,7 +28,7 @@ fn main() -> iced::Result {
     .antialiasing(true)
     .window(window::Settings {
         size: iced::Size::new(1120.0, 700.0),
-        min_size: Some(iced::Size::new(900.0, 580.0)),
+        min_size: Some(iced::Size::new(1000.0, 640.0)),
         position: window::Position::Specific(iced::Point::new(20.0, 0.0)),
         decorations: false,
         resizable: true,

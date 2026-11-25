@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rustblock_core::{
-    estimate_fit, source_supported, type_name, FitEstimate, FitRequest, Gguf, Hardware, Phase,
-    Report, Target, VerifyMode, TY_PTQ1_0, TY_Q2_0,
+    estimate_fit, source_supported, type_info, type_name, FitEstimate, FitRequest, Gguf, Hardware,
+    Phase, Report, Target, VerifyMode, TY_PTQ1_0, TY_Q2_0,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +367,36 @@ impl Job {
     }
 }
 
+/// One tensor (block) as listed and edited by the inspector.
+#[derive(Debug, Clone)]
+pub struct InspectorBlock {
+    pub name: String,
+    pub ty: u32,
+    pub type_name: &'static str,
+    pub dims: Vec<u64>,
+    pub elements: u64,
+    /// On-disk bytes, or 0 for a type this build cannot size.
+    pub bytes: u64,
+    /// Absolute offset of the payload in the file.
+    pub offset: u64,
+    /// Elements and bytes per stored block (0 when the layout is unknown).
+    pub block: u64,
+    pub block_bytes: u64,
+    pub bits_per_weight: f64,
+    /// Fraction of all tensor bytes in the file.
+    pub share: f32,
+}
+
+impl InspectorBlock {
+    /// Case-insensitive name/type match for the inspector filter.
+    pub fn matches(&self, filter: &str) -> bool {
+        let filter = filter.trim().to_ascii_lowercase();
+        filter.is_empty()
+            || self.name.to_ascii_lowercase().contains(&filter)
+            || self.type_name.to_ascii_lowercase().contains(&filter)
+    }
+}
+
 /// A loaded GGUF for the inspector view: facts, metadata, tensor histogram
 /// and the memory estimate. `open` returns `None` for unreadable files.
 #[derive(Debug, Clone)]
@@ -377,6 +407,8 @@ pub struct InspectorData {
     pub alignment: u64,
     pub data_start: u64,
     pub tensors: usize,
+    /// Every tensor in header order, with its layout and size.
+    pub blocks: Vec<InspectorBlock>,
     pub pq2: usize,
     pub ptq1: usize,
     pub file_type: Option<u32>,
@@ -399,6 +431,34 @@ impl InspectorData {
             },
         )
         .ok();
+        let weights_bytes: u64 = g.tensors.iter().filter_map(|t| t.size).sum();
+        let blocks: Vec<InspectorBlock> = g
+            .tensors
+            .iter()
+            .map(|tensor| {
+                let info = type_info(tensor.ty);
+                let bytes = tensor.size.unwrap_or(0);
+                InspectorBlock {
+                    name: tensor.name.clone(),
+                    ty: tensor.ty,
+                    type_name: type_name(tensor.ty),
+                    dims: tensor.dims.clone(),
+                    elements: tensor.element_count(),
+                    bytes,
+                    offset: g.data_start + tensor.offset,
+                    block: info.map(|info| info.block).unwrap_or(0),
+                    block_bytes: info.map(|info| info.bytes).unwrap_or(0),
+                    bits_per_weight: info
+                        .map(|info| info.bytes as f64 * 8.0 / info.block as f64)
+                        .unwrap_or(0.0),
+                    share: if weights_bytes > 0 {
+                        bytes as f32 / weights_bytes as f32
+                    } else {
+                        0.0
+                    },
+                }
+            })
+            .collect();
         let mut by_type: BTreeMap<u32, (usize, u64)> = BTreeMap::new();
         for tensor in &g.tensors {
             let entry = by_type.entry(tensor.ty).or_insert((0, 0));
@@ -417,12 +477,13 @@ impl InspectorData {
             alignment: g.alignment,
             data_start: g.data_start,
             tensors: g.tensors.len(),
+            blocks,
             pq2: g.pq2_count(),
             ptq1: g.tensors.iter().filter(|t| t.ty == TY_PTQ1_0).count(),
             file_type: g.file_type,
             metadata: g.metadata_summary(12),
             histogram,
-            weights_bytes: g.tensors.iter().filter_map(|t| t.size).sum(),
+            weights_bytes,
             fit,
         })
     }
@@ -477,6 +538,9 @@ pub struct Settings {
     pub source: Source,
     /// Queue a finished download automatically.
     pub auto_add_downloads: bool,
+    /// Read the whole download back to check its SHA-256. Off skips that pass
+    /// on slow disks, so only the published size is checked.
+    pub verify_downloads: bool,
     /// Ask before converting an already quantized model again.
     pub confirm_requantize: bool,
     /// Hub endpoint; `https://hf-mirror.com` works as a drop-in mirror.
@@ -497,6 +561,7 @@ impl Default for Settings {
             download_dir: default_download_dir(),
             source: Source::HuggingFace,
             auto_add_downloads: true,
+            verify_downloads: true,
             confirm_requantize: true,
             hf_endpoint: "https://huggingface.co".to_string(),
             lmstudio_dir: home_dir()
@@ -571,6 +636,10 @@ impl Settings {
             .get("auto_add_downloads")
             .and_then(|v| v.as_bool())
             .unwrap_or(settings.auto_add_downloads);
+        settings.verify_downloads = value
+            .get("verify_downloads")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(settings.verify_downloads);
         settings.confirm_requantize = value
             .get("confirm_requantize")
             .and_then(|v| v.as_bool())
@@ -604,6 +673,7 @@ impl Settings {
                 Source::ModelScope => "modelscope",
             },
             "auto_add_downloads": self.auto_add_downloads,
+            "verify_downloads": self.verify_downloads,
             "confirm_requantize": self.confirm_requantize,
             "hf_endpoint": self.hf_endpoint,
             "lmstudio_dir": self.lmstudio_dir.display().to_string(),
