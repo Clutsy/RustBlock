@@ -96,6 +96,18 @@ export HF_TOKEN=hf_...
 
 The token is read from the environment and is never written to disk by RustBlock.
 
+## Download
+
+Windows builds are published on the [GitHub Releases page](https://github.com/Clutsy/RustBlock/releases/latest):
+
+- **RustBlock-Setup-x.y.z.exe** - per-user installer in `%LOCALAPPDATA%\Programs\RustBlock`, with a Start Menu entry, optional desktop shortcut and silent updates. No administrator prompt.
+- **RustBlock-x.y.z-portable.zip** - standalone `RustBlock.exe` and `rustblock.exe`; unpack anywhere. Settings still live in `%APPDATA%\RustBlock`.
+- **SHA256SUMS.txt** - checksums for both downloads.
+
+The installed app checks GitHub Releases on launch. Settings -> **Updates** shows the
+latest release, downloads the new installer and restarts into it. The update is
+handed to the same per-user installer, so it does not ask for elevation.
+
 ## Install / build
 
 Requires Rust **1.92+**.
@@ -113,6 +125,30 @@ Launch the GUI with one or more models:
 
 ```bash
 cargo run -p rustblock-gui --release -- model-PQ2_0.gguf
+```
+
+### Windows installer
+
+The Inno Setup definition lives in `packaging/windows/RustBlock.iss`. After a
+release build:
+
+```powershell
+iscc /DMyAppVersion=0.1.0 packaging\windows\RustBlock.iss
+```
+
+The installer is written to `dist/RustBlock-Setup-0.1.0.exe`. `site/` contains the
+English showcase page ready for Vercel; see `site/README.md` for the one-click
+import settings.
+
+## Releases
+
+Pushing a tag that starts with `v` runs `.github/workflows/release.yml`. The
+workflow builds the Windows binaries, packages the portable ZIP, compiles the
+Inno Setup installer, writes `SHA256SUMS.txt` and creates the GitHub Release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## CLI

@@ -30,6 +30,7 @@ use crate::model::{
     DownloadState, FileKind, InspectorData, Job, JobStatus, OutputMode, RunState, Settings, Source,
 };
 use crate::theme::{self, ERROR, MUTED, OK, WARN};
+use crate::update::{self, Check, UpdateEvent, UpdateInfo};
 use crate::worker::{self, Event, WorkItem, WorkKind};
 use rustblock_core::imatrix::find_tool;
 use rustblock_core::{plan_budget, BudgetRequest, Hardware, Target, VerifyMode};
@@ -168,6 +169,35 @@ pub struct BenchmarkUi {
 }
 
 #[derive(Debug, Clone)]
+pub enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(UpdateInfo),
+    Installing,
+    Error(String),
+}
+
+#[derive(Debug)]
+pub struct UpdateUi {
+    pub state: UpdateState,
+    pub rx: Option<Receiver<UpdateEvent>>,
+    pub worker: Option<JoinHandle<()>>,
+    pub pending_install: Option<PathBuf>,
+}
+
+impl Default for UpdateUi {
+    fn default() -> Self {
+        Self {
+            state: UpdateState::Idle,
+            rx: None,
+            worker: None,
+            pending_install: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum HfState {
     Idle,
     Searching,
@@ -251,6 +281,8 @@ pub enum Message {
     ClearLog,
     CopyLog,
     DismissBenchmark,
+    CheckUpdates,
+    InstallUpdate,
 }
 
 pub struct RustBlock {
@@ -266,6 +298,7 @@ pub struct RustBlock {
     pub last_output_dir: Option<PathBuf>,
     pub benchmark: Option<BenchmarkUi>,
     pub benchmark_result: Option<(bool, String)>,
+    pub update: UpdateUi,
     pub logs: Vec<LogEntry>,
     pub show_log: bool,
     pub log_filter: String,
@@ -404,6 +437,7 @@ impl RustBlock {
         if !files.is_empty() {
             app.add_paths(files);
         }
+        app.start_update_check(false);
         app
     }
 
@@ -424,6 +458,7 @@ impl RustBlock {
             last_output_dir: None,
             benchmark: None,
             benchmark_result: None,
+            update: UpdateUi::default(),
             logs: Vec::new(),
             show_log: false,
             log_filter: String::new(),
@@ -583,6 +618,23 @@ impl RustBlock {
                 self.poll_benchmark();
                 self.poll_deploy();
                 self.poll_edit();
+                self.poll_update();
+                if let Some(path) = self.update.pending_install.take() {
+                    match update::run_installer(&path) {
+                        Ok(()) => {
+                            self.log(
+                                LogLevel::Info,
+                                "Installer started; RustBlock will restart with the new version."
+                                    .to_string(),
+                            );
+                            std::process::exit(0);
+                        }
+                        Err(error) => {
+                            self.log(LogLevel::Error, format!("Update installer: {error}"));
+                            self.update.state = UpdateState::Error(error);
+                        }
+                    }
+                }
             }
             Message::WindowOpened(id) => {
                 if self.window.is_none() {
@@ -635,6 +687,8 @@ impl RustBlock {
             Message::ToggleLog => self.show_log = !self.show_log,
             Message::ToggleHelp => self.show_help = !self.show_help,
             Message::ToggleSettings => self.show_settings = !self.show_settings,
+            Message::CheckUpdates => self.start_update_check(true),
+            Message::InstallUpdate => self.install_update(),
             Message::SetSource(source) => {
                 if self.settings.source != source {
                     self.settings.source = source;
@@ -933,7 +987,7 @@ impl RustBlock {
             iced::event::listen_with(listen),
             iced::window::open_events().map(Message::WindowOpened),
         ];
-        if self.busy() {
+        if self.busy() || self.update.rx.is_some() {
             subscriptions
                 .push(iced::time::every(Duration::from_millis(120)).map(|_| Message::Tick));
         }
@@ -1367,6 +1421,100 @@ impl RustBlock {
         self.rx = Some(rx);
         self.worker = Some(handle);
         self.cancel = Some(cancel);
+    }
+
+    // ----- Updates ---------------------------------------------------------
+
+    fn start_update_check(&mut self, announce: bool) {
+        if self.update.rx.is_some() {
+            return;
+        }
+        self.update.state = UpdateState::Checking;
+        if announce {
+            self.log(
+                LogLevel::Info,
+                "Checking GitHub for a newer RustBlock release...".to_string(),
+            );
+        }
+        let (tx, rx) = mpsc::channel();
+        self.update.rx = Some(rx);
+        self.update.worker = Some(thread::spawn(move || {
+            let _ = tx.send(UpdateEvent::Checked(update::check_latest()));
+        }));
+    }
+
+    fn install_update(&mut self) {
+        let UpdateState::Available(info) = self.update.state.clone() else {
+            return;
+        };
+        if self.update.rx.is_some() {
+            return;
+        }
+        if info.installer_url.is_none() {
+            self.update.state = UpdateState::Error(
+                "This release does not include a Windows installer.".to_string(),
+            );
+            return;
+        }
+        self.update.state = UpdateState::Installing;
+        self.log(
+            LogLevel::Info,
+            format!("Downloading the RustBlock {} installer...", info.version),
+        );
+        let (tx, rx) = mpsc::channel();
+        self.update.rx = Some(rx);
+        self.update.worker = Some(thread::spawn(move || {
+            let _ = tx.send(UpdateEvent::Downloaded(update::download_installer(&info)));
+        }));
+    }
+
+    fn poll_update(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &self.update.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for event in events {
+            match event {
+                UpdateEvent::Checked(Ok(Check::Available(info))) => {
+                    self.log(
+                        LogLevel::Ok,
+                        format!("RustBlock {} is available.", info.version),
+                    );
+                    self.update.state = UpdateState::Available(info);
+                }
+                UpdateEvent::Checked(Ok(Check::UpToDate)) => {
+                    self.log(LogLevel::Info, "RustBlock is up to date.".to_string());
+                    self.update.state = UpdateState::UpToDate;
+                }
+                UpdateEvent::Checked(Err(error)) => {
+                    self.log(LogLevel::Warn, format!("Update check: {error}"));
+                    self.update.state = UpdateState::Error(error);
+                }
+                UpdateEvent::Downloaded(Ok(path)) => {
+                    self.update.pending_install = Some(path);
+                }
+                UpdateEvent::Downloaded(Err(error)) => {
+                    self.log(LogLevel::Error, format!("Update download: {error}"));
+                    self.update.state = UpdateState::Error(error);
+                }
+            }
+        }
+        if disconnected {
+            self.update.rx = None;
+            if let Some(worker) = self.update.worker.take() {
+                let _ = worker.join();
+            }
+        }
     }
 
     // ----- Benchmark / inspector ------------------------------------------

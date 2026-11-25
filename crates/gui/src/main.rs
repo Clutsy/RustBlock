@@ -11,6 +11,7 @@ mod edit;
 mod hf;
 mod model;
 mod theme;
+mod update;
 mod view;
 mod worker;
 

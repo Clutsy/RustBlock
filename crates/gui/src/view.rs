@@ -15,7 +15,7 @@ use iced::{
 
 use crate::app::{
     detected_hardware, format_count, short_date, size_fit_badge, DownloadUi, HfState, LogLevel,
-    Message, RustBlock, Tab,
+    Message, RustBlock, Tab, UpdateState,
 };
 use crate::deploy::Runtime;
 use crate::hf::{self, HfFile, HfModel, HfSort};
@@ -223,28 +223,49 @@ fn chrome(app: &RustBlock) -> El<'_> {
     ]
     .spacing(3);
 
-    let right = row![
-        chrome_icon_button(NavIcon::Log, "LOG", Message::ToggleLog, app.show_log),
-        chrome_icon_button(
+    let mut right = row![].spacing(2).align_y(Alignment::Center);
+    if let UpdateState::Available(info) = &app.update.state {
+        right = right.push(
+            button(
+                text(format!("UPDATE {}", info.version))
+                    .size(8.5)
+                    .font(MONO)
+                    .color(INK),
+            )
+            .on_press(Message::ToggleSettings)
+            .padding(Padding::from([5.0, 9.0]))
+            .style(theme::primary),
+        );
+    }
+    right = right
+        .push(chrome_icon_button(
+            NavIcon::Log,
+            "LOG",
+            Message::ToggleLog,
+            app.show_log,
+        ))
+        .push(chrome_icon_button(
             NavIcon::Settings,
             "SETTINGS",
             Message::ToggleSettings,
             app.show_settings,
-        ),
-        chrome_icon_button(NavIcon::Help, "HELP", Message::ToggleHelp, app.show_help),
-        window_button(WindowIcon::Minimize, Message::Minimize),
-        window_button(
+        ))
+        .push(chrome_icon_button(
+            NavIcon::Help,
+            "HELP",
+            Message::ToggleHelp,
+            app.show_help,
+        ))
+        .push(window_button(WindowIcon::Minimize, Message::Minimize))
+        .push(window_button(
             if app.maximized {
                 WindowIcon::Restore
             } else {
                 WindowIcon::Maximize
             },
             Message::ToggleMaximize,
-        ),
-        window_button(WindowIcon::Close, Message::CloseWindow),
-    ]
-    .spacing(2)
-    .align_y(Alignment::Center);
+        ))
+        .push(window_button(WindowIcon::Close, Message::CloseWindow));
 
     container(
         row![brand, spacer(), tabs, spacer(), status_pill(app), right,]
@@ -2543,6 +2564,7 @@ fn help_modal<'a>(app: &'a RustBlock) -> El<'a> {
         ("Discover badge", "Computed before the download from the published weights plus 512 MiB. The KV cache needs the model header, so it is not included."),
         ("GPU not detected", "When VRAM is unknown the badge uses system RAM and marks VRAM as not detected. RustBlock never assumes a GPU."),
         ("Benchmark", "Run llama-bench on the newest finished model, or on the first queued file. The result appears above the queue; install llama.cpp tools or set LLAMA_BENCH."),
+        ("Updates", "RustBlock checks GitHub Releases on launch. When a newer version exists, Settings shows Install update: it downloads the release installer and restarts the app."),
         ("GGUF inspector", "Facts, metadata and the tensor type histogram with byte sizes, straight from the file."),
         ("Shortcuts", "Ctrl+O add files · Ctrl+S start · Ctrl+L log · F1 help"),
     ];
@@ -2705,6 +2727,88 @@ fn settings_modal(app: &RustBlock) -> El<'_> {
     ]
     .spacing(8);
 
+    let (update_status, update_color, install_ready) = match &app.update.state {
+        UpdateState::Idle => ("Not checked yet.".to_string(), MUTED, false),
+        UpdateState::Checking => ("Checking GitHub...".to_string(), INFO, false),
+        UpdateState::UpToDate => ("You are on the latest release.".to_string(), OK, false),
+        UpdateState::Available(info) => (
+            format!(
+                "RustBlock {} is available (installed v{}).",
+                info.version,
+                env!("CARGO_PKG_VERSION")
+            ),
+            ACCENT,
+            info.installer_url.is_some(),
+        ),
+        UpdateState::Installing => (
+            "Downloading and preparing the installer...".to_string(),
+            WARN,
+            false,
+        ),
+        UpdateState::Error(error) => (error.clone(), ERROR, false),
+    };
+    let mut update_buttons = row![].spacing(6);
+    if let UpdateState::Available(info) = &app.update.state {
+        update_buttons = update_buttons.push(
+            button(text("Release notes").size(9.5))
+                .on_press(Message::OpenUrl(info.page_url.clone()))
+                .padding(Padding::from([5.0, 10.0]))
+                .style(theme::secondary),
+        );
+    }
+    if install_ready {
+        update_buttons = update_buttons.push(
+            button(text("Install update").size(9.5).color(INK))
+                .on_press(Message::InstallUpdate)
+                .padding(Padding::from([5.0, 12.0]))
+                .style(theme::primary),
+        );
+    }
+    if matches!(
+        app.update.state,
+        UpdateState::Idle | UpdateState::UpToDate | UpdateState::Error(_)
+    ) {
+        update_buttons = update_buttons.push(
+            button(text("Check now").size(9.5))
+                .on_press(Message::CheckUpdates)
+                .padding(Padding::from([5.0, 10.0]))
+                .style(theme::secondary),
+        );
+    }
+    let update_notes: El<'_> = match &app.update.state {
+        UpdateState::Available(info) if !info.notes.trim().is_empty() => text(
+            info.notes
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or_default()
+                .chars()
+                .take(110)
+                .collect::<String>(),
+        )
+        .size(8.5)
+        .color(MUTED)
+        .into(),
+        _ => space().height(Length::Fixed(0.0)).into(),
+    };
+    let updates = column![
+        section_label("UPDATES"),
+        row![
+            column![
+                text(format!("Installed v{}", env!("CARGO_PKG_VERSION")))
+                    .size(10.5)
+                    .color(TEXT),
+                text(update_status).size(9.0).color(update_color),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            update_buttons,
+        ]
+        .align_y(Alignment::Center)
+        .spacing(8),
+        update_notes,
+    ]
+    .spacing(6);
+
     let ram = app
         .hardware
         .ram_bytes
@@ -2747,6 +2851,8 @@ fn settings_modal(app: &RustBlock) -> El<'_> {
         downloads,
         divider(),
         network,
+        divider(),
+        updates,
         divider(),
         system,
         divider(),
