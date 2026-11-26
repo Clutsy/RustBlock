@@ -104,14 +104,16 @@ Native builds for Windows, Linux and macOS are published on the
 - **RustBlock-Setup-x.y.z.exe** - per-user Windows installer in
   `%LOCALAPPDATA%\Programs\RustBlock`, with a Start Menu entry, optional desktop
   shortcut and silent updates. No administrator prompt.
-- **RustBlock-x.y.z-portable.zip** - standalone `RustBlock.exe` and
-  `rustblock.exe` for Windows; unpack anywhere. Settings still live in
-  `%APPDATA%\RustBlock`.
-- **RustBlock-x.y.z-linux-x86_64.tar.gz** - the `RustBlock` GUI and `rustblock`
-  CLI for Linux x86_64 with X11 or Wayland. Unpack and run; no installer or root
-  step.
-- **RustBlock-x.y.z-macos-arm64.tar.gz** - Apple Silicon build of the GUI and CLI.
-- **RustBlock-x.y.z-macos-x86_64.tar.gz** - Intel build of the GUI and CLI.
+- **RustBlock-x.y.z-portable.zip** - standalone Windows build: the
+  `RustBlock.exe` GUI at the root and the CLI in `cli\rustblock.exe`; unpack
+  anywhere. Settings still live in `%APPDATA%\RustBlock`.
+- **RustBlock-x.y.z-linux-x86_64.tar.gz** - the `RustBlock` GUI and the
+  `cli/rustblock` CLI for Linux x86_64 with X11 or Wayland. Unpack and run; no
+  installer or root step.
+- **RustBlock-x.y.z-macos-arm64.tar.gz** - Apple Silicon build of the GUI and the
+  `cli/rustblock` CLI.
+- **RustBlock-x.y.z-macos-x86_64.tar.gz** - Intel build of the GUI and the
+  `cli/rustblock` CLI.
 - **SHA256SUMS.txt** - checksums for every asset.
 
 The installed Windows app checks GitHub Releases on launch. Settings -> **Updates**
@@ -157,10 +159,10 @@ The Inno Setup definition lives in `packaging/windows/RustBlock.iss`. After a
 native release build:
 
 ```powershell
-iscc /DMyAppVersion=0.2.0 packaging\windows\RustBlock.iss
+iscc /DMyAppVersion=0.2.1 packaging\windows\RustBlock.iss
 ```
 
-The installer is written to `dist/RustBlock-Setup-0.2.0.exe`. `site/` contains the
+The installer is written to `dist/RustBlock-Setup-0.2.1.exe`. `site/` contains the
 English showcase page; see `site/README.md` for preview and Vercel settings.
 
 ## Releases
@@ -172,8 +174,8 @@ job verifies that the tag matches the workspace version, writes `SHA256SUMS.txt`
 and creates the GitHub Release with every asset:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 To compile without publishing, open **Actions -> Build -> Run workflow**. The same

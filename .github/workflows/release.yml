@@ -45,10 +45,12 @@ jobs:
           $version = "${{ github.ref_name }}".TrimStart("v")
           choco install innosetup --no-progress -y
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" "packaging\windows\RustBlock.iss"
-          New-Item -ItemType Directory -Force dist\portable | Out-Null
+          New-Item -ItemType Directory -Force dist\portable\cli | Out-Null
           Copy-Item target\release\rustblock-gui.exe dist\portable\RustBlock.exe
-          Copy-Item target\release\rustblock.exe dist\portable\rustblock.exe
+          Copy-Item target\release\rustblock.exe dist\portable\cli\rustblock.exe
           Copy-Item README.md, LICENSE, NOTICE dist\portable\
+          if (-not (Test-Path dist\portable\RustBlock.exe)) { throw "GUI missing from portable ZIP" }
+          if (-not (Test-Path dist\portable\cli\rustblock.exe)) { throw "CLI missing from portable ZIP" }
           Compress-Archive -Path dist\portable\* -DestinationPath "dist\RustBlock-$version-portable.zip" -Force
 
       - name: Build Unix package
@@ -56,15 +58,19 @@ jobs:
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          mkdir -p dist/pkg
+          mkdir -p dist/pkg/cli
           cp target/release/rustblock-gui dist/pkg/RustBlock
-          cp target/release/rustblock dist/pkg/rustblock
+          cp target/release/rustblock dist/pkg/cli/rustblock
           cp README.md LICENSE NOTICE dist/pkg/
-          chmod +x dist/pkg/RustBlock dist/pkg/rustblock
+          chmod +x dist/pkg/RustBlock dist/pkg/cli/rustblock
+          test -x dist/pkg/RustBlock
+          test -x dist/pkg/cli/rustblock
           if [ "${{ runner.os }}" = "macOS" ]; then
-            codesign --force --sign - dist/pkg/RustBlock dist/pkg/rustblock
+            codesign --force --sign - dist/pkg/RustBlock dist/pkg/cli/rustblock
           fi
           tar -czf "dist/RustBlock-${version}-${{ matrix.platform }}.tar.gz" -C dist/pkg .
+          tar -tzf "dist/RustBlock-${version}-${{ matrix.platform }}.tar.gz" | grep -qx './RustBlock'
+          tar -tzf "dist/RustBlock-${version}-${{ matrix.platform }}.tar.gz" | grep -qx './cli/rustblock'
 
       - uses: actions/upload-artifact@v4
         with:
@@ -115,10 +121,10 @@ jobs:
             | macOS Intel | `RustBlock-*-macos-x86_64.tar.gz` |
 
             The Windows installer is per-user (no elevation) and supports silent OTA
-            updates from Settings → Updates. The Linux and macOS archives contain the
-            `RustBlock` GUI and the `rustblock` CLI. macOS builds are ad-hoc signed but
-            not notarized: if Gatekeeper blocks the first launch, right-click → Open,
-            or remove the quarantine attribute.
+            updates from Settings → Updates. The portable ZIP and the Linux/macOS
+            archives keep the GUI at the root and the CLI in `cli/`. macOS builds are
+            ad-hoc signed but not notarized: if Gatekeeper blocks the first launch,
+            right-click → Open, or remove the quarantine attribute.
 
             Every archive is covered by `SHA256SUMS.txt`.
           files: dist/*

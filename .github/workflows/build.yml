@@ -54,10 +54,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist\pkg | Out-Null
+          New-Item -ItemType Directory -Force dist\pkg\cli | Out-Null
           Copy-Item target\release\rustblock-gui.exe dist\pkg\RustBlock.exe
-          Copy-Item target\release\rustblock.exe dist\pkg\rustblock.exe
+          Copy-Item target\release\rustblock.exe dist\pkg\cli\rustblock.exe
           Copy-Item README.md, LICENSE, NOTICE dist\pkg\
+          if (-not (Test-Path dist\pkg\RustBlock.exe)) { throw "GUI missing from package" }
+          if (-not (Test-Path dist\pkg\cli\rustblock.exe)) { throw "CLI missing from package" }
           Compress-Archive -Path dist\pkg\* -DestinationPath "dist\RustBlock-${{ steps.version.outputs.version }}-${{ matrix.platform }}.zip" -Force
 
       - name: Package Unix
@@ -65,15 +67,19 @@ jobs:
         shell: bash
         run: |
           version="${{ steps.version.outputs.version }}"
-          mkdir -p dist/pkg
+          mkdir -p dist/pkg/cli
           cp target/release/rustblock-gui dist/pkg/RustBlock
-          cp target/release/rustblock dist/pkg/rustblock
+          cp target/release/rustblock dist/pkg/cli/rustblock
           cp README.md LICENSE NOTICE dist/pkg/
-          chmod +x dist/pkg/RustBlock dist/pkg/rustblock
+          chmod +x dist/pkg/RustBlock dist/pkg/cli/rustblock
+          test -x dist/pkg/RustBlock
+          test -x dist/pkg/cli/rustblock
           if [ "${{ runner.os }}" = "macOS" ]; then
-            codesign --force --sign - dist/pkg/RustBlock dist/pkg/rustblock
+            codesign --force --sign - dist/pkg/RustBlock dist/pkg/cli/rustblock
           fi
           tar -czf "dist/RustBlock-${version}-${{ matrix.platform }}.tar.gz" -C dist/pkg .
+          tar -tzf "dist/RustBlock-${version}-${{ matrix.platform }}.tar.gz" | grep -qx './RustBlock'
+          tar -tzf "dist/RustBlock-${version}-${{ matrix.platform }}.tar.gz" | grep -qx './cli/rustblock'
 
       - uses: actions/upload-artifact@v4
         with:
