@@ -1,0 +1,85 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "build-*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: macos-15-intel
+            platform: macos-x86_64
+          - os: macos-15
+            platform: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      - name: Read workspace version
+        id: version
+        shell: bash
+        run: |
+          version=$(awk '/^\[workspace.package\]/{found=1} found && /^version = /{gsub(/[",]/,""); print $3; exit}' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "::error::Cannot read the workspace version."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\pkg | Out-Null
+          Copy-Item target\release\rustblock-gui.exe dist\pkg\RustBlock.exe
+          Copy-Item target\release\rustblock.exe dist\pkg\rustblock.exe
+          Copy-Item README.md, LICENSE, NOTICE dist\pkg\
+          Compress-Archive -Path dist\pkg\* -DestinationPath "dist\RustBlock-${{ steps.version.outputs.version }}-${{ matrix.platform }}.zip" -Force
+
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p dist/pkg
+          cp target/release/rustblock-gui dist/pkg/RustBlock
+          cp target/release/rustblock dist/pkg/rustblock
+          cp README.md LICENSE NOTICE dist/pkg/
+          chmod +x dist/pkg/RustBlock dist/pkg/rustblock
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            codesign --force --sign - dist/pkg/RustBlock dist/pkg/rustblock
+          fi
+          tar -czf "dist/RustBlock-${version}-${{ matrix.platform }}.tar.gz" -C dist/pkg .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RustBlock-${{ matrix.platform }}
+          path: |
+            dist/RustBlock-*.zip
+            dist/RustBlock-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14

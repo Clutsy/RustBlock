@@ -9,58 +9,118 @@ permissions:
   contents: write
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  build:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: macos-15-intel
+            platform: macos-x86_64
+          - os: macos-15
+            platform: macos-arm64
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build binaries
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+
+      - name: Build release binaries
         run: cargo build --release --locked
 
-      - name: Install Inno Setup
-        run: choco install innosetup --no-progress -y
-
-      - name: Build Windows installer
+      - name: Build Windows packages
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
+          choco install innosetup --no-progress -y
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" "packaging\windows\RustBlock.iss"
-
-      - name: Build portable package
-        shell: pwsh
-        run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
           New-Item -ItemType Directory -Force dist\portable | Out-Null
           Copy-Item target\release\rustblock-gui.exe dist\portable\RustBlock.exe
           Copy-Item target\release\rustblock.exe dist\portable\rustblock.exe
           Copy-Item README.md, LICENSE, NOTICE dist\portable\
           Compress-Archive -Path dist\portable\* -DestinationPath "dist\RustBlock-$version-portable.zip" -Force
 
-      - name: Write checksums
-        shell: pwsh
+      - name: Build Unix package
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          Get-ChildItem dist\RustBlock-Setup-*.exe, dist\RustBlock-*-portable.zip |
-            ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
-            Set-Content -Encoding ascii dist\SHA256SUMS.txt
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/pkg
+          cp target/release/rustblock-gui dist/pkg/RustBlock
+          cp target/release/rustblock dist/pkg/rustblock
+          cp README.md LICENSE NOTICE dist/pkg/
+          chmod +x dist/pkg/RustBlock dist/pkg/rustblock
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            codesign --force --sign - dist/pkg/RustBlock dist/pkg/rustblock
+          fi
+          tar -czf "dist/RustBlock-${version}-${{ matrix.platform }}.tar.gz" -C dist/pkg .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RustBlock-${{ matrix.platform }}
+          path: |
+            dist/RustBlock-*.exe
+            dist/RustBlock-*.zip
+            dist/RustBlock-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: RustBlock-*
+          merge-multiple: true
+
+      - name: Verify tag and build checksums
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(awk '/^\[workspace.package\]/{found=1} found && /^version = /{gsub(/[",]/,""); print $3; exit}' Cargo.toml)
+          if [ "$tag" != "$version" ]; then
+            echo "::error::Tag v$tag does not match the workspace version $version."
+            exit 1
+          fi
+          cd dist
+          sha256sum RustBlock-* > SHA256SUMS.txt
+          ls -lh
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           name: RustBlock ${{ github.ref_name }}
           body: |
-            Native Windows build of RustBlock.
+            Native builds for Windows, Linux and macOS.
 
-            - `RustBlock-Setup-*.exe` — per-user installer with Start Menu and optional desktop shortcut.
-            - `RustBlock-*-portable.zip` — standalone GUI and CLI, no installation required.
-            - `SHA256SUMS.txt` — checksums for both downloads.
+            | Platform | Asset |
+            |---|---|
+            | Windows 10/11 x64 | `RustBlock-Setup-*.exe` installer, `RustBlock-*-portable.zip` |
+            | Linux x86_64 | `RustBlock-*-linux-x86_64.tar.gz` |
+            | macOS Apple Silicon | `RustBlock-*-macos-arm64.tar.gz` |
+            | macOS Intel | `RustBlock-*-macos-x86_64.tar.gz` |
 
-            The installed app checks GitHub Releases on launch and can download the next
-            installer from Settings → Updates.
-          files: |
-            dist/RustBlock-Setup-*.exe
-            dist/RustBlock-*-portable.zip
-            dist/SHA256SUMS.txt
-          generate_release_notes: true
+            The Windows installer is per-user (no elevation) and supports silent OTA
+            updates from Settings → Updates. The Linux and macOS archives contain the
+            `RustBlock` GUI and the `rustblock` CLI. macOS builds are ad-hoc signed but
+            not notarized: if Gatekeeper blocks the first launch, right-click → Open,
+            or remove the quarantine attribute.
+
+            Every archive is covered by `SHA256SUMS.txt`.
+          files: dist/*
           fail_on_unmatched_files: true
+          generate_release_notes: true

@@ -4,10 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RustBlock — native GGUF conversion, without the maze</title>
-  <meta name="description" content="RustBlock is a native Windows workbench for GGUF models: reblock Prism ternary files, quantize to 22 targets, verify every tensor and update over the air. No Python, no telemetry.">
+  <meta name="description" content="RustBlock is a native desktop workbench for GGUF models on Windows, Linux and macOS: reblock Prism ternary files, quantize to 22 targets, verify every tensor and update over the air. No Python, no telemetry.">
   <meta name="theme-color" content="#0e1012">
   <meta property="og:title" content="RustBlock — native GGUF conversion">
-  <meta property="og:description" content="Reblock, convert and quantize GGUF models on Windows. 22 targets, multicore conversion, per-tensor verification and GitHub OTA updates.">
+  <meta property="og:description" content="Reblock, convert and quantize GGUF models on Windows, Linux and macOS. 22 targets, multicore conversion, per-tensor verification and GitHub OTA updates.">
   <meta property="og:type" content="website">
   <meta property="og:image" content="/assets/app-convert.png">
   <meta name="twitter:card" content="summary_large_image">
@@ -19,9 +19,9 @@
   <a class="skip-link" href="#main">Skip to content</a>
 
   <div class="topline">
-    <p><span class="topline-dot" aria-hidden="true"></span> RustBlock <span data-version>v0.1.0</span> is live on GitHub Releases</p>
+    <p><span class="topline-dot" aria-hidden="true"></span> RustBlock <span data-version>v0.2.0</span> is live on GitHub Releases</p>
     <a data-release href="https://github.com/Clutsy/RustBlock/releases/latest" target="_blank" rel="noreferrer">
-      Installer <span data-size="installer">9.0 MB</span> · Portable <span data-size="portable">3.2 MB</span>
+      Windows · Linux · macOS
       <span aria-hidden="true">↗</span>
     </a>
   </div>
@@ -29,7 +29,7 @@
   <header class="site-header" data-header>
     <div class="header-inner">
       <a class="brand" href="#top" aria-label="RustBlock home">
-        <img src="/assets/rustblock-wordmark.png" alt="RustBlock" width="1465" height="216">
+        <img src="/assets/rustblock-wordmark.png" alt="RustBlock" width="600" height="88">
       </a>
       <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
         <span></span><span></span>
@@ -49,23 +49,23 @@
   <main id="main">
     <section class="hero" id="top">
       <div class="hero-mark" aria-hidden="true">
-        <img src="/assets/rustblock-logo.png" alt="" width="790" height="790">
+        <img src="/assets/rustblock-logo.png" alt="" width="640" height="640">
       </div>
       <div class="wrap">
-        <p class="eyebrow">Native Windows app · no Python</p>
+        <p class="eyebrow">Native desktop app · no Python</p>
         <h1>Quantize without<br>the <em>maze.</em></h1>
         <div class="hero-grid">
           <p class="hero-lede">RustBlock is a native workbench for GGUF models. Reblock Prism ternary files, convert floats, quantize to twenty-two targets and verify every tensor — before a single byte is replaced.</p>
           <div class="hero-actions">
-            <a class="btn btn-dark" href="https://github.com/Clutsy/RustBlock/releases/latest" data-installer>
+            <a class="btn btn-dark" href="#download">
               <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v9m0 0 3.6-3.6M10 12 6.4 8.4M4 16h12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              Download for Windows
-              <span class="btn-meta" data-version>v0.1.0</span>
+              Download RustBlock
+              <span class="btn-meta" data-version>v0.2.0</span>
             </a>
             <a class="btn btn-ghost" href="#workflow">See the workflow</a>
           </div>
         </div>
-        <p class="hero-note">Windows 10/11 · x64 · installer or portable ZIP · GitHub OTA updates · Apache-2.0</p>
+        <p class="hero-note">Windows 10/11 · Linux x86_64 · macOS 11+ · installer, portable ZIP or tar.gz · OTA updates on Windows · Apache-2.0</p>
       </div>
 
       <div class="wrap">
@@ -101,6 +101,15 @@
           <strong>100<em>%</em></strong>
           <span>local conversion</span>
         </div>
+      </div>
+      <div class="wrap community">
+        <p class="community-label"><span class="community-dot" aria-hidden="true"></span> Live from GitHub</p>
+        <dl class="community-stats">
+          <div><dt>Stars</dt><dd data-stars>—</dd></div>
+          <div><dt>Forks</dt><dd data-forks>—</dd></div>
+          <div><dt>Release downloads</dt><dd data-downloads>—</dd></div>
+          <div><dt>Latest release</dt><dd><a data-release data-latest href="https://github.com/Clutsy/RustBlock/releases/latest" target="_blank" rel="noreferrer">v0.2.0</a></dd></div>
+        </dl>
       </div>
     </section>
 
@@ -284,47 +293,84 @@
         <header class="download-head">
           <p class="eyebrow">Download</p>
           <h2>Native. Portable. <em>Yours.</em></h2>
-          <p class="section-lede">One executable and the libraries Windows already has. No runtime, no Python, no telemetry, and no model data leaving your machine.</p>
+          <p class="section-lede">Native builds for Windows, Linux and macOS. One executable and the system libraries each platform already has. No runtime, no Python, no telemetry, and no model data leaving your machine.</p>
         </header>
 
-        <div class="download-grid">
+        <div class="platform-grid">
           <article class="download-card download-card-dark">
             <div class="download-top">
-              <span class="pill">Recommended</span>
-              <h3>Windows installer</h3>
-              <p>Per-user install in <code>%LOCALAPPDATA%\Programs\RustBlock</code>. Start Menu entry, optional desktop shortcut and silent OTA updates.</p>
+              <span class="pill">Windows 10/11 · x64</span>
+              <h3>Windows</h3>
+              <p>Per-user installer in <code>%LOCALAPPDATA%\Programs\RustBlock</code>. Start Menu entry, optional desktop shortcut and silent OTA updates.</p>
               <ul class="mini-list">
                 <li>No administrator prompt</li>
-                <li>Updates through the same installer</li>
-                <li>Uninstalls cleanly from Windows Settings</li>
+                <li>OTA updates through the same installer</li>
+                <li>Portable ZIP available without installation</li>
               </ul>
             </div>
-            <a class="btn btn-light btn-block" href="https://github.com/Clutsy/RustBlock/releases/latest" data-installer>
-              <span>Download installer</span>
-              <span class="btn-meta" data-size="installer" data-version>9.0 MB · v0.1.0</span>
+            <div class="download-actions">
+              <a class="btn btn-light btn-block" href="https://github.com/Clutsy/RustBlock/releases/latest" data-installer>
+                <span>Download installer</span>
+                <span class="btn-meta" data-size="installer" data-version>9.0 MB · v0.2.0</span>
+              </a>
+              <a class="link-quiet" href="https://github.com/Clutsy/RustBlock/releases/latest" data-portable>
+                <span>Portable ZIP</span>
+                <span data-size="portable">3.2 MB</span>
+              </a>
+            </div>
+          </article>
+
+          <article class="download-card download-card-paper">
+            <div class="download-top">
+              <span class="pill pill-dark">Linux · x86_64</span>
+              <h3>Linux</h3>
+              <p>GUI and CLI in one archive. Runs on a modern glibc distribution with an X11 or Wayland session; no installer and no root step.</p>
+              <ul class="mini-list">
+                <li><code>RustBlock</code> and <code>rustblock</code></li>
+                <li>No runtime, no Python</li>
+                <li>README, license and notice included</li>
+              </ul>
+            </div>
+            <a class="btn btn-dark btn-block" href="https://github.com/Clutsy/RustBlock/releases/latest" data-linux>
+              <span>Download .tar.gz</span>
+              <span class="btn-meta" data-size="linux">tar.gz</span>
             </a>
           </article>
 
           <article class="download-card download-card-paper">
             <div class="download-top">
-              <span class="pill pill-dark">No installation</span>
-              <h3>Portable ZIP</h3>
-              <p><code>RustBlock.exe</code> and <code>rustblock.exe</code> side by side. Unpack anywhere, keep your settings in <code>%APPDATA%\RustBlock</code>, delete the folder when you are done.</p>
+              <span class="pill pill-dark">macOS 11+</span>
+              <h3>macOS</h3>
+              <p>Native archives for Apple Silicon and Intel. Ad-hoc signed, not notarized: Gatekeeper may ask for right-click → Open on first launch.</p>
               <ul class="mini-list">
-                <li>GUI and CLI in one archive</li>
-                <li>Runs from a USB drive</li>
-                <li>Same native core, same targets</li>
+                <li>Apple Silicon (arm64)</li>
+                <li>Intel (x86_64)</li>
+                <li>GUI and CLI included</li>
               </ul>
             </div>
-            <a class="btn btn-dark btn-block" href="https://github.com/Clutsy/RustBlock/releases/latest" data-portable>
-              <span>Download portable</span>
-              <span class="btn-meta" data-size="portable">3.2 MB</span>
-            </a>
+            <div class="download-actions">
+              <a class="btn btn-dark btn-block" href="https://github.com/Clutsy/RustBlock/releases/latest" data-macos-arm64>
+                <span>Apple Silicon</span>
+                <span class="btn-meta" data-size="macos-arm64">arm64</span>
+              </a>
+              <a class="btn btn-ghost btn-block" href="https://github.com/Clutsy/RustBlock/releases/latest" data-macos-x64>
+                <span>Intel</span>
+                <span class="btn-meta" data-size="macos-x64">x86_64</span>
+              </a>
+            </div>
           </article>
         </div>
 
+        <div class="build-note">
+          <div>
+            <h3>Compile it on GitHub.</h3>
+            <p>The <strong>Build</strong> workflow runs on Windows, Linux and macOS and uploads fresh binaries as artifacts. No local toolchain required.</p>
+          </div>
+          <a class="btn btn-ghost" href="https://github.com/Clutsy/RustBlock/actions/workflows/build.yml" target="_blank" rel="noreferrer">Run a build <span aria-hidden="true">↗</span></a>
+        </div>
+
         <div class="download-meta">
-          <span>Windows 10/11 · x64</span>
+          <span>Windows · Linux · macOS</span>
           <span>Apache-2.0</span>
           <a data-checksums href="https://github.com/Clutsy/RustBlock/releases/latest" target="_blank" rel="noreferrer">SHA-256 checksums</a>
           <a data-releases href="https://github.com/Clutsy/RustBlock/releases" target="_blank" rel="noreferrer">All releases ↗</a>
@@ -361,7 +407,11 @@
           </details>
           <details>
             <summary>Which platforms are supported?</summary>
-            <p>The published builds target Windows 10 and 11 on x64, as both a per-user installer and a portable ZIP.</p>
+            <p>Windows 10/11 x64 gets a per-user installer with OTA updates and a portable ZIP. Linux x86_64 and macOS 11+ (Apple Silicon and Intel) are published as tar.gz archives with the GUI and the CLI. All three platforms build from the same Rust workspace.</p>
+          </details>
+          <details>
+            <summary>Are the macOS and Linux builds signed?</summary>
+            <p>The macOS archives are ad-hoc signed but not notarized: on first launch, right-click the app and choose Open, or remove the quarantine attribute with <code>xattr -d com.apple.quarantine</code>. Linux archives are plain <code>.tar.gz</code> files with no installer signature involved.</p>
           </details>
         </div>
       </div>
@@ -390,6 +440,7 @@
           <a href="https://github.com/Clutsy/RustBlock" target="_blank" rel="noreferrer">Source ↗</a>
           <a data-releases href="https://github.com/Clutsy/RustBlock/releases" target="_blank" rel="noreferrer">Releases ↗</a>
           <a href="https://github.com/Clutsy/RustBlock/issues" target="_blank" rel="noreferrer">Issues ↗</a>
+          <a href="https://github.com/Clutsy/RustBlock/actions/workflows/build.yml" target="_blank" rel="noreferrer">Builds ↗</a>
           <a href="https://github.com/Clutsy/RustBlock/blob/main/LICENSE" target="_blank" rel="noreferrer">License ↗</a>
         </div>
       </div>
@@ -398,7 +449,7 @@
     <div class="wrap footer-bottom">
       <span>© <span data-year>2026</span> Clutsy</span>
       <span>Built in Rust. No telemetry.</span>
-      <span class="footer-version" data-version>v0.1.0</span>
+      <span class="footer-version" data-version>v0.2.0</span>
     </div>
   </footer>
 

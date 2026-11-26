@@ -1309,7 +1309,7 @@ fn encode_values(
 
 fn encode_q8_0(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() / 32 * 34);
-    for block in values.chunks_exact(32) {
+    for block in values.as_chunks::<32>().0 {
         let max = block.iter().fold(0f32, |m, v| m.max(v.abs()));
         let d = max / 127.0;
         out.extend_from_slice(&f16::from_f32(d).to_bits().to_le_bytes());
@@ -1324,7 +1324,7 @@ fn encode_q8_0(values: &[f32]) -> Vec<u8> {
 
 fn encode_q4_0(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() / 32 * 18);
-    for block in values.chunks_exact(32) {
+    for block in values.as_chunks::<32>().0 {
         let max = block.iter().fold(0f32, |m, v| m.max(v.abs()));
         let d = max / 8.0;
         out.extend_from_slice(&f16::from_f32(d).to_bits().to_le_bytes());
@@ -1342,7 +1342,7 @@ fn encode_q4_0(values: &[f32]) -> Vec<u8> {
 
 fn encode_q5_0(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() / 32 * 22);
-    for block in values.chunks_exact(32) {
+    for block in values.as_chunks::<32>().0 {
         let max = block.iter().fold(0f32, |m, v| m.max(v.abs()));
         let d = max / 16.0;
         out.extend_from_slice(&f16::from_f32(d).to_bits().to_le_bytes());
@@ -1370,14 +1370,14 @@ fn encode_q5_0(values: &[f32]) -> Vec<u8> {
 /// 32 high-bit bytes, then 128 low-nibble bytes.
 fn encode_q5k(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() / 256 * 176);
-    for block in values.chunks_exact(256) {
+    for block in values.as_chunks::<256>().0 {
         let mut scales = [0u8; 8];
         let mut mins = [0u8; 8];
         let mut q = [0u8; 256];
         let mut block_scale = 0f32;
         let mut block_min = 0f32;
 
-        for chunk in block.chunks_exact(32) {
+        for chunk in block.as_chunks::<32>().0 {
             let min = chunk.iter().fold(0f32, |m, v| m.min(*v));
             let max = chunk.iter().fold(f32::NEG_INFINITY, |m, v| m.max(*v));
             let scale = (max - min) / 31.0;
@@ -1387,7 +1387,7 @@ fn encode_q5k(values: &[f32]) -> Vec<u8> {
 
         let d = f16::from_f32(block_scale / 63.0);
         let dmin = f16::from_f32(block_min / 63.0);
-        for (j, chunk) in block.chunks_exact(32).enumerate() {
+        for (j, chunk) in block.as_chunks::<32>().0.iter().enumerate() {
             let min = chunk.iter().fold(0f32, |m, v| m.min(*v));
             let max = chunk.iter().fold(f32::NEG_INFINITY, |m, v| m.max(*v));
             let scale = (max - min) / 31.0;

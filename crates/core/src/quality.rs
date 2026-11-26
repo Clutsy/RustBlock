@@ -205,8 +205,10 @@ fn decode(
             });
         }
         return Ok(raw
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("4-byte chunk")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect());
     }
     let shape: Vec<i32> = info

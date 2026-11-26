@@ -98,19 +98,43 @@ The token is read from the environment and is never written to disk by RustBlock
 
 ## Download
 
-Windows builds are published on the [GitHub Releases page](https://github.com/Clutsy/RustBlock/releases/latest):
+Native builds for Windows, Linux and macOS are published on the
+[GitHub Releases page](https://github.com/Clutsy/RustBlock/releases/latest):
 
-- **RustBlock-Setup-x.y.z.exe** - per-user installer in `%LOCALAPPDATA%\Programs\RustBlock`, with a Start Menu entry, optional desktop shortcut and silent updates. No administrator prompt.
-- **RustBlock-x.y.z-portable.zip** - standalone `RustBlock.exe` and `rustblock.exe`; unpack anywhere. Settings still live in `%APPDATA%\RustBlock`.
-- **SHA256SUMS.txt** - checksums for both downloads.
+- **RustBlock-Setup-x.y.z.exe** - per-user Windows installer in
+  `%LOCALAPPDATA%\Programs\RustBlock`, with a Start Menu entry, optional desktop
+  shortcut and silent updates. No administrator prompt.
+- **RustBlock-x.y.z-portable.zip** - standalone `RustBlock.exe` and
+  `rustblock.exe` for Windows; unpack anywhere. Settings still live in
+  `%APPDATA%\RustBlock`.
+- **RustBlock-x.y.z-linux-x86_64.tar.gz** - the `RustBlock` GUI and `rustblock`
+  CLI for Linux x86_64 with X11 or Wayland. Unpack and run; no installer or root
+  step.
+- **RustBlock-x.y.z-macos-arm64.tar.gz** - Apple Silicon build of the GUI and CLI.
+- **RustBlock-x.y.z-macos-x86_64.tar.gz** - Intel build of the GUI and CLI.
+- **SHA256SUMS.txt** - checksums for every asset.
 
-The installed app checks GitHub Releases on launch. Settings -> **Updates** shows the
-latest release, downloads the new installer and restarts into it. The update is
-handed to the same per-user installer, so it does not ask for elevation.
+The installed Windows app checks GitHub Releases on launch. Settings -> **Updates**
+shows the latest release, downloads the new installer and restarts into it. The
+update is handed to the same per-user installer, so it does not ask for elevation.
+Linux and macOS archives are plain builds with no background updater.
+
+The macOS archives are ad-hoc signed but not notarized. If Gatekeeper blocks the
+first launch, right-click the app and choose **Open**, or run
+`xattr -d com.apple.quarantine RustBlock`.
 
 ## Install / build
 
 Requires Rust **1.92+**.
+
+Linux also needs the GUI development libraries at build time:
+
+```bash
+sudo apt install libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+  libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+```
+
+Then build the whole workspace:
 
 ```bash
 cargo build --release
@@ -119,7 +143,7 @@ cargo build --release
 Binaries:
 
 - CLI: `target/release/rustblock` (`rustblock.exe` on Windows)
-- GUI: `target/release/rustblock-gui` (`rustblock-gui.exe` on Windows)
+- GUI: `target/release/rustblock-gui` (`RustBlock` after packaging)
 
 Launch the GUI with one or more models:
 
@@ -130,26 +154,31 @@ cargo run -p rustblock-gui --release -- model-PQ2_0.gguf
 ### Windows installer
 
 The Inno Setup definition lives in `packaging/windows/RustBlock.iss`. After a
-release build:
+native release build:
 
 ```powershell
-iscc /DMyAppVersion=0.1.0 packaging\windows\RustBlock.iss
+iscc /DMyAppVersion=0.2.0 packaging\windows\RustBlock.iss
 ```
 
-The installer is written to `dist/RustBlock-Setup-0.1.0.exe`. `site/` contains the
-English showcase page ready for Vercel; see `site/README.md` for the one-click
-import settings.
+The installer is written to `dist/RustBlock-Setup-0.2.0.exe`. `site/` contains the
+English showcase page; see `site/README.md` for preview and Vercel settings.
 
 ## Releases
 
-Pushing a tag that starts with `v` runs `.github/workflows/release.yml`. The
-workflow builds the Windows binaries, packages the portable ZIP, compiles the
-Inno Setup installer, writes `SHA256SUMS.txt` and creates the GitHub Release:
+Pushing a tag that starts with `v` runs `.github/workflows/release.yml` on native
+runners: `windows-latest`, `ubuntu-latest`, `macos-15-intel` and `macos-15`. Each
+job builds the workspace, packages its platform asset and uploads it; the publish
+job verifies that the tag matches the workspace version, writes `SHA256SUMS.txt`
+and creates the GitHub Release with every asset:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
+
+To compile without publishing, open **Actions -> Build -> Run workflow**. The same
+four-platform matrix runs and every binary is attached to the workflow run as a
+downloadable artifact. A `build-*` tag also triggers that workflow.
 
 ## CLI
 

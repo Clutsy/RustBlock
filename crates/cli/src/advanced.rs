@@ -596,11 +596,7 @@ pub fn download_cmd(args: DownloadArgs) -> Result<()> {
             &options,
             &cancel,
             &|done, total| {
-                let percent = if total > 0 {
-                    done.saturating_mul(100) / total
-                } else {
-                    0
-                };
+                let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
                 if last.swap(percent, Ordering::Relaxed) != percent {
                     println!(
                         "{}",
@@ -744,11 +740,7 @@ pub fn download_many_cmd(args: DownloadManyArgs) -> Result<()> {
                     json!({"event": "start", "index": index, "url": url, "destination": destination})
                 ),
                 BatchDownloadEvent::Progress { index, done, total } => {
-                    let percent = if total > 0 {
-                        done.saturating_mul(100) / total
-                    } else {
-                        0
-                    };
+                    let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0);
                     let mut seen = last.lock().expect("progress lock");
                     if seen.get(&index).copied() == Some(percent) {
                         return;

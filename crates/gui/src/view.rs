@@ -186,7 +186,7 @@ fn backdrop(app: &RustBlock) -> El<'_> {
             .width(Length::Fill)
             .height(Length::Fill)
             .content_fit(ContentFit::Contain)
-            .opacity(0.09),
+            .opacity(0.09_f32),
     )
     .width(Length::Fill)
     .height(Length::Fill)

@@ -4,6 +4,11 @@
   const REPO = "Clutsy/RustBlock";
   const RELEASES = `https://github.com/${REPO}/releases`;
   const API = `https://api.github.com/repos/${REPO}/releases/latest`;
+  const REPO_API = `https://api.github.com/repos/${REPO}`;
+  const ALL_RELEASES_API = `https://api.github.com/repos/${REPO}/releases?per_page=100`;
+  const COMMUNITY_CACHE = "rustblock:github:v1";
+  const COMMUNITY_TTL = 10 * 60 * 1000;
+  const number = new Intl.NumberFormat("en-US");
 
   const formatSize = (bytes) => {
     if (!Number.isFinite(bytes) || bytes <= 0) return "";
@@ -25,6 +30,15 @@
     });
   };
 
+  const findAsset = (assets, pattern) =>
+    assets.find((asset) => pattern.test(asset.name || ""));
+
+  const bindAsset = (selector, asset, sizeKey) => {
+    if (!asset) return;
+    setLink(selector, asset.browser_download_url);
+    if (asset.size) setText(`[data-size="${sizeKey}"]`, formatSize(asset.size));
+  };
+
   async function loadRelease() {
     try {
       const response = await fetch(API, {
@@ -35,11 +49,12 @@
       const version = String(release.tag_name || "").replace(/^v/i, "");
       const label = version ? `v${version}` : "";
       const assets = Array.isArray(release.assets) ? release.assets : [];
-      const find = (pattern) =>
-        assets.find((asset) => pattern.test(asset.name || ""));
-      const installer = find(/^RustBlock-Setup-.*\.exe$/i);
-      const portable = find(/^RustBlock-.*-portable\.zip$/i);
-      const checksums = find(/^SHA256SUMS\.txt$/i);
+      const installer = findAsset(assets, /^RustBlock-Setup-.*\.exe$/i);
+      const portable = findAsset(assets, /^RustBlock-.*-portable\.zip$/i);
+      const linux = findAsset(assets, /^RustBlock-.*-linux-x86_64\.tar\.gz$/i);
+      const macArm = findAsset(assets, /^RustBlock-.*-macos-arm64\.tar\.gz$/i);
+      const macIntel = findAsset(assets, /^RustBlock-.*-macos-x86_64\.tar\.gz$/i);
+      const checksums = findAsset(assets, /^SHA256SUMS\.txt$/i);
 
       if (label) {
         document.querySelectorAll("[data-version]").forEach((node) => {
@@ -63,23 +78,94 @@
         }
       }
 
-      if (portable) {
-        setLink("[data-portable]", portable.browser_download_url);
-        if (portable.size) {
-          setText('[data-size="portable"]', formatSize(portable.size));
-        }
-      }
+      bindAsset("[data-portable]", portable, "portable");
+      bindAsset("[data-linux]", linux, "linux");
+      bindAsset("[data-macos-arm64]", macArm, "macos-arm64");
+      bindAsset("[data-macos-x64]", macIntel, "macos-x64");
 
       if (checksums) setLink("[data-checksums]", checksums.browser_download_url);
       setLink("[data-release]", release.html_url);
       setLink("[data-releases]", RELEASES);
     } catch {
-      document.querySelectorAll("[data-installer]").forEach((node) => {
-        node.href = `${RELEASES}/latest`;
+      const latest = `${RELEASES}/latest`;
+      ["[data-installer]", "[data-portable]", "[data-linux]", "[data-macos-arm64]", "[data-macos-x64]"].forEach(
+        (selector) => setLink(selector, latest)
+      );
+    }
+  }
+
+  const readCommunityCache = () => {
+    try {
+      const raw = sessionStorage.getItem(COMMUNITY_CACHE);
+      if (!raw) return null;
+      const cached = JSON.parse(raw);
+      if (!cached || typeof cached.ts !== "number" || !cached.data) return null;
+      return cached;
+    } catch {
+      return null;
+    }
+  };
+
+  const renderCommunity = (data) => {
+    document.querySelectorAll("[data-stars]").forEach((node) => {
+      node.textContent = number.format(data.stars || 0);
+    });
+    document.querySelectorAll("[data-forks]").forEach((node) => {
+      node.textContent = number.format(data.forks || 0);
+    });
+    document.querySelectorAll("[data-downloads]").forEach((node) => {
+      node.textContent = number.format(data.downloads || 0);
+    });
+    if (data.latestTag) {
+      document.querySelectorAll("[data-latest]").forEach((node) => {
+        node.textContent = data.latestTag;
       });
-      document.querySelectorAll("[data-portable]").forEach((node) => {
-        node.href = `${RELEASES}/latest`;
-      });
+    }
+    if (data.latestUrl) setLink("[data-latest]", data.latestUrl);
+  };
+
+  async function loadCommunity() {
+    const cached = readCommunityCache();
+    if (cached) {
+      renderCommunity(cached.data);
+      if (Date.now() - cached.ts < COMMUNITY_TTL) return;
+    }
+
+    try {
+      const [repoResponse, releasesResponse] = await Promise.all([
+        fetch(REPO_API, { headers: { Accept: "application/vnd.github+json" } }),
+        fetch(ALL_RELEASES_API, { headers: { Accept: "application/vnd.github+json" } }),
+      ]);
+      if (!repoResponse.ok || !releasesResponse.ok) {
+        throw new Error("GitHub API unavailable");
+      }
+      const repo = await repoResponse.json();
+      const releases = await releasesResponse.json();
+      const list = Array.isArray(releases) ? releases : [];
+      const downloads = list.reduce(
+        (total, release) =>
+          total +
+          (Array.isArray(release.assets) ? release.assets : [])
+            .filter((asset) => !/^SHA256SUMS\.txt$/i.test(asset.name || ""))
+            .reduce((sum, asset) => sum + (Number(asset.download_count) || 0), 0),
+        0
+      );
+      const latest = list.find((release) => !release.draft && !release.prerelease) || list[0];
+      const data = {
+        stars: Number(repo.stargazers_count) || 0,
+        forks: Number(repo.forks_count) || 0,
+        downloads,
+        latestTag: latest?.tag_name || "",
+        latestUrl: latest?.html_url || `${RELEASES}/latest`,
+      };
+      renderCommunity(data);
+      try {
+        sessionStorage.setItem(COMMUNITY_CACHE, JSON.stringify({ ts: Date.now(), data }));
+      } catch {
+        /* private mode */
+      }
+    } catch {
+      /* keep the cached values or the em dashes */
     }
   }
 
@@ -147,4 +233,5 @@
   if (year) year.textContent = String(new Date().getFullYear());
 
   loadRelease();
+  loadCommunity();
 })();

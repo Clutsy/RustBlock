@@ -650,7 +650,14 @@ mod tests {
         let handle = std::thread::spawn(move || {
             while !stop_thread.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => serve(stream, &data),
+                    Ok((stream, _)) => {
+                        // On Windows an accepted socket can inherit the listener's
+                        // non-blocking mode; serve() must wait for the request.
+                        if stream.set_nonblocking(false).is_err() {
+                            break;
+                        }
+                        serve(stream, &data);
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(1));
                     }
@@ -761,7 +768,10 @@ mod tests {
         assert_eq!(finished.load(Ordering::Relaxed), 2);
         assert!(progress.load(Ordering::Relaxed) >= 1);
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(Result::is_ok));
+        assert!(
+            results.iter().all(Result::is_ok),
+            "batch results: {results:?}"
+        );
         assert_eq!(std::fs::read(&jobs[0].1).unwrap(), data);
         assert_eq!(std::fs::read(&jobs[1].1).unwrap(), data);
     }

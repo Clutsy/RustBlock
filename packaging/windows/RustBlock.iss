@@ -1,9 +1,9 @@
 ; RustBlock Windows installer.
-; Build with: iscc /DMyAppVersion=0.1.0 packaging\windows\RustBlock.iss
+; Build with: iscc /DMyAppVersion=0.2.0 packaging\windows\RustBlock.iss
 
 #define MyAppName "RustBlock"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.0"
+  #define MyAppVersion "0.2.0"
 #endif
 #define MyAppPublisher "Clutsy"
 #define MyAppURL "https://github.com/Clutsy/RustBlock"

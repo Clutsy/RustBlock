@@ -205,16 +205,22 @@ pub(crate) fn decode_floats(
     }
     match dtype {
         "F32" => Ok(raw
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect()),
         "F16" => Ok(raw
-            .chunks_exact(2)
-            .map(|chunk| half::f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| half::f16::from_bits(u16::from_le_bytes(*chunk)).to_f32())
             .collect()),
         "BF16" => Ok(raw
-            .chunks_exact(2)
-            .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| bf16::from_bits(u16::from_le_bytes(*chunk)).to_f32())
             .collect()),
         "F8_E4M3" | "F8_E4M3FN" => Ok(raw.iter().map(|byte| fp8_e4m3(*byte)).collect()),
         "F8_E5M2" => Ok(raw.iter().map(|byte| fp8_e5m2(*byte)).collect()),
@@ -230,8 +236,10 @@ pub(crate) fn decode_u32(name: &str, raw: &[u8]) -> Result<Vec<u32>, NativeError
         });
     }
     Ok(raw
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four bytes")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -541,8 +549,10 @@ mod tests {
             awq_dequant("test", &qweight, None, &scales, &[1, 1], &[1, 1], &[1, 8]).unwrap();
         assert_eq!(shape, vec![8, 1]);
         let values = data
-            .chunks_exact(2)
-            .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| bf16::from_bits(u16::from_le_bytes(*chunk)).to_f32())
             .collect::<Vec<_>>();
         assert_eq!(values, vec![1.0, 5.0, 2.0, 6.0, 3.0, 7.0, 4.0, 8.0]);
     }
@@ -564,8 +574,10 @@ mod tests {
         .unwrap();
         assert_eq!(shape, vec![8, 1]);
         let values = data
-            .chunks_exact(2)
-            .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| bf16::from_bits(u16::from_le_bytes(*chunk)).to_f32())
             .collect::<Vec<_>>();
         assert_eq!(values, vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]);
     }

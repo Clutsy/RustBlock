@@ -542,6 +542,6 @@ mod tests {
     fn wordmark_decodes_with_visible_pixels() {
         let (width, height, pixels) = wordmark_rgba().expect("wordmark must decode");
         assert!(width > 10 && height > 5);
-        assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] > 200));
+        assert!(pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] > 200));
     }
 }

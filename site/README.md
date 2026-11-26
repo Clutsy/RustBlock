@@ -4,6 +4,16 @@ A static, English-only landing page for RustBlock. No build step and no runtime
 dependencies: Vercel serves `index.html`, `styles.css`, `script.js` and the
 `assets/` folder directly.
 
+The download cards resolve the Windows installer, portable ZIP, Linux x86_64 and
+both macOS archives from the latest GitHub Release. A second request renders the
+live star, fork and release-download counts in the stats strip; both responses are
+cached in `sessionStorage` for ten minutes to stay well inside the unauthenticated
+GitHub API limit.
+
+The **Build** and **Run a build** buttons point at the manual
+`.github/workflows/build.yml` workflow, which produces downloadable artifacts for
+all four targets without creating a release.
+
 ## Preview locally
 
 From the repository root:
@@ -29,5 +39,5 @@ npx vercel --cwd site --prod
 ```
 
 `site/vercel.json` adds clean URLs, long-lived asset caching and basic security
-headers. The download buttons read the latest GitHub Release at runtime and fall
-back to the releases page when the API is unavailable.
+headers. The download buttons and GitHub counters fall back gracefully to the
+releases page and em dashes when the API is unavailable.
