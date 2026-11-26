@@ -19,7 +19,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
-      - run: cargo test --workspace
+      - name: Test and annotate failures
+        shell: bash
+        run: |
+          set +e
+          cargo test --workspace --no-fail-fast > test.log 2>&1
+          status=$?
+          grep -nE "FAILED|panicked|test result: FAILED|error\[|error:" test.log | head -30 | sed 's/%/%25/g; s/\r//g' > failures.txt || true
+          while IFS= read -r line; do echo "::error title=Test::$line"; done < failures.txt
+          tail -80 test.log
+          exit $status
 
   parity:
     runs-on: ubuntu-latest
