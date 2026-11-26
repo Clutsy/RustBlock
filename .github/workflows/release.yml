@@ -68,9 +68,11 @@ jobs:
           if [ "${{ runner.os }}" = "macOS" ]; then
             codesign --force --sign - dist/pkg/RustBlock dist/pkg/cli/rustblock
           fi
-          tar -czf "dist/RustBlock-${version}-${{ matrix.platform }}.tar.gz" -C dist/pkg .
-          tar -tzf "dist/RustBlock-${version}-${{ matrix.platform }}.tar.gz" | grep -qx './RustBlock'
-          tar -tzf "dist/RustBlock-${version}-${{ matrix.platform }}.tar.gz" | grep -qx './cli/rustblock'
+          archive="dist/RustBlock-${version}-${{ matrix.platform }}.tar.gz"
+          tar -czf "$archive" -C dist/pkg .
+          listing=$(tar -tzf "$archive")
+          grep -qx './RustBlock' <<<"$listing"
+          grep -qx './cli/rustblock' <<<"$listing"
 
       - uses: actions/upload-artifact@v4
         with:
